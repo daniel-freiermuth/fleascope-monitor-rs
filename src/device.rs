@@ -75,6 +75,7 @@ pub struct FleaScopeDevice {
     pub trigger_config: TriggerConfig, // Trigger configuration
     pub waveform_config: WaveformConfig, // Waveform generator configuration
     fleascope: Arc<Mutex<Option<FleaScope>>>, // Actual FleaScope connection
+    config_sender: Option<tokio::sync::mpsc::UnboundedSender<ConfigUpdate>>, // NEW: config update channel
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -113,6 +114,7 @@ impl FleaScopeDevice {
             trigger_config: TriggerConfig::default(), // Default trigger config
             waveform_config: WaveformConfig::default(), // Default waveform config
             fleascope: Arc::new(Mutex::new(None)), // No connection initially
+            config_sender: None, // No config sender initially
         }
     }
 
@@ -172,73 +174,151 @@ impl FleaScopeDevice {
         Ok(())
     }
 
-    pub fn start_data_generation(&self) {
+    pub fn start_data_generation(&mut self) {
         let data_arc = Arc::clone(&self.data);
         let is_paused_arc = Arc::clone(&self.is_paused);
         let fleascope_arc = Arc::clone(&self.fleascope);
-        let probe_multiplier = self.probe_multiplier;
-        let trigger_config = self.trigger_config.clone();
-        let waveform_config = self.waveform_config.clone();
-        let time_frame = self.time_frame;
-
+        // Create channel for config updates
+        let (config_sender, mut config_receiver) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
+        self.config_sender = Some(config_sender);
+        // Initial config
+        let mut current_config = ConfigUpdate {
+            probe_multiplier: self.probe_multiplier,
+            trigger_config: self.trigger_config.clone(),
+            waveform_config: self.waveform_config.clone(),
+            time_frame: self.time_frame,
+        };
         tokio::spawn(async move {
             let mut time_offset = 0.0;
             let sample_rate = 1000.0;
-            let update_rate = 10.0; // Reduce to 10 Hz for real hardware to give more time
-            let points_per_update = (sample_rate / update_rate) as usize;
-
-            tracing::info!("Starting data generation loop with update rate: {} Hz", update_rate);
-
+            let mut adaptive_delay = std::time::Duration::from_millis(50);
+            let points_per_update = (sample_rate / 10.0) as usize;
+            let mut consecutive_failures = 0;
+            let mut last_successful_read = Instant::now();
+            let mut last_rate_update = Instant::now();
+            let mut read_count = 0;
+            let mut ongoing_read: Option<tokio::task::JoinHandle<Option<(Vec<f64>, Vec<DataPoint>)>>> = None;
             loop {
-                // sleep(Duration::from_millis((1000.0 / update_rate) as u64)).await;
-
-                // Check if device is paused
                 if is_paused_arc.load(Ordering::Relaxed) {
-                    tracing::debug!("Device is paused, skipping data generation");
-                    continue; // Skip data generation if paused
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
                 }
-
-                // Check if we have a real FleaScope connection
+                // Apply config updates
+                while let Ok(new_config) = config_receiver.try_recv() {
+                    if let Some(handle) = ongoing_read.take() { handle.abort(); }
+                    current_config = new_config;
+                }
                 let use_real_data = {
                     let fleascope = fleascope_arc.lock().unwrap();
                     fleascope.is_some()
                 };
-
-                tracing::info!("Data generation loop: use_real_data = {}", use_real_data);
-
                 if use_real_data {
-                    tracing::info!("Attempting to get real data from FleaScope");
-                    // Try to get real data from FleaScope
-                    match Self::get_real_fleascope_data(
-                        &fleascope_arc,
-                        probe_multiplier,
-                        &trigger_config,
-                        &waveform_config,
-                        time_frame,
-                    ).await {
-                        Some(real_data) => {
-                            tracing::info!("Successfully got real data with {} points", real_data.1.len());
-                            // Update data without holding the guard across await
-                            {
-                                let mut data = data_arc.lock().unwrap();
-                                data.x_values = real_data.0;
-                                data.data_points = real_data.1;
-                                data.last_update = Instant::now();
+                    let start_time = Instant::now();
+                    let fleascope_clone = Arc::clone(&fleascope_arc);
+                    let config_clone = current_config.clone();
+                    let read_handle = tokio::spawn(async move {
+                        FleaScopeDevice::get_real_fleascope_data(
+                            &fleascope_clone,
+                            config_clone.probe_multiplier,
+                            &config_clone.trigger_config,
+                            &config_clone.waveform_config,
+                            config_clone.time_frame,
+                        ).await
+                    });
+                    ongoing_read = Some(read_handle);
+                    tokio::select! {
+                        read_result = ongoing_read.as_mut().unwrap() => {
+                            ongoing_read = None;
+                            match read_result {
+                                Ok(Some(real_data)) => { // Ok from JoinHandle, Some from get_real_fleascope_data
+                                    let read_duration = start_time.elapsed();
+                                    consecutive_failures = 0;
+                                    last_successful_read = Instant::now();
+                                    read_count += 1;
+                                    if let Ok(mut data) = data_arc.lock() {
+                                        data.x_values = real_data.0;
+                                        data.data_points = real_data.1;
+                                        data.last_update = Instant::now();
+                                    }
+                                    time_offset += points_per_update as f64 / sample_rate;
+                                    adaptive_delay = if read_duration < Duration::from_millis(50) {
+                                        Duration::from_millis(20)
+                                    } else if read_duration < Duration::from_millis(200) {
+                                        Duration::from_millis(50)
+                                    } else if read_duration < Duration::from_millis(1000) {
+                                        Duration::from_millis(100)
+                                    } else {
+                                        Duration::from_millis(200)
+                                    };
+                                }
+                                Ok(None) => {
+                                    consecutive_failures += 1;
+                                    let backoff_delay = match consecutive_failures {
+                                        1..=3 => Duration::from_millis(100),
+                                        4..=10 => Duration::from_millis(250),
+                                        _ => Duration::from_millis(500),
+                                    };
+                                    adaptive_delay = backoff_delay;
+                                    if last_successful_read.elapsed() > Duration::from_secs(10) {
+                                        adaptive_delay = Duration::from_millis(1000);
+                                    }
+                                }
+                                Err(_) => {
+                                    // Task was aborted or panicked
+                                    continue;
+                                }
                             }
-                            time_offset += points_per_update as f64 / sample_rate;
                         }
-                        None => {
-                            // Real data failed - just skip this iteration and try again
-                            tracing::info!("Failed to get real data, skipping iteration");
+                        new_config = config_receiver.recv() => {
+                            if let Some(new_config) = new_config {
+                                if let Some(handle) = ongoing_read.take() { handle.abort(); }
+                                current_config = new_config;
+                                continue;
+                            }
                         }
                     }
                 } else {
-                    // No real hardware connected - wait and try again
-                    tracing::info!("No real hardware connected, waiting...");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    adaptive_delay = Duration::from_millis(500);
                 }
+                tokio::time::sleep(adaptive_delay).await;
             }
         });
+    }
+
+    // Add a helper to send config updates
+    fn send_config_update(&self) {
+        if let Some(sender) = &self.config_sender {
+            let _ = sender.send(ConfigUpdate {
+                probe_multiplier: self.probe_multiplier,
+                trigger_config: self.trigger_config.clone(),
+                waveform_config: self.waveform_config.clone(),
+                time_frame: self.time_frame,
+            });
+        }
+    }
+
+    // Update all config setters to call send_config_update
+    pub fn set_waveform(&mut self, waveform_type: WaveformType, frequency_hz: f64) {
+        self.waveform_config.waveform_type = waveform_type;
+        self.waveform_config.frequency_hz = frequency_hz.clamp(10.0, 4000.0);
+        self.waveform_config.enabled = true;
+        self.send_config_update();
+    }
+    pub fn disable_waveform(&mut self) {
+        self.waveform_config.enabled = false;
+        self.send_config_update();
+    }
+    pub fn set_trigger_config(&mut self, config: TriggerConfig) {
+        self.trigger_config = config;
+        self.send_config_update();
+    }
+    pub fn set_probe_multiplier(&mut self, multiplier: ProbeMultiplier) {
+        self.probe_multiplier = multiplier;
+        self.send_config_update();
+    }
+    pub fn set_time_frame(&mut self, time_frame: f64) {
+        self.time_frame = time_frame;
+        self.send_config_update();
     }
 
     async fn get_real_fleascope_data(
@@ -248,8 +328,12 @@ impl FleaScopeDevice {
         waveform_config: &WaveformConfig,
         time_frame: f64,
     ) -> Option<(Vec<f64>, Vec<DataPoint>)> {
-        let mut fleascope_guard = fleascope_arc.lock().unwrap();
-        if let Some(fleascope) = fleascope_guard.as_mut() {
+        // Take the FleaScope out of the mutex, use it, then put it back
+        let mut fleascope_opt = {
+            let mut guard = fleascope_arc.lock().unwrap();
+            guard.take()
+        };
+        let result = if let Some(mut fleascope) = fleascope_opt {
             // Set up waveform generator if enabled
             if waveform_config.enabled {
                 let waveform = match waveform_config.waveform_type {
@@ -259,43 +343,34 @@ impl FleaScopeDevice {
                     WaveformType::Ekg => Waveform::Ekg,
                 };
                 let freq = waveform_config.frequency_hz.round() as i32;
-                if let Err(e) = fleascope.set_waveform(waveform, freq) {
-                    tracing::warn!("Failed to set waveform: {}", e);
-                }
+                let _ = fleascope.set_waveform(waveform, freq);
             }
-
-            // Convert our trigger config to fleascope-rs trigger (use None for auto-trigger in demo)
-            let trigger = None; // Use auto trigger for continuous data flow
-            // let trigger = Self::convert_trigger_config(trigger_config); // Enable when trigger config is working
-
-            // Convert probe type
+            // let trigger = Self::convert_trigger_config(trigger_config); // Enable when needed
+            let trigger = None;
             let probe_type = match probe_multiplier {
                 ProbeMultiplier::X1 => ProbeType::X1,
                 ProbeMultiplier::X10 => ProbeType::X10,
             };
-
-            // Read data from the actual device
-            let duration = Duration::from_millis(100); // Use shorter 100ms reads for faster response
-            tracing::debug!("Reading from FleaScope with duration: {:?}", duration);
-            match fleascope.read(probe_type, duration, trigger, None) {
+            let duration = Duration::from_millis(100);
+            // Now call hardware read without holding any lock
+            let out = match fleascope.read(probe_type, duration, trigger, None) {
                 Ok(lazy_frame) => {
-                    tracing::debug!("Successfully read lazy frame from FleaScope");
                     match lazy_frame.collect() {
-                        Ok(df) => {
-                            tracing::debug!("Successfully collected DataFrame with {} rows", df.height());
-                            return Self::convert_polars_to_data_points(df);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to collect data frame: {}", e);
-                        }
+                        Ok(df) => Self::convert_polars_to_data_points(df),
+                        Err(_) => None,
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to read from FleaScope: {}", e);
-                }
-            }
-        }
-        None
+                Err(_) => None,
+            };
+            fleascope_opt = Some(fleascope); // Put it back
+            out
+        } else {
+            None
+        };
+        // Put the FleaScope back in the mutex
+        let mut guard = fleascope_arc.lock().unwrap();
+        *guard = fleascope_opt;
+        result
     }
 
     fn convert_trigger_config(trigger_config: &TriggerConfig) -> Option<Trigger> {
@@ -562,29 +637,6 @@ impl FleaScopeDevice {
     pub fn is_paused(&self) -> bool {
         self.is_paused.load(Ordering::Relaxed)
     }
-
-    pub fn set_waveform(&mut self, waveform_type: WaveformType, frequency_hz: f64) {
-        self.waveform_config.waveform_type = waveform_type;
-        self.waveform_config.frequency_hz = frequency_hz.clamp(10.0, 4000.0);
-        self.waveform_config.enabled = true;
-    }
-
-    pub fn disable_waveform(&mut self) {
-        self.waveform_config.enabled = false;
-    }
-
-    pub fn get_waveform_status(&self) -> String {
-        if self.waveform_config.enabled {
-            let freq_str = if self.waveform_config.frequency_hz >= 1000.0 {
-                format!("{:.1}kHz", self.waveform_config.frequency_hz / 1000.0)
-            } else {
-                format!("{:.0}Hz", self.waveform_config.frequency_hz)
-            };
-            format!("{} {}", self.waveform_config.waveform_type.as_str(), freq_str)
-        } else {
-            "Off".to_string()
-        }
-    }
 }
 
 impl Clone for FleaScopeDevice {
@@ -601,6 +653,7 @@ impl Clone for FleaScopeDevice {
             trigger_config: self.trigger_config.clone(),
             waveform_config: self.waveform_config.clone(),
             fleascope: Arc::clone(&self.fleascope),
+            config_sender: None, // Config sender is not cloned
         }
     }
 }
@@ -623,11 +676,10 @@ impl DeviceManager {
         let device = FleaScopeDevice::new(id, name, hostname);
 
         // Auto-connect and start data generation for demo
-        let device_clone = device.clone();
+        let mut device_clone = device.clone();
         tokio::spawn(async move {
-            let dev = device_clone;
-            if dev.connect().await.is_ok() {
-                dev.start_data_generation();
+            if device_clone.connect().await.is_ok() {
+                device_clone.start_data_generation();
             }
         });
 
@@ -792,4 +844,12 @@ impl WaveformConfig {
     pub fn clamp_frequency(&mut self) {
         self.frequency_hz = self.frequency_hz.clamp(10.0, 4000.0);
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigUpdate {
+    pub probe_multiplier: ProbeMultiplier,
+    pub trigger_config: TriggerConfig,
+    pub waveform_config: WaveformConfig,
+    pub time_frame: f64,
 }
