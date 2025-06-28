@@ -18,6 +18,7 @@ This Rust-based oscilloscope GUI provides a modern, high-performance interface f
 - **DeviceManager**: Manages multiple devices and their lifecycle
 - **DataPoint**: Single measurement with analog and digital channels
 - **DeviceData**: Time-series data buffer for each device
+- **WaveformConfig**: Waveform generator configuration and state
 
 #### 3. Plot Visualization (`plot_area.rs`)
 - **PlotArea**: Main plotting component for real-time visualization
@@ -30,6 +31,7 @@ This Rust-based oscilloscope GUI provides a modern, high-performance interface f
 - **Device Rack**: Visual representation of connected devices
 - **Channel Configuration**: Enable/disable individual channels
 - **Trigger Settings**: Configurable trigger parameters
+- **Waveform Generator**: Built-in signal generator controls
 
 ### Data Flow Architecture
 
@@ -220,6 +222,37 @@ pub struct PlotArea {
     show_grid: bool,
     auto_scale: bool,
     time_window: f64,
+}
+```
+
+### Waveform Generator
+
+Each FleaScope device includes a built-in waveform generator with the following capabilities:
+
+#### Supported Waveforms
+- **Sine Wave (～)**: Pure sinusoidal signal
+- **Square Wave (⊓)**: Digital square wave with 50% duty cycle
+- **Triangle Wave (△)**: Linear ramp up/down pattern
+- **EKG Wave (💓)**: Electrocardiogram-like pattern for biomedical simulation
+
+#### Frequency Control
+- **Range**: 10 Hz to 4 kHz
+- **Control**: Logarithmic slider for fine control across the range
+- **Presets**: Quick-access buttons for common frequencies (10Hz, 50Hz, 100Hz, 500Hz, 1kHz, 2kHz)
+- **Display**: Smart formatting (Hz for < 1kHz, kHz for ≥ 1kHz)
+
+#### User Interface
+- **Collapsible Panel**: Waveform controls are in an expandable section of the device rack
+- **Visual Indicators**: Waveform type icon appears in device header when generator is active
+- **Status Display**: Current waveform frequency shown in device statistics
+- **Enable/Disable**: Simple ON/OFF toggle for each device's generator
+
+#### Configuration Structure
+```rust
+pub struct WaveformConfig {
+    pub enabled: bool,
+    pub waveform_type: WaveformType,
+    pub frequency_hz: f64, // 10.0 to 4000.0 Hz
 }
 ```
 

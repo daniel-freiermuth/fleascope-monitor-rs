@@ -72,6 +72,7 @@ pub struct FleaScopeDevice {
     pub is_paused: Arc<AtomicBool>,   // Pause/continue state (thread-safe)
     pub probe_multiplier: ProbeMultiplier, // Probe selection
     pub trigger_config: TriggerConfig, // Trigger configuration
+    pub waveform_config: WaveformConfig, // Waveform generator configuration
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,6 +109,7 @@ impl FleaScopeDevice {
             is_paused: Arc::new(AtomicBool::new(false)), // Running by default
             probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
             trigger_config: TriggerConfig::default(), // Default trigger config
+            waveform_config: WaveformConfig::default(), // Default waveform config
         }
     }
 
@@ -212,6 +214,29 @@ impl FleaScopeDevice {
     pub fn is_paused(&self) -> bool {
         self.is_paused.load(Ordering::Relaxed)
     }
+
+    pub fn set_waveform(&mut self, waveform_type: WaveformType, frequency_hz: f64) {
+        self.waveform_config.waveform_type = waveform_type;
+        self.waveform_config.frequency_hz = frequency_hz.clamp(10.0, 4000.0);
+        self.waveform_config.enabled = true;
+    }
+
+    pub fn disable_waveform(&mut self) {
+        self.waveform_config.enabled = false;
+    }
+
+    pub fn get_waveform_status(&self) -> String {
+        if self.waveform_config.enabled {
+            let freq_str = if self.waveform_config.frequency_hz >= 1000.0 {
+                format!("{:.1}kHz", self.waveform_config.frequency_hz / 1000.0)
+            } else {
+                format!("{:.0}Hz", self.waveform_config.frequency_hz)
+            };
+            format!("{} {}", self.waveform_config.waveform_type.as_str(), freq_str)
+        } else {
+            "Off".to_string()
+        }
+    }
 }
 
 impl Clone for FleaScopeDevice {
@@ -226,6 +251,7 @@ impl Clone for FleaScopeDevice {
             is_paused: Arc::clone(&self.is_paused),
             probe_multiplier: self.probe_multiplier,
             trigger_config: self.trigger_config.clone(),
+            waveform_config: self.waveform_config.clone(),
         }
     }
 }
@@ -361,5 +387,60 @@ impl DigitalBitState {
             DigitalBitState::Low => DigitalBitState::High,
             DigitalBitState::High => DigitalBitState::DontCare,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WaveformType {
+    Sine,
+    Square,
+    Triangle,
+    Ekg,
+}
+
+impl WaveformType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WaveformType::Sine => "Sine",
+            WaveformType::Square => "Square",
+            WaveformType::Triangle => "Triangle",
+            WaveformType::Ekg => "EKG",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            WaveformType::Sine => "～",
+            WaveformType::Square => "⊓",
+            WaveformType::Triangle => "△",
+            WaveformType::Ekg => "💓",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WaveformConfig {
+    pub enabled: bool,
+    pub waveform_type: WaveformType,
+    pub frequency_hz: f64, // 10 Hz to 4000 Hz
+}
+
+impl Default for WaveformConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            waveform_type: WaveformType::Sine,
+            frequency_hz: 100.0, // Default 100 Hz
+        }
+    }
+}
+
+impl WaveformConfig {
+    pub fn is_frequency_valid(&self) -> bool {
+        self.frequency_hz >= 10.0 && self.frequency_hz <= 4000.0
+    }
+
+    pub fn clamp_frequency(&mut self) {
+        self.frequency_hz = self.frequency_hz.clamp(10.0, 4000.0);
     }
 }

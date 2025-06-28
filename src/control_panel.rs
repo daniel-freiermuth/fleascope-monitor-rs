@@ -126,6 +126,12 @@ impl ControlPanel {
             let status_color = if device.is_connected() { Color32::GREEN } else { Color32::RED };
             ui.colored_label(status_color, "●");
             ui.label(RichText::new(&device.name).strong().size(14.0));
+            
+            // Waveform indicator
+            if device.waveform_config.enabled {
+                ui.label(RichText::new(device.waveform_config.waveform_type.icon()).size(12.0).color(Color32::LIGHT_BLUE));
+            }
+            
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("✕").on_hover_text("Remove").clicked() {
                     *to_remove = Some(idx);
@@ -212,6 +218,15 @@ impl ControlPanel {
                 self.render_compact_trigger_config(ui, device, idx, notifications);
             });
 
+        // Waveform Generator - Very Compact
+        ui.add_space(1.0);
+        egui::CollapsingHeader::new(RichText::new("🌊 WAVEFORM").size(11.0).strong())
+            .id_source(format!("waveform_device_{}", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+                self.render_waveform_config(ui, device, idx, notifications);
+            });
+
         // Statistics - Minimal
         if device.is_connected() {
             ui.add_space(1.0);
@@ -222,6 +237,14 @@ impl ControlPanel {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&format!("📊 {}ms", update_age)).size(9.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if device.waveform_config.enabled {
+                        let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
+                            format!("{:.1}k", device.waveform_config.frequency_hz / 1000.0)
+                        } else {
+                            format!("{:.0}", device.waveform_config.frequency_hz)
+                        };
+                        ui.label(RichText::new(&format!("🌊{}", freq_str)).size(9.0).color(Color32::LIGHT_BLUE));
+                    }
                     ui.label(RichText::new("1kHz").size(9.0).weak());
                 });
             });
@@ -551,5 +574,105 @@ impl ControlPanel {
                 .join("");
             ui.code(RichText::new(pattern_str).size(11.0));
         });
+    }
+
+    fn render_waveform_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        notifications: &mut NotificationManager,
+    ) {
+        // Enable/Disable Toggle
+        ui.horizontal(|ui| {
+            ui.label("EN:");
+            let enabled = device.waveform_config.enabled;
+            let button_text = if enabled { "ON" } else { "OFF" };
+            let mut new_enabled = enabled;
+            if ui.toggle_value(&mut new_enabled, button_text).on_hover_text("Enable Waveform Generator").clicked() {
+                device.waveform_config.enabled = new_enabled;
+                let status = if new_enabled { "enabled" } else { "disabled" };
+                notifications.add_info(format!("Waveform generator {} - {}", status, device.name));
+            }
+        });
+
+        if device.waveform_config.enabled {
+            ui.add_space(1.0);
+
+            // Waveform Type Selection
+            ui.horizontal(|ui| {
+                ui.label("TYPE:");
+                let current_type = device.waveform_config.waveform_type;
+                
+                let is_sine = current_type == crate::device::WaveformType::Sine;
+                let is_square = current_type == crate::device::WaveformType::Square;
+                let is_triangle = current_type == crate::device::WaveformType::Triangle;
+                let is_ekg = current_type == crate::device::WaveformType::Ekg;
+                
+                if ui.selectable_label(is_sine, "～").on_hover_text("Sine Wave").clicked() {
+                    device.waveform_config.waveform_type = crate::device::WaveformType::Sine;
+                    notifications.add_info(format!("Waveform: Sine - {}", device.name));
+                }
+                if ui.selectable_label(is_square, "⊓").on_hover_text("Square Wave").clicked() {
+                    device.waveform_config.waveform_type = crate::device::WaveformType::Square;
+                    notifications.add_info(format!("Waveform: Square - {}", device.name));
+                }
+                if ui.selectable_label(is_triangle, "△").on_hover_text("Triangle Wave").clicked() {
+                    device.waveform_config.waveform_type = crate::device::WaveformType::Triangle;
+                    notifications.add_info(format!("Waveform: Triangle - {}", device.name));
+                }
+                if ui.selectable_label(is_ekg, "💓").on_hover_text("EKG Wave").clicked() {
+                    device.waveform_config.waveform_type = crate::device::WaveformType::Ekg;
+                    notifications.add_info(format!("Waveform: EKG - {}", device.name));
+                }
+            });
+
+            // Frequency Control
+            ui.horizontal(|ui| {
+                ui.label("FREQ:");
+                let mut freq = device.waveform_config.frequency_hz as f32;
+                if ui.add(egui::Slider::new(&mut freq, 10.0..=4000.0)
+                    .logarithmic(true)
+                    .suffix("Hz")
+                    .show_value(false)
+                    .custom_formatter(|v, _| {
+                        if v >= 1000.0 {
+                            format!("{:.1}kHz", v / 1000.0)
+                        } else {
+                            format!("{:.0}Hz", v)
+                        }
+                    })).changed() {
+                    device.waveform_config.frequency_hz = freq as f64;
+                    device.waveform_config.clamp_frequency();
+                    let freq_str = if freq >= 1000.0 {
+                        format!("{:.1}kHz", freq / 1000.0)
+                    } else {
+                        format!("{:.0}Hz", freq)
+                    };
+                    notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
+                }
+            });
+
+            // Quick Frequency Presets
+            ui.horizontal(|ui| {
+                ui.label("PRESET:");
+                for freq in [10.0, 50.0, 100.0, 500.0, 1000.0, 2000.0] {
+                    let label = if freq >= 1000.0 {
+                        format!("{}k", freq / 1000.0)
+                    } else {
+                        format!("{}", freq)
+                    };
+                    if ui.small_button(label).on_hover_text(&format!("{}Hz", freq)).clicked() {
+                        device.waveform_config.frequency_hz = freq;
+                        let freq_str = if freq >= 1000.0 {
+                            format!("{:.1}kHz", freq / 1000.0)
+                        } else {
+                            format!("{:.0}Hz", freq)
+                        };
+                        notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
+                    }
+                }
+            });
+        }
     }
 }
