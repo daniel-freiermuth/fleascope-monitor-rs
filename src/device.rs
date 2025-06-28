@@ -356,11 +356,25 @@ impl FleaScopeDevice {
             let out = match fleascope.read(probe_type, duration, trigger, None) {
                 Ok(lazy_frame) => {
                     match lazy_frame.collect() {
-                        Ok(df) => Self::convert_polars_to_data_points(df),
-                        Err(_) => None,
+                        Ok(df) => {
+                            let res = Self::convert_polars_to_data_points(df);
+                            if let Some((ref x, ref y)) = res {
+                                tracing::info!("[DATA] Got {} points, first x: {:?}", x.len(), x.get(0));
+                            } else {
+                                tracing::warn!("[DATA] DataFrame conversion returned None");
+                            }
+                            res
+                        },
+                        Err(e) => {
+                            tracing::warn!("Failed to collect data frame: {}", e);
+                            None
+                        },
                     }
                 }
-                Err(_) => None,
+                Err(e) => {
+                    tracing::warn!("Failed to read from FleaScope: {}", e);
+                    None
+                },
             };
             fleascope_opt = Some(fleascope); // Put it back
             out
@@ -554,7 +568,7 @@ impl FleaScopeDevice {
 
         // Verify we have data
         if time_values.is_empty() || bnc_values.is_empty() || bitmap_values.is_empty() {
-            tracing::error!("One or more data vectors are empty");
+            tracing::warn!("[DATA] One or more data vectors are empty: time={}, bnc={}, bitmap={}", time_values.len(), bnc_values.len(), bitmap_values.len());
             return None;
         }
 
@@ -579,7 +593,7 @@ impl FleaScopeDevice {
             });
         }
 
-        tracing::debug!("Converted to {} data points", data_points.len());
+        tracing::info!("[DATA] Returning {} data points", x_values.len());
         Some((x_values, data_points))
     }
 
