@@ -275,38 +275,183 @@ impl ControlPanel {
             });
         }
 
-        // Trigger Settings (Placeholder)
+        // Trigger Settings
         egui::CollapsingHeader::new("⚡ Trigger Settings")
             .id_source(format!("trigger_settings_device_{}", idx))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Mode:");
-                    let mut trigger_mode = "Auto".to_string();
-                    egui::ComboBox::from_id_source(format!("trigger_mode_device_{}", idx))
-                        .selected_text(&trigger_mode)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut trigger_mode, "Auto".to_string(), "Auto");
-                            ui.selectable_value(&mut trigger_mode, "Normal".to_string(), "Normal");
-                            ui.selectable_value(&mut trigger_mode, "Single".to_string(), "Single");
-                        });
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Level:");
-                    let mut trigger_level = 0.5f32;
-                    ui.add(egui::Slider::new(&mut trigger_level, 0.0..=1.0).suffix("V"));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Slope:");
-                    let mut trigger_slope = "Rising".to_string();
-                    egui::ComboBox::from_id_source(format!("trigger_slope_device_{}", idx))
-                        .selected_text(&trigger_slope)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut trigger_slope, "Rising".to_string(), "Rising");
-                            ui.selectable_value(&mut trigger_slope, "Falling".to_string(), "Falling");
-                        });
-                });
+                self.render_trigger_config(ui, device, idx, notifications);
             });
+    }
+
+    fn render_trigger_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        notifications: &mut NotificationManager,
+    ) {
+        // Trigger Source Selection
+        ui.horizontal(|ui| {
+            ui.label("Source:");
+            let mut source = device.trigger_config.source;
+            if ui.radio_value(&mut source, crate::device::TriggerSource::Analog, "Analog").clicked() {
+                device.trigger_config.source = source;
+                device.trigger_config.analog.enabled = true;
+                device.trigger_config.digital.enabled = false;
+                notifications.add_info(format!("Trigger source set to Analog for {}", device.name));
+            }
+            if ui.radio_value(&mut source, crate::device::TriggerSource::Digital, "Digital").clicked() {
+                device.trigger_config.source = source;
+                device.trigger_config.analog.enabled = false;
+                device.trigger_config.digital.enabled = true;
+                notifications.add_info(format!("Trigger source set to Digital for {}", device.name));
+            }
+        });
+
+        ui.separator();
+
+        // Analog Trigger Configuration
+        if device.trigger_config.source == crate::device::TriggerSource::Analog {
+            self.render_analog_trigger_config(ui, device, idx, notifications);
+        }
+
+        // Digital Trigger Configuration
+        if device.trigger_config.source == crate::device::TriggerSource::Digital {
+            self.render_digital_trigger_config(ui, device, idx, notifications);
+        }
+    }
+
+    fn render_analog_trigger_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        notifications: &mut NotificationManager,
+    ) {
+        ui.label(RichText::new("📊 Analog Trigger").strong());
+
+        // Trigger Level
+        ui.horizontal(|ui| {
+            ui.label("Level:");
+            let mut level = device.trigger_config.analog.level as f32;
+            if ui.add(egui::Slider::new(&mut level, 0.0..=1.0).suffix("V")).changed() {
+                device.trigger_config.analog.level = level as f64;
+                notifications.add_info(format!("Analog trigger level set to {:.2}V for {}", level, device.name));
+            }
+        });
+
+        // Trigger Pattern
+        ui.horizontal(|ui| {
+            ui.label("Pattern:");
+            let mut pattern = device.trigger_config.analog.pattern;
+            egui::ComboBox::from_id_source(format!("analog_trigger_pattern_device_{}", idx))
+                .selected_text(match pattern {
+                    crate::device::AnalogTriggerPattern::Rising => "Rising Edge",
+                    crate::device::AnalogTriggerPattern::Falling => "Falling Edge",
+                    crate::device::AnalogTriggerPattern::Level => "Level",
+                    crate::device::AnalogTriggerPattern::LevelAuto => "Level + Auto",
+                })
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut pattern, crate::device::AnalogTriggerPattern::Rising, "Rising Edge").clicked() {
+                        device.trigger_config.analog.pattern = pattern;
+                        notifications.add_info(format!("Analog trigger pattern set to Rising Edge for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut pattern, crate::device::AnalogTriggerPattern::Falling, "Falling Edge").clicked() {
+                        device.trigger_config.analog.pattern = pattern;
+                        notifications.add_info(format!("Analog trigger pattern set to Falling Edge for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut pattern, crate::device::AnalogTriggerPattern::Level, "Level").clicked() {
+                        device.trigger_config.analog.pattern = pattern;
+                        notifications.add_info(format!("Analog trigger pattern set to Level for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut pattern, crate::device::AnalogTriggerPattern::LevelAuto, "Level + Auto").clicked() {
+                        device.trigger_config.analog.pattern = pattern;
+                        notifications.add_info(format!("Analog trigger pattern set to Level + Auto for {}", device.name));
+                    }
+                });
+        });
+    }
+
+    fn render_digital_trigger_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        notifications: &mut NotificationManager,
+    ) {
+        ui.label(RichText::new("💻 Digital Trigger").strong());
+
+        // Trigger Mode
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            let mut mode = device.trigger_config.digital.mode;
+            egui::ComboBox::from_id_source(format!("digital_trigger_mode_device_{}", idx))
+                .selected_text(match mode {
+                    crate::device::DigitalTriggerMode::StartMatching => "Start Matching",
+                    crate::device::DigitalTriggerMode::StopMatching => "Stop Matching",
+                    crate::device::DigitalTriggerMode::WhileMatching => "While Matching",
+                    crate::device::DigitalTriggerMode::WhileMatchingAuto => "While Matching + Auto",
+                })
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut mode, crate::device::DigitalTriggerMode::StartMatching, "Start Matching").clicked() {
+                        device.trigger_config.digital.mode = mode;
+                        notifications.add_info(format!("Digital trigger mode set to Start Matching for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut mode, crate::device::DigitalTriggerMode::StopMatching, "Stop Matching").clicked() {
+                        device.trigger_config.digital.mode = mode;
+                        notifications.add_info(format!("Digital trigger mode set to Stop Matching for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut mode, crate::device::DigitalTriggerMode::WhileMatching, "While Matching").clicked() {
+                        device.trigger_config.digital.mode = mode;
+                        notifications.add_info(format!("Digital trigger mode set to While Matching for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut mode, crate::device::DigitalTriggerMode::WhileMatchingAuto, "While Matching + Auto").clicked() {
+                        device.trigger_config.digital.mode = mode;
+                        notifications.add_info(format!("Digital trigger mode set to While Matching + Auto for {}", device.name));
+                    }
+                });
+        });
+
+        // Bit Pattern Configuration
+        ui.label("Bit Pattern:");
+        ui.horizontal(|ui| {
+            ui.label("Channel:");
+            for ch in 0..9 {
+                ui.label(format!("D{}", ch));
+            }
+        });
+        
+        ui.horizontal(|ui| {
+            ui.label("Pattern:");
+            for ch in 0..9 {
+                let bit_state = device.trigger_config.digital.bit_pattern[ch];
+                let button_color = match bit_state {
+                    crate::device::DigitalBitState::DontCare => egui::Color32::GRAY,
+                    crate::device::DigitalBitState::Low => egui::Color32::RED,
+                    crate::device::DigitalBitState::High => egui::Color32::GREEN,
+                };
+                
+                if ui.button(RichText::new(bit_state.as_str()).color(button_color)).clicked() {
+                    device.trigger_config.digital.bit_pattern[ch] = bit_state.cycle();
+                    let new_state = device.trigger_config.digital.bit_pattern[ch];
+                    notifications.add_info(format!("Digital trigger D{} set to {} for {}", ch, new_state.as_str(), device.name));
+                }
+            }
+        });
+
+        // Pattern Preview
+        ui.horizontal(|ui| {
+            ui.label("Current pattern:");
+            let pattern_str: String = device.trigger_config.digital.bit_pattern.iter()
+                .map(|bit| bit.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            ui.code(pattern_str);
+            
+            if ui.small_button("Clear All").clicked() {
+                device.trigger_config.digital.bit_pattern = [crate::device::DigitalBitState::DontCare; 9];
+                notifications.add_info(format!("Digital trigger pattern cleared for {}", device.name));
+            }
+        });
     }
 }

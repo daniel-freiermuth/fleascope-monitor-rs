@@ -71,6 +71,7 @@ pub struct FleaScopeDevice {
     pub time_frame: f64,              // Time window in seconds
     pub is_paused: Arc<AtomicBool>,   // Pause/continue state (thread-safe)
     pub probe_multiplier: ProbeMultiplier, // Probe selection
+    pub trigger_config: TriggerConfig, // Trigger configuration
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,6 +107,7 @@ impl FleaScopeDevice {
             time_frame: 2.0,             // Default 2 seconds
             is_paused: Arc::new(AtomicBool::new(false)), // Running by default
             probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
+            trigger_config: TriggerConfig::default(), // Default trigger config
         }
     }
 
@@ -223,6 +225,7 @@ impl Clone for FleaScopeDevice {
             time_frame: self.time_frame,
             is_paused: Arc::clone(&self.is_paused),
             probe_multiplier: self.probe_multiplier,
+            trigger_config: self.trigger_config.clone(),
         }
     }
 }
@@ -271,6 +274,92 @@ impl DeviceManager {
             Ok(())
         } else {
             Err(anyhow::anyhow!("Device index out of bounds"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TriggerSource {
+    Analog,
+    Digital,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnalogTriggerPattern {
+    Rising,
+    Falling,
+    Level,
+    LevelAuto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DigitalTriggerMode {
+    StartMatching,  // Trigger when pattern starts matching
+    StopMatching,   // Trigger when pattern stops matching
+    WhileMatching,  // Trigger while pattern is matching
+    WhileMatchingAuto, // Auto mode while matching
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DigitalBitState {
+    DontCare,  // X - bit value doesn't matter
+    Low,       // 0 - bit must be low
+    High,      // 1 - bit must be high
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalogTriggerConfig {
+    pub enabled: bool,
+    pub level: f64,           // Trigger level (0.0 to 1.0)
+    pub pattern: AnalogTriggerPattern,
+}
+
+#[derive(Debug, Clone)]
+pub struct DigitalTriggerConfig {
+    pub enabled: bool,
+    pub bit_pattern: [DigitalBitState; 9], // Pattern for 9 digital channels
+    pub mode: DigitalTriggerMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerConfig {
+    pub source: TriggerSource,
+    pub analog: AnalogTriggerConfig,
+    pub digital: DigitalTriggerConfig,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            source: TriggerSource::Analog,
+            analog: AnalogTriggerConfig {
+                enabled: true,
+                level: 0.5,
+                pattern: AnalogTriggerPattern::Rising,
+            },
+            digital: DigitalTriggerConfig {
+                enabled: false,
+                bit_pattern: [DigitalBitState::DontCare; 9],
+                mode: DigitalTriggerMode::StartMatching,
+            },
+        }
+    }
+}
+
+impl DigitalBitState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DigitalBitState::DontCare => "X",
+            DigitalBitState::Low => "0",
+            DigitalBitState::High => "1",
+        }
+    }
+
+    pub fn cycle(&self) -> Self {
+        match self {
+            DigitalBitState::DontCare => DigitalBitState::Low,
+            DigitalBitState::Low => DigitalBitState::High,
+            DigitalBitState::High => DigitalBitState::DontCare,
         }
     }
 }
