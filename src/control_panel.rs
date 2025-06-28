@@ -202,35 +202,37 @@ impl ControlPanel {
         }
 
         // Trigger Settings (Placeholder)
-        ui.collapsing("⚡ Trigger Settings", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                let mut trigger_mode = "Auto".to_string();
-                egui::ComboBox::from_id_source(format!("trigger_mode_device_{}", idx))
-                    .selected_text(&trigger_mode)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut trigger_mode, "Auto".to_string(), "Auto");
-                        ui.selectable_value(&mut trigger_mode, "Normal".to_string(), "Normal");
-                        ui.selectable_value(&mut trigger_mode, "Single".to_string(), "Single");
-                    });
-            });
+        egui::CollapsingHeader::new("⚡ Trigger Settings")
+            .id_source(format!("trigger_settings_device_{}", idx))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    let mut trigger_mode = "Auto".to_string();
+                    egui::ComboBox::from_id_source(format!("trigger_mode_device_{}", idx))
+                        .selected_text(&trigger_mode)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut trigger_mode, "Auto".to_string(), "Auto");
+                            ui.selectable_value(&mut trigger_mode, "Normal".to_string(), "Normal");
+                            ui.selectable_value(&mut trigger_mode, "Single".to_string(), "Single");
+                        });
+                });
 
-            ui.horizontal(|ui| {
-                ui.label("Level:");
-                let mut trigger_level = 0.5f32;
-                ui.add(egui::Slider::new(&mut trigger_level, 0.0..=1.0).suffix("V"));
-            });
+                ui.horizontal(|ui| {
+                    ui.label("Level:");
+                    let mut trigger_level = 0.5f32;
+                    ui.add(egui::Slider::new(&mut trigger_level, 0.0..=1.0).suffix("V"));
+                });
 
-            ui.horizontal(|ui| {
-                ui.label("Slope:");
-                let mut trigger_slope = "Rising".to_string();
-                egui::ComboBox::from_id_source(format!("trigger_slope_device_{}", idx))
-                    .selected_text(&trigger_slope)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut trigger_slope, "Rising".to_string(), "Rising");
-                        ui.selectable_value(&mut trigger_slope, "Falling".to_string(), "Falling");
-                    });
+                ui.horizontal(|ui| {
+                    ui.label("Slope:");
+                    let mut trigger_slope = "Rising".to_string();
+                    egui::ComboBox::from_id_source(format!("trigger_slope_device_{}", idx))
+                        .selected_text(&trigger_slope)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut trigger_slope, "Rising".to_string(), "Rising");
+                            ui.selectable_value(&mut trigger_slope, "Falling".to_string(), "Falling");
+                        });
+                });
             });
-        });
     }
 }
