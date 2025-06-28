@@ -1,4 +1,5 @@
 use crate::device::{DeviceManager, FleaScopeDevice};
+use crate::notifications::NotificationManager;
 use egui::{Color32, RichText};
 
 #[derive(Default)]
@@ -8,7 +9,7 @@ pub struct ControlPanel {
 }
 
 impl ControlPanel {
-    pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &mut DeviceManager) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &mut DeviceManager, notifications: &mut NotificationManager) {
         ui.heading("🎛️ Control Panel");
 
         ui.separator();
@@ -33,12 +34,16 @@ impl ControlPanel {
 
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() && !self.new_device_hostname.is_empty() {
-                        if let Err(e) = device_manager.add_device(self.new_device_hostname.clone())
-                        {
-                            tracing::error!("Failed to add device: {}", e);
-                        } else {
-                            self.new_device_hostname.clear();
-                            self.show_add_device = false;
+                        match device_manager.add_device(self.new_device_hostname.clone()) {
+                            Ok(_) => {
+                                notifications.add_success(format!("Connected to device: {}", self.new_device_hostname));
+                                self.new_device_hostname.clear();
+                                self.show_add_device = false;
+                            }
+                            Err(e) => {
+                                notifications.add_error(format!("Failed to connect to {}: {}", self.new_device_hostname, e));
+                                tracing::error!("Failed to add device: {}", e);
+                            }
                         }
                     }
                     if ui.button("Cancel").clicked() {
@@ -52,8 +57,14 @@ impl ControlPanel {
                 ui.horizontal_wrapped(|ui| {
                     for hostname in ["scope-001", "scope-002", "scope-003", "localhost:8080"] {
                         if ui.small_button(hostname).clicked() {
-                            if let Err(e) = device_manager.add_device(hostname.to_string()) {
-                                tracing::error!("Failed to add device: {}", e);
+                            match device_manager.add_device(hostname.to_string()) {
+                                Ok(_) => {
+                                    notifications.add_success(format!("Connected to device: {}", hostname));
+                                }
+                                Err(e) => {
+                                    notifications.add_error(format!("Failed to connect to {}: {}", hostname, e));
+                                    tracing::error!("Failed to add device: {}", e);
+                                }
                             }
                         }
                     }
@@ -87,12 +98,15 @@ impl ControlPanel {
 
                         for (idx, device) in device_manager.get_devices().iter().enumerate() {
                             ui.group(|ui| {
-                                self.render_device_rack(ui, device, idx, &mut to_remove);
+                                self.render_device_rack(ui, device, idx, &mut to_remove, notifications);
                             });
                             ui.add_space(5.0);
                         }
 
                         if let Some(idx) = to_remove {
+                            if let Some(device) = device_manager.get_devices().get(idx) {
+                                notifications.add_info(format!("Removed device: {}", device.name));
+                            }
                             let _ = device_manager.remove_device(idx);
                         }
                     });
@@ -106,6 +120,7 @@ impl ControlPanel {
         device: &FleaScopeDevice,
         idx: usize,
         to_remove: &mut Option<usize>,
+        notifications: &mut NotificationManager,
     ) {
         ui.horizontal(|ui| {
             // Connection status indicator
@@ -153,6 +168,8 @@ impl ControlPanel {
             if ui.checkbox(&mut enabled, "").clicked() {
                 // Note: In a real implementation, you'd need mutable access to device
                 // For now, this is just UI demonstration
+                let status = if enabled { "enabled" } else { "disabled" };
+                notifications.add_info(format!("Analog channel {} for {}", status, device.name));
             }
             ui.label("📊 Analog (12-bit)");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -170,6 +187,8 @@ impl ControlPanel {
                     let mut enabled = device.enabled_channels[ch + 1];
                     if ui.checkbox(&mut enabled, "").clicked() {
                         // Note: In a real implementation, you'd need mutable access to device
+                        let status = if enabled { "enabled" } else { "disabled" };
+                        notifications.add_info(format!("Digital channel D{} {} for {}", ch, status, device.name));
                     }
                     ui.label(format!("D{}", ch));
 

@@ -4,10 +4,12 @@ use tokio::sync::Mutex;
 
 mod control_panel;
 mod device;
+mod notifications;
 mod plot_area;
 
 use control_panel::ControlPanel;
 use device::DeviceManager;
+use notifications::NotificationManager;
 use plot_area::PlotArea;
 
 #[derive(Default)]
@@ -15,18 +17,27 @@ pub struct FleaScopeApp {
     device_manager: Arc<Mutex<DeviceManager>>,
     plot_area: PlotArea,
     control_panel: ControlPanel,
+    notification_manager: NotificationManager,
 }
 
 impl FleaScopeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
-        Self::default()
+        let mut app = Self::default();
+        
+        // Add welcome notification
+        app.notification_manager.add_info("🔬 FleaScope Live Oscilloscope started successfully!");
+        
+        app
     }
 }
 
 impl eframe::App for FleaScopeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update notifications (remove expired ones)
+        self.notification_manager.update();
+        
         // Request repaint for real-time updates
         ctx.request_repaint();
 
@@ -46,8 +57,14 @@ impl eframe::App for FleaScopeApp {
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Demo Notifications").clicked() {
+                        self.notification_manager.add_info("This is an info notification");
+                        self.notification_manager.add_success("Operation completed successfully!");
+                        self.notification_manager.add_error("This is an error notification");
+                    }
+                    ui.separator();
                     if ui.button("About").clicked() {
-                        // Show about dialog
+                        self.notification_manager.add_info("FleaScope Live Oscilloscope v0.1.0\nBuilt with Rust and egui");
                     }
                 });
 
@@ -119,7 +136,7 @@ impl eframe::App for FleaScopeApp {
 
                         // Access device manager safely for control panel
                         if let Ok(mut manager) = self.device_manager.try_lock() {
-                            self.control_panel.ui(ui, &mut manager);
+                            self.control_panel.ui(ui, &mut manager, &mut self.notification_manager);
                         } else {
                             ui.label("Loading control panel...");
                         }
@@ -127,6 +144,9 @@ impl eframe::App for FleaScopeApp {
                 );
             });
         });
+
+        // Render notifications (always last, so they appear on top)
+        self.notification_manager.ui(ctx);
     }
 }
 
