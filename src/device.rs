@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -60,13 +61,38 @@ impl DeviceData {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FleaScopeDevice {
     pub id: String,
     pub name: String,
     pub hostname: String,
     pub data: Arc<Mutex<DeviceData>>,
     pub enabled_channels: [bool; 10], // 1 analog + 9 digital
+    pub time_frame: f64,              // Time window in seconds
+    pub is_paused: Arc<AtomicBool>,   // Pause/continue state (thread-safe)
+    pub probe_multiplier: ProbeMultiplier, // Probe selection
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProbeMultiplier {
+    X1,
+    X10,
+}
+
+impl ProbeMultiplier {
+    pub fn get_factor(&self) -> f64 {
+        match self {
+            ProbeMultiplier::X1 => 1.0,
+            ProbeMultiplier::X10 => 10.0,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProbeMultiplier::X1 => "x1",
+            ProbeMultiplier::X10 => "x10",
+        }
+    }
 }
 
 impl FleaScopeDevice {
@@ -77,6 +103,9 @@ impl FleaScopeDevice {
             hostname,
             data: Arc::new(Mutex::new(DeviceData::new(1000.0))),
             enabled_channels: [true; 10], // All channels enabled by default
+            time_frame: 2.0,             // Default 2 seconds
+            is_paused: Arc::new(AtomicBool::new(false)), // Running by default
+            probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
         }
     }
 
@@ -107,7 +136,7 @@ impl FleaScopeDevice {
 
     pub fn start_data_generation(&self) {
         let data_arc = Arc::clone(&self.data);
-        let _device_name = self.name.clone();
+        let is_paused_arc = Arc::clone(&self.is_paused);
 
         tokio::spawn(async move {
             let mut time_offset = 0.0;
@@ -117,6 +146,11 @@ impl FleaScopeDevice {
 
             loop {
                 sleep(Duration::from_millis((1000.0 / update_rate) as u64)).await;
+
+                // Check if device is paused
+                if is_paused_arc.load(Ordering::Relaxed) {
+                    continue; // Skip data generation if paused
+                }
 
                 let mut data = data_arc.lock().unwrap();
 
@@ -154,6 +188,7 @@ impl FleaScopeDevice {
                 data.x_values = new_x_values;
                 data.data_points = new_data_points;
                 data.last_update = Instant::now();
+                drop(data);
 
                 time_offset += points_per_update as f64 / sample_rate;
             }
@@ -162,6 +197,33 @@ impl FleaScopeDevice {
 
     pub fn is_connected(&self) -> bool {
         self.data.lock().unwrap().connected
+    }
+
+    pub fn pause(&self) {
+        self.is_paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.is_paused.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for FleaScopeDevice {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            hostname: self.hostname.clone(),
+            data: Arc::clone(&self.data),
+            enabled_channels: self.enabled_channels,
+            time_frame: self.time_frame,
+            is_paused: Arc::clone(&self.is_paused),
+            probe_multiplier: self.probe_multiplier,
+        }
     }
 }
 

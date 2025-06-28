@@ -96,7 +96,7 @@ impl ControlPanel {
 
                         let mut to_remove = None;
 
-                        for (idx, device) in device_manager.get_devices().iter().enumerate() {
+                        for (idx, device) in device_manager.get_devices_mut().iter_mut().enumerate() {
                             ui.group(|ui| {
                                 self.render_device_rack(ui, device, idx, &mut to_remove, notifications);
                             });
@@ -104,9 +104,8 @@ impl ControlPanel {
                         }
 
                         if let Some(idx) = to_remove {
-                            if let Some(device) = device_manager.get_devices().get(idx) {
-                                notifications.add_info(format!("Removed device: {}", device.name));
-                            }
+                            let device_name = device_manager.get_devices().get(idx).map(|d| d.name.clone()).unwrap_or_else(|| "Unknown".to_string());
+                            notifications.add_info(format!("Removed device: {}", device_name));
                             let _ = device_manager.remove_device(idx);
                         }
                     });
@@ -117,7 +116,7 @@ impl ControlPanel {
     fn render_device_rack(
         &self,
         ui: &mut egui::Ui,
-        device: &FleaScopeDevice,
+        device: &mut FleaScopeDevice,
         idx: usize,
         to_remove: &mut Option<usize>,
         notifications: &mut NotificationManager,
@@ -166,8 +165,7 @@ impl ControlPanel {
         ui.horizontal(|ui| {
             let mut enabled = device.enabled_channels[0];
             if ui.checkbox(&mut enabled, "").clicked() {
-                // Note: In a real implementation, you'd need mutable access to device
-                // For now, this is just UI demonstration
+                device.enabled_channels[0] = enabled;
                 let status = if enabled { "enabled" } else { "disabled" };
                 notifications.add_info(format!("Analog channel {} for {}", status, device.name));
             }
@@ -186,7 +184,7 @@ impl ControlPanel {
                 for ch in 0..9 {
                     let mut enabled = device.enabled_channels[ch + 1];
                     if ui.checkbox(&mut enabled, "").clicked() {
-                        // Note: In a real implementation, you'd need mutable access to device
+                        device.enabled_channels[ch + 1] = enabled;
                         let status = if enabled { "enabled" } else { "disabled" };
                         notifications.add_info(format!("Digital channel D{} {} for {}", ch, status, device.name));
                     }
@@ -197,6 +195,63 @@ impl ControlPanel {
                     }
                 }
             });
+
+        ui.separator();
+
+        // Device Configuration
+        ui.label(RichText::new("Device Configuration").small().strong());
+        
+        // Time Frame Control
+        ui.horizontal(|ui| {
+            ui.label("⏱️ Time Window:");
+            let mut time_frame = device.time_frame as f32;
+            if ui.add(egui::Slider::new(&mut time_frame, 0.1..=10.0).suffix("s")).changed() {
+                device.time_frame = time_frame as f64;
+                notifications.add_info(format!("Time window changed to {:.1}s for {}", time_frame, device.name));
+            }
+        });
+
+        // Pause/Resume Control
+        ui.horizontal(|ui| {
+            let is_paused = device.is_paused();
+            let button_text = if is_paused { "▶️ Resume" } else { "⏸️ Pause" };
+            let button_color = if is_paused { egui::Color32::GREEN } else { egui::Color32::YELLOW };
+            
+            if ui.button(RichText::new(button_text).color(button_color)).clicked() {
+                if is_paused {
+                    device.resume();
+                    notifications.add_success(format!("Resumed data acquisition for {}", device.name));
+                } else {
+                    device.pause();
+                    notifications.add_info(format!("Paused data acquisition for {}", device.name));
+                }
+            }
+            
+            ui.label(if is_paused { 
+                RichText::new("Paused").color(egui::Color32::YELLOW)
+            } else { 
+                RichText::new("Running").color(egui::Color32::GREEN)
+            });
+        });
+
+        // Probe Selection
+        ui.horizontal(|ui| {
+            ui.label("🔍 Probe:");
+            let mut current_probe = device.probe_multiplier;
+            egui::ComboBox::from_id_source(format!("probe_selector_device_{}", idx))
+                .selected_text(current_probe.as_str())
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut current_probe, crate::device::ProbeMultiplier::X1, "x1").clicked() {
+                        device.probe_multiplier = current_probe;
+                        notifications.add_info(format!("Probe set to x1 for {}", device.name));
+                    }
+                    if ui.selectable_value(&mut current_probe, crate::device::ProbeMultiplier::X10, "x10").clicked() {
+                        device.probe_multiplier = current_probe;
+                        notifications.add_info(format!("Probe set to x10 for {}", device.name));
+                    }
+                });
+            ui.label(RichText::new(format!("({}x amplification)", current_probe.get_factor())).small().weak());
+        });
 
         ui.separator();
 

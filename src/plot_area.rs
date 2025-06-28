@@ -7,7 +7,6 @@ pub struct PlotArea {
     colors: Vec<Color32>,
     show_grid: bool,
     auto_scale: bool,
-    time_window: f64, // seconds
 }
 
 impl Default for PlotArea {
@@ -28,7 +27,6 @@ impl Default for PlotArea {
             ],
             show_grid: true,
             auto_scale: true,
-            time_window: 2.0, // Show 2 seconds of data
         }
     }
 }
@@ -40,9 +38,6 @@ impl PlotArea {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_grid, "Show Grid");
             ui.checkbox(&mut self.auto_scale, "Auto Scale");
-            ui.separator();
-            ui.label("Time Window:");
-            ui.add(egui::Slider::new(&mut self.time_window, 0.1..=10.0).suffix("s"));
             ui.separator();
             ui.label("Plot Height:");
             ui.add(egui::Slider::new(&mut self.plot_height, 100.0..=400.0).suffix("px"));
@@ -134,9 +129,9 @@ impl PlotArea {
             .allow_scroll(false);
 
         plot.show(ui, |plot_ui| {
-            // Filter data to time window
+            // Filter data to device's time window
             let latest_time = x_data.last().copied().unwrap_or(0.0);
-            let min_time = latest_time - self.time_window;
+            let min_time = latest_time - device.time_frame;
 
             let filtered_data: Vec<[f64; 2]> = x_data
                 .iter()
@@ -171,7 +166,7 @@ impl PlotArea {
         }
 
         let latest_time = x_data.last().copied().unwrap_or(0.0);
-        let min_time = latest_time - self.time_window;
+        let min_time = latest_time - device.time_frame;
 
         let plot = Plot::new(format!("digital_plot_{}", device_idx))
             .height(self.plot_height * 1.5) // Taller for multiple digital channels
