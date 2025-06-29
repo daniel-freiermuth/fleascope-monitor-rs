@@ -56,10 +56,6 @@ impl PlotArea {
                 ui.set_min_width(ui.available_width());
 
                 for (device_idx, device) in device_manager.get_devices().iter().enumerate() {
-                    if !device.is_connected() {
-                        continue;
-                    }
-
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&device.name).heading().strong());
@@ -67,11 +63,14 @@ impl PlotArea {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(format!("📡 {}", device.name));
+                                    let status_color = Color32::GREEN; // Default to green
+                                    /*
                                     let status_color = if device.is_connected() {
                                         Color32::GREEN
                                     } else {
                                         Color32::RED
                                     };
+                                    */
                                     ui.colored_label(status_color, "●");
                                 },
                             );

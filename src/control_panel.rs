@@ -123,7 +123,8 @@ impl ControlPanel {
     ) {
         // Device Header - Compact
         ui.horizontal(|ui| {
-            let status_color = if device.is_connected() { Color32::GREEN } else { Color32::RED };
+            // let status_color = if device.is_connected() { Color32::GREEN } else { Color32::RED };
+            let status_color = Color32::GREEN;
             ui.colored_label(status_color, "●");
             ui.label(RichText::new(&device.name).strong().size(14.0));
             
@@ -175,7 +176,7 @@ impl ControlPanel {
         ui.horizontal(|ui| {
             ui.label("⏱");
             let mut time_frame = device.time_frame as f32;
-            if ui.add(egui::Slider::new(&mut time_frame, 0.1..=10.0).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
+            if ui.add(egui::Slider::new(&mut time_frame, 0.0001..=10.0).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
                 device.set_time_frame(time_frame as f64);
                 notifications.add_info(format!("Time: {:.1}s - {}", time_frame, device.name));
             }
@@ -233,28 +234,26 @@ impl ControlPanel {
             });
 
         // Statistics - Minimal
-        if device.is_connected() {
-            ui.add_space(1.0);
-            
-            // Use ArcSwap load for always-smooth, lock-free data access
-            let data = device.data.load();
-            let update_age = data.last_update.elapsed().as_millis();
-            
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&format!("📊 {}ms", update_age)).size(9.0).weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if device.waveform_config.enabled {
-                        let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
-                            format!("{:.1}k", device.waveform_config.frequency_hz / 1000.0)
-                        } else {
-                            format!("{:.0}", device.waveform_config.frequency_hz)
-                        };
-                        ui.label(RichText::new(&format!("🌊{}", freq_str)).size(9.0).color(Color32::LIGHT_BLUE));
-                    }
-                    ui.label(RichText::new("1kHz").size(9.0).weak());
-                });
+        ui.add_space(1.0);
+        
+        // Use ArcSwap load for always-smooth, lock-free data access
+        let data = device.data.load();
+        let update_age = data.last_update.elapsed().as_millis();
+        
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&format!("📊 {}ms", update_age)).size(9.0).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if device.waveform_config.enabled {
+                    let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
+                        format!("{:.1}k", device.waveform_config.frequency_hz / 1000.0)
+                    } else {
+                        format!("{:.0}", device.waveform_config.frequency_hz)
+                    };
+                    ui.label(RichText::new(&format!("🌊{}", freq_str)).size(9.0).color(Color32::LIGHT_BLUE));
+                }
+                ui.label(RichText::new("1kHz").size(9.0).weak());
             });
-        }
+        });
     }
 
     fn render_compact_trigger_config(
