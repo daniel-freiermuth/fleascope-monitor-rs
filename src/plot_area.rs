@@ -66,7 +66,7 @@ impl PlotArea {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(format!("📡 {}", device.hostname));
+                                    ui.label(format!("📡 {}", device.name));
                                     let status_color = if device.is_connected() {
                                         Color32::GREEN
                                     } else {
@@ -111,9 +111,9 @@ impl PlotArea {
         device: &FleaScopeDevice,
         device_idx: usize,
     ) {
-        let data_guard = device.data.lock().unwrap();
-        let (x_data, y_data) = data_guard.get_analog_data();
-        drop(data_guard);
+        // Use ArcSwap load for lock-free, smooth data access
+        let data = device.data.load();
+        let (x_data, y_data) = data.get_analog_data();
 
         if x_data.is_empty() {
             ui.label("No data available");
@@ -157,8 +157,9 @@ impl PlotArea {
         device: &FleaScopeDevice,
         device_idx: usize,
     ) {
-        let data_guard = device.data.lock().unwrap();
-        let x_data = &data_guard.x_values;
+        // Use ArcSwap load for lock-free, smooth data access
+        let data = device.data.load();
+        let x_data = &data.x_values;
 
         if x_data.is_empty() {
             ui.label("No data available");
@@ -183,7 +184,7 @@ impl PlotArea {
                     continue;
                 }
 
-                let (x_data, y_data) = data_guard.get_digital_channel_data(ch);
+                let (x_data, y_data) = data.get_digital_channel_data(ch);
 
                 let filtered_data: Vec<[f64; 2]> = x_data
                     .iter()
@@ -203,6 +204,5 @@ impl PlotArea {
                 }
             }
         });
-        drop(data_guard);
     }
 }
