@@ -342,7 +342,15 @@ impl FleaScopeDevice {
                     } else {
                         // No real hardware connected - wait and try again with cancellation support
                         tracing::trace!("No real hardware connected, waiting...");
-                        continue;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                            signal = config_change_rx.changed() => {
+                                if signal.is_ok() {
+                                    tracing::info!("Configuration changed while waiting, will restart");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -878,8 +886,7 @@ impl DeviceManager {
     }
 
     pub fn add_device(&mut self, hostname: String) -> Result<()> {
-        let name = format!("FleaScope {}", hostname);
-        let device = FleaScopeDevice::new(name);
+        let device = FleaScopeDevice::new(hostname);
 
         // Auto-connect and start data generation for demo
         let device_clone = device.clone();
@@ -965,16 +972,16 @@ pub struct TriggerConfig {
 impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
-            source: TriggerSource::Analog,
+            source: TriggerSource::Digital,
             analog: AnalogTriggerConfig {
-                enabled: true,
+                enabled: false,
                 level: 0.5,
                 pattern: AnalogTriggerPattern::Rising,
             },
             digital: DigitalTriggerConfig {
-                enabled: false,
+                enabled: true,
                 bit_pattern: [DigitalBitState::DontCare; 9],
-                mode: DigitalTriggerMode::StartMatching,
+                mode: DigitalTriggerMode::WhileMatchingAuto,
             },
         }
     }
