@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -23,6 +23,9 @@ pub struct DeviceData {
     pub sample_rate: f64,
     pub last_update: Instant,
     pub connected: bool,
+    pub read_duration: Duration,      // Last read operation duration
+    pub update_rate: f64,             // Current update rate (Hz)
+    pub consecutive_failures: u32,    // Number of consecutive read failures
 }
 
 impl DeviceData {
@@ -33,6 +36,9 @@ impl DeviceData {
             sample_rate,
             last_update: Instant::now(),
             connected: false,
+            read_duration: Duration::from_millis(0),
+            update_rate: 0.0,
+            consecutive_failures: 0,
         }
     }
 
@@ -182,33 +188,39 @@ impl FleaScopeDevice {
         let time_frame = self.time_frame;
 
         tokio::spawn(async move {
-            let mut time_offset = 0.0;
+            let mut _time_offset = 0.0;
             let sample_rate = 1000.0;
-            let update_rate = 10.0; // Reduce to 10 Hz for real hardware to give more time
-            let points_per_update = (sample_rate / update_rate) as usize;
+            let mut adaptive_delay = Duration::from_millis(20); // Start with high frequency
+            let points_per_update = (sample_rate / 20.0) as usize; // Target 20 Hz update rate
+            let mut consecutive_failures = 0;
+            let mut last_successful_read = Instant::now();
+            let mut last_rate_update = Instant::now();
+            let mut read_count = 0;
 
-            tracing::info!("Starting data generation loop with update rate: {} Hz", update_rate);
+            tracing::info!("Starting high-performance data generation loop");
 
             loop {
-                // sleep(Duration::from_millis((1000.0 / update_rate) as u64)).await;
-
-                // Check if device is paused
+                // Check if device is paused first
                 if is_paused_arc.load(Ordering::Relaxed) {
                     tracing::debug!("Device is paused, skipping data generation");
-                    continue; // Skip data generation if paused
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
                 }
 
-                // Check if we have a real FleaScope connection
+                // Check if we have a real FleaScope connection (non-blocking)
                 let use_real_data = {
-                    let fleascope = fleascope_arc.lock().unwrap();
-                    fleascope.is_some()
+                    if let Ok(fleascope) = fleascope_arc.try_lock() {
+                        fleascope.is_some()
+                    } else {
+                        // If we can't get the lock immediately, assume we have data and try later
+                        true
+                    }
                 };
 
-                tracing::info!("Data generation loop: use_real_data = {}", use_real_data);
-
                 if use_real_data {
-                    tracing::info!("Attempting to get real data from FleaScope");
-                    // Try to get real data from FleaScope
+                    let start_time = Instant::now();
+                    
+                    // Try to get real data from FleaScope (non-blocking for other devices)
                     match Self::get_real_fleascope_data(
                         &fleascope_arc,
                         probe_multiplier,
@@ -217,26 +229,77 @@ impl FleaScopeDevice {
                         time_frame,
                     ).await {
                         Some(real_data) => {
-                            tracing::info!("Successfully got real data with {} points", real_data.1.len());
-                            // Update data without holding the guard across await
-                            {
-                                let mut data = data_arc.lock().unwrap();
+                            let read_duration = start_time.elapsed();
+                            consecutive_failures = 0;
+                            last_successful_read = Instant::now();
+                            read_count += 1;
+                            
+                            tracing::trace!("Successfully got real data with {} points in {:?}", 
+                                           real_data.1.len(), read_duration);
+                            
+                            // Update data with minimal lock time and include performance metrics
+                            if let Ok(mut data) = data_arc.try_lock() {
                                 data.x_values = real_data.0;
                                 data.data_points = real_data.1;
                                 data.last_update = Instant::now();
+                                data.read_duration = read_duration;
+                                data.consecutive_failures = consecutive_failures;
+                                
+                                // Update read rate every second
+                                if last_rate_update.elapsed() >= Duration::from_secs(1) {
+                                    data.update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                                    read_count = 0;
+                                    last_rate_update = Instant::now();
+                                }
                             }
-                            time_offset += points_per_update as f64 / sample_rate;
+                            
+                            _time_offset += points_per_update as f64 / sample_rate;
+                            
+                            // Adaptive delay based on read performance
+                            adaptive_delay = if read_duration < Duration::from_millis(30) {
+                                // Fast reads: high frequency
+                                Duration::from_millis(20)
+                            } else if read_duration < Duration::from_millis(100) {
+                                // Medium reads: medium frequency
+                                Duration::from_millis(50)
+                            } else {
+                                // Slow reads: lower frequency but still responsive
+                                Duration::from_millis(100)
+                            };
                         }
                         None => {
-                            // Real data failed - just skip this iteration and try again
-                            tracing::info!("Failed to get real data, skipping iteration");
+                            consecutive_failures += 1;
+                            tracing::debug!("Failed to get real data (failure #{} consecutive)", consecutive_failures);
+                            
+                            // Update failure count in data (non-blocking)
+                            if let Ok(mut data) = data_arc.try_lock() {
+                                data.consecutive_failures = consecutive_failures;
+                            }
+                            
+                            // Exponential backoff based on consecutive failures
+                            let backoff_delay = match consecutive_failures {
+                                1..=3 => Duration::from_millis(50), // Short delay for temporary issues
+                                4..=10 => Duration::from_millis(100), // Medium delay for ongoing issues
+                                _ => Duration::from_millis(200), // Longer delay for persistent issues
+                            };
+                            
+                            adaptive_delay = backoff_delay;
+                            
+                            // If no successful reads for a long time, reduce frequency significantly
+                            if last_successful_read.elapsed() > Duration::from_secs(5) {
+                                adaptive_delay = Duration::from_millis(500);
+                                tracing::debug!("No successful reads for >5s, reducing frequency");
+                            }
                         }
                     }
                 } else {
                     // No real hardware connected - wait and try again
-                    tracing::info!("No real hardware connected, waiting...");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tracing::trace!("No real hardware connected, waiting...");
+                    adaptive_delay = Duration::from_millis(500);
                 }
+                
+                // Apply the adaptive delay (this allows other devices to work independently)
+                tokio::time::sleep(adaptive_delay).await;
             }
         });
     }
@@ -248,9 +311,17 @@ impl FleaScopeDevice {
         waveform_config: &WaveformConfig,
         time_frame: f64,
     ) -> Option<(Vec<f64>, Vec<DataPoint>)> {
-        let mut fleascope_guard = fleascope_arc.lock().unwrap();
+        // Use try_lock to avoid blocking other devices
+        let mut fleascope_guard = match fleascope_arc.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::trace!("FleaScope device busy, skipping this iteration");
+                return None;
+            }
+        };
+        
         if let Some(fleascope) = fleascope_guard.as_mut() {
-            // Set up waveform generator if enabled
+            // Set up waveform generator if enabled (quick operation)
             if waveform_config.enabled {
                 let waveform = match waveform_config.waveform_type {
                     WaveformType::Sine => Waveform::Sine,
@@ -260,13 +331,17 @@ impl FleaScopeDevice {
                 };
                 let freq = waveform_config.frequency_hz.round() as i32;
                 if let Err(e) = fleascope.set_waveform(waveform, freq) {
-                    tracing::warn!("Failed to set waveform: {}", e);
+                    tracing::debug!("Failed to set waveform: {}", e);
                 }
             }
 
-            // Convert our trigger config to fleascope-rs trigger (use None for auto-trigger in demo)
-            let trigger = None; // Use auto trigger for continuous data flow
-            // let trigger = Self::convert_trigger_config(trigger_config); // Enable when trigger config is working
+            // Convert trigger configuration properly
+            let trigger = Self::convert_trigger_config(trigger_config);
+            if trigger.is_some() {
+                tracing::trace!("Using configured trigger");
+            } else {
+                tracing::trace!("Using auto trigger for continuous data flow");
+            }
 
             // Convert probe type
             let probe_type = match probe_multiplier {
@@ -274,24 +349,30 @@ impl FleaScopeDevice {
                 ProbeMultiplier::X10 => ProbeType::X10,
             };
 
-            // Read data from the actual device
-            let duration = Duration::from_millis(100); // Use shorter 100ms reads for faster response
-            tracing::debug!("Reading from FleaScope with duration: {:?}", duration);
+            // Calculate duration based on time frame, but cap it for responsiveness
+            let max_duration = Duration::from_millis(50); // Maximum 50ms to keep GUI responsive
+            let frame_duration = Duration::from_millis((time_frame * 100.0) as u64);
+            let duration = frame_duration.min(max_duration);
+            
+            tracing::trace!("Reading from FleaScope with duration: {:?}", duration);
             match fleascope.read(probe_type, duration, trigger, None) {
                 Ok(lazy_frame) => {
-                    tracing::debug!("Successfully read lazy frame from FleaScope");
+                    // Release the lock as early as possible
+                    drop(fleascope_guard);
+                    
+                    // Collect the data (this can take time but doesn't block other devices)
                     match lazy_frame.collect() {
                         Ok(df) => {
-                            tracing::debug!("Successfully collected DataFrame with {} rows", df.height());
+                            tracing::trace!("Successfully collected DataFrame with {} rows", df.height());
                             return Self::convert_polars_to_data_points(df);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to collect data frame: {}", e);
+                            tracing::debug!("Failed to collect data frame: {}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read from FleaScope: {}", e);
+                    tracing::debug!("Failed to read from FleaScope: {}", e);
                 }
             }
         }
@@ -583,6 +664,24 @@ impl FleaScopeDevice {
             format!("{} {}", self.waveform_config.waveform_type.as_str(), freq_str)
         } else {
             "Off".to_string()
+        }
+    }
+
+    pub fn get_performance_status(&self) -> String {
+        if let Ok(data) = self.data.try_lock() {
+            let read_time_ms = data.read_duration.as_millis();
+            let update_rate = data.update_rate;
+            let failures = data.consecutive_failures;
+            
+            if failures > 0 {
+                format!("⚠️ {:.1}Hz, {}ms, {} failures", update_rate, read_time_ms, failures)
+            } else if update_rate > 10.0 {
+                format!("✅ {:.1}Hz, {}ms", update_rate, read_time_ms)
+            } else {
+                format!("🐌 {:.1}Hz, {}ms", update_rate, read_time_ms)
+            }
+        } else {
+            "🔒 Busy".to_string()
         }
     }
 }
