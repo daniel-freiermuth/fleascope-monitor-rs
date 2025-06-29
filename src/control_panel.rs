@@ -272,16 +272,12 @@ impl ControlPanel {
             if ui.selectable_label(is_analog, "📊").on_hover_text("Analog Trigger").clicked() {
                 let mut new_config = device.trigger_config.clone();
                 new_config.source = crate::device::TriggerSource::Analog;
-                new_config.analog.enabled = true;
-                new_config.digital.enabled = false;
                 device.set_trigger_config(new_config);
                 notifications.add_info(format!("Trigger: Analog - {}", device.name));
             }
             if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
                 let mut new_config = device.trigger_config.clone();
                 new_config.source = crate::device::TriggerSource::Digital;
-                new_config.analog.enabled = false;
-                new_config.digital.enabled = true;
                 device.set_trigger_config(new_config);
                 notifications.add_info(format!("Trigger: Digital - {}", device.name));
             }
@@ -441,14 +437,10 @@ impl ControlPanel {
             
             if ui.selectable_label(is_analog, "📊").on_hover_text("Analog Trigger").clicked() {
                 device.trigger_config.source = crate::device::TriggerSource::Analog;
-                device.trigger_config.analog.enabled = true;
-                device.trigger_config.digital.enabled = false;
                 notifications.add_info(format!("Trigger source set to Analog for {}", device.name));
             }
             if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
                 device.trigger_config.source = crate::device::TriggerSource::Digital;
-                device.trigger_config.analog.enabled = false;
-                device.trigger_config.digital.enabled = true;
                 notifications.add_info(format!("Trigger source set to Digital for {}", device.name));
             }
         });

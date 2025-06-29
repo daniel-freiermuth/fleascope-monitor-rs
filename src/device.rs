@@ -81,6 +81,14 @@ pub enum ProbeMultiplier {
     X10,
 }
 
+impl Into<ProbeType> for ProbeMultiplier {
+    fn into(self) -> ProbeType {
+        match self {
+            ProbeMultiplier::X1 => ProbeType::X1,
+            ProbeMultiplier::X10 => ProbeType::X10,
+        }
+    }
+}
 
 struct FleaWorker {
     fleascope: Arc<Mutex<FleaScope>>,
@@ -203,31 +211,21 @@ impl FleaWorker {
         time_frame: f64,
     ) -> Result<(Vec<f64>, Vec<DataPoint>),> {
         let fleascope_arc_clone = Arc::clone(fleascope_arc);
-        let probe_multiplier = probe_multiplier;
         let trigger_config = trigger_config.clone();
         
         // Run the potentially blocking hardware operation in a separate thread
         // Use a longer timeout (5 seconds) to allow legitimate reads while preventing infinite hangs
         // This is still much more responsive than allowing 20-second hangs
-        let read_task = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // Use try_lock to avoid blocking other devices
             tracing::trace!("Pre match");
             let mut fleascope = fleascope_arc_clone.try_lock().unwrap();
             tracing::trace!("Device available");
             
-            // Convert trigger configuration properly
-            let trigger = Self::convert_trigger_config(&trigger_config);
-
-            // Convert probe type
-            let probe_type = match probe_multiplier {
-                ProbeMultiplier::X1 => ProbeType::X1,
-                ProbeMultiplier::X10 => ProbeType::X10,
-            };
-
             let duration = Duration::from_secs_f64(time_frame);
             
             tracing::trace!("Reading from FleaScope with duration: {:?}", duration);
-            let lf = fleascope.read(probe_type, duration, Some(trigger), None)?;
+            let lf = fleascope.read(probe_multiplier.into(), duration, Some(trigger_config.into()), None)?;
             // Release the lock as early as possible
             drop(fleascope);
             
@@ -235,62 +233,9 @@ impl FleaWorker {
             let df = lf.collect()?;
             tracing::trace!("Successfully collected DataFrame with {} rows", df.height());
             return Ok(Self::convert_polars_to_data_points(df));
-        });
-        
-        // Apply a reasonable timeout to prevent indefinite hangs while allowing legitimate long reads
-        // 5 seconds should be enough for most triggers while keeping GUI responsive
-        
-        read_task.await?
+        }).await?
     }
 
-    fn convert_trigger_config(trigger_config: &TriggerConfig) -> Trigger {
-        match trigger_config.source {
-            TriggerSource::Analog => {
-                let analog_trigger = match trigger_config.analog.pattern {
-                    AnalogTriggerPattern::Rising => {
-                        AnalogTrigger::start_capturing_when()
-                            .rising_edge(trigger_config.analog.level)
-                    }
-                    AnalogTriggerPattern::Falling => {
-                        AnalogTrigger::start_capturing_when()
-                            .falling_edge(trigger_config.analog.level)
-                    }
-                    AnalogTriggerPattern::Level => {
-                        AnalogTrigger::start_capturing_when()
-                            .level(trigger_config.analog.level)
-                    }
-                    AnalogTriggerPattern::LevelAuto => {
-                        AnalogTrigger::start_capturing_when()
-                            .auto(trigger_config.analog.level)
-                    }
-                };
-                Trigger::from(analog_trigger)
-            }
-            TriggerSource::Digital => {
-                let mut digital_trigger = DigitalTrigger::start_capturing_when();
-                
-                // Set bit patterns
-                for (i, bit_state) in trigger_config.digital.bit_pattern.iter().enumerate() {
-                    let bit_value = match bit_state {
-                        DigitalBitState::DontCare => BitState::DontCare,
-                        DigitalBitState::Low => BitState::Low,
-                        DigitalBitState::High => BitState::High,
-                    };
-                    digital_trigger = digital_trigger.set_bit(i, bit_value);
-                }
-                
-                // Set trigger mode
-                let final_trigger = match trigger_config.digital.mode {
-                    DigitalTriggerMode::StartMatching => digital_trigger.starts_matching(),
-                    DigitalTriggerMode::StopMatching => digital_trigger.stops_matching(),
-                    DigitalTriggerMode::WhileMatching => digital_trigger.is_matching(),
-                    DigitalTriggerMode::WhileMatchingAuto => digital_trigger.is_matching(), // Note: auto not directly supported
-                };
-                
-                Trigger::from(final_trigger)
-            }
-        }
-    }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
         tracing::debug!("Converting DataFrame with columns: {:?}", df.get_column_names());
@@ -599,20 +544,58 @@ pub enum DigitalBitState {
     High,      // 1 - bit must be high
 }
 
+impl Into<BitState> for &DigitalBitState {
+    fn into(self) -> BitState {
+        match self {
+            DigitalBitState::DontCare => BitState::DontCare,
+            DigitalBitState::Low => BitState::Low,
+            DigitalBitState::High => BitState::High,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AnalogTriggerConfig {
-    pub enabled: bool,
     pub level: f64,           // Trigger level (0.0 to 1.0)
     pub pattern: AnalogTriggerPattern,
 }
 
+impl Into<Trigger> for AnalogTriggerConfig {
+    fn into(self) -> Trigger {
+        let analog_trigger = match self.pattern {
+            AnalogTriggerPattern::Rising => AnalogTrigger::start_capturing_when().rising_edge(self.level),
+            AnalogTriggerPattern::Falling => AnalogTrigger::start_capturing_when().falling_edge(self.level),
+            AnalogTriggerPattern::Level => AnalogTrigger::start_capturing_when().level(self.level),
+            AnalogTriggerPattern::LevelAuto => AnalogTrigger::start_capturing_when().auto(self.level),
+        };
+        Trigger::from(analog_trigger)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DigitalTriggerConfig {
-    pub enabled: bool,
     pub bit_pattern: [DigitalBitState; 9], // Pattern for 9 digital channels
     pub mode: DigitalTriggerMode,
 }
 
+impl Into<Trigger> for DigitalTriggerConfig {
+    fn into(self) -> Trigger {
+        let mut digital_trigger = DigitalTrigger::start_capturing_when();
+        
+        // Set bit patterns
+        for (i, bit_state) in self.bit_pattern.iter().enumerate() {
+            digital_trigger = digital_trigger.set_bit(i, bit_state.into());
+        }
+        
+        // Set trigger mode
+        Trigger::from(match self.mode {
+            DigitalTriggerMode::StartMatching => digital_trigger.starts_matching(),
+            DigitalTriggerMode::StopMatching => digital_trigger.stops_matching(),
+            DigitalTriggerMode::WhileMatching => digital_trigger.is_matching(),
+            DigitalTriggerMode::WhileMatchingAuto => digital_trigger.is_matching(), // Note: auto not directly supported
+        })
+    }
+}
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub source: TriggerSource,
@@ -620,17 +603,24 @@ pub struct TriggerConfig {
     pub digital: DigitalTriggerConfig,
 }
 
+impl Into<Trigger> for TriggerConfig {
+    fn into(self) -> Trigger {
+        match self.source {
+            TriggerSource::Analog => self.analog.into(),
+            TriggerSource::Digital => self.digital.into(),
+        }
+    }
+}
+
 impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             source: TriggerSource::Digital,
             analog: AnalogTriggerConfig {
-                enabled: false,
                 level: 0.5,
                 pattern: AnalogTriggerPattern::Rising,
             },
             digital: DigitalTriggerConfig {
-                enabled: true,
                 bit_pattern: [DigitalBitState::DontCare; 9],
                 mode: DigitalTriggerMode::WhileMatchingAuto,
             },
