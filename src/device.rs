@@ -35,6 +35,7 @@ pub struct DeviceData {
     pub data_points: Vec<DataPoint>,
     pub last_update: Instant,
     pub read_duration: Duration,      // Last read operation duration
+    pub update_rate: f64,
 }
 
 impl DeviceData {
@@ -44,6 +45,7 @@ impl DeviceData {
             data_points: Vec::new(),
             last_update: Instant::now(),
             read_duration: Duration::from_millis(0),
+            update_rate: 0.0,
         }
     }
 
@@ -117,13 +119,15 @@ impl FleaScopeDevice {
     pub fn start_data_generation(mut self) {
         // Create a new receiver for configuration changes
         let mut config_change_rx = self.config_change_tx.subscribe();
+        let mut update_rate = 0.0;
+        let mut last_rate_update = Instant::now();
+        let mut read_count = 0;
 
         // Start the cancellation-aware data generation loop
         let handle = tokio::spawn(async move {
             tracing::debug!("Starting cancellation-aware data generation loop");
             
             loop {
-                loop {
                     // Check if device is paused first
                     if self.is_paused {
                         tracing::debug!("Device is paused, skipping data generation");
@@ -160,15 +164,21 @@ impl FleaScopeDevice {
                                     
                                     // Update data with lock-free operation using ArcSwap
                                     {
-                                        let mut new_data = DeviceData {
+                                        let new_data = DeviceData {
                                             x_values : real_data.0,
                                             data_points : real_data.1,
                                             last_update : Instant::now(),
                                             read_duration : read_duration,
+                                            update_rate,
                                         };
-                                        
                                         self.data.store(Arc::new(new_data));
                                     }
+                                    if last_rate_update.elapsed() >= Duration::from_secs(1) {
+                                        update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                                        read_count = 0;
+                                        last_rate_update = Instant::now();
+                                    }
+                                    read_count += 1;
                                 }
                                 Err(e) => {
                                     tracing::debug!("Failed to read data from FleaScope: {}", e);
@@ -192,7 +202,8 @@ impl FleaScopeDevice {
                     }
                     if config_change_rx.has_changed().unwrap() {
                         let signal = config_change_rx.borrow_and_update();
-                        tracing::info!("Config changed");
+                        tracing::info!("Config changed: {:?}", signal);
+                        
                         match signal.clone() {
                             ConfigChangeSignal::ProbeMultiplierChanged(probe) => {
                                 self.probe_multiplier = probe;
@@ -208,7 +219,6 @@ impl FleaScopeDevice {
                             },
                             ConfigChangeSignal::Restart => todo!(),
                         }
-                    }
                 }
                 
                 // Inner loop ended due to config change - restart the inner loop with new config
@@ -217,21 +227,8 @@ impl FleaScopeDevice {
             }
         });
         
-        // Store the handle for cancellation
-        if let Ok(mut stored_handle) = self.data_generation_handle.try_lock() {
-            *stored_handle = Some(handle);
-        }
     }
-    
-    /// Cancel the current data generation task
-    pub fn cancel_data_generation(&self) {
-        if let Ok(mut handle_guard) = self.data_generation_handle.try_lock() {
-            if let Some(handle) = handle_guard.take() {
-                handle.abort();
-                tracing::info!("Cancelled data generation task");
-            }
-        }
-    }
+
     
     /// Signal that configuration has changed and data generation should restart
     fn signal_config_change(&self, signal: ConfigChangeSignal) {

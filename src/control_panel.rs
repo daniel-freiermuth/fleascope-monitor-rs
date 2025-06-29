@@ -176,7 +176,7 @@ impl ControlPanel {
         ui.horizontal(|ui| {
             ui.label("⏱");
             let mut time_frame = device.time_frame as f32;
-            if ui.add(egui::Slider::new(&mut time_frame, 0.0001..=10.0).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
+            if ui.add(egui::Slider::new(&mut time_frame, 0.0001..=3.4).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
                 device.set_time_frame(time_frame as f64);
                 notifications.add_info(format!("Time: {:.1}s - {}", time_frame, device.name));
             }
@@ -241,7 +241,7 @@ impl ControlPanel {
         let update_age = data.last_update.elapsed().as_millis();
         
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&format!("📊 {}ms", update_age)).size(9.0).weak());
+            ui.label(RichText::new(&format!("📊 {}ms. {:.2} Hz", update_age, data.update_rate)).size(9.0).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if device.waveform_config.enabled {
                     let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
@@ -295,7 +295,7 @@ impl ControlPanel {
             ui.horizontal(|ui| {
                 ui.label("LVL:");
                 let mut level = device.trigger_config.analog.level as f32;
-                if ui.add(egui::Slider::new(&mut level, 0.0..=1.0).suffix("V").show_value(false).custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
+                if ui.add(egui::Slider::new(&mut level, -6.6..=6.6).suffix("V").show_value(false).custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.level = level as f64;
                     device.set_trigger_config(new_config);
