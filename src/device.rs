@@ -1,25 +1,22 @@
 use anyhow::Result;
-use tracing_subscriber::field::debug;
-use std::panic;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{panic};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
-use tokio::sync::watch;
+use tokio::sync::watch::{self, Sender};
 use fleascope_rs::{FleaScope, ProbeType, Trigger, AnalogTrigger, DigitalTrigger, BitState};
 use polars::prelude::*;
 use arc_swap::ArcSwap;
 
-pub type ChannelData = Vec<f64>;
-pub type BinaryChannelData = Vec<bool>;
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    pub probe_multiplier: ProbeMultiplier,
+    pub trigger_config: TriggerConfig,
+    pub time_frame: f64,
+}
 
 #[derive(Debug, Clone)]
 pub enum ConfigChangeSignal {
-    ProbeMultiplierChanged(ProbeMultiplier),
-    TriggerConfigChanged(TriggerConfig),
-    WaveformConfigChanged(WaveformConfig),
-    TimeFrameChanged(f64),
-    Restart, // Generic restart signal
+    NewConfigSignal(CaptureConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -39,16 +36,6 @@ pub struct DeviceData {
 }
 
 impl DeviceData {
-    pub fn new() -> Self {
-        Self {
-            x_values: Vec::new(),
-            data_points: Vec::new(),
-            last_update: Instant::now(),
-            read_duration: Duration::from_millis(0),
-            update_rate: 0.0,
-        }
-    }
-
     pub fn get_analog_data(&self) -> (Vec<f64>, Vec<f64>) {
         let x = self.x_values.clone();
         let y = self.data_points.iter().map(|p| p.analog_channel).collect();
@@ -85,9 +72,7 @@ pub struct FleaScopeDevice {
     pub probe_multiplier: ProbeMultiplier, // Probe selection
     pub trigger_config: TriggerConfig, // Trigger configuration
     pub waveform_config: WaveformConfig, // Waveform generator configuration
-    fleascope: Arc<Mutex<FleaScope>>, // Actual FleaScope connection
     config_change_tx: watch::Sender<ConfigChangeSignal>, // Channel for configuration changes
-    data_generation_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>, // Handle to data generation task
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,38 +81,28 @@ pub enum ProbeMultiplier {
     X10,
 }
 
-impl FleaScopeDevice {
-    pub fn new(device: FleaScope) -> Self {
-        let (config_change_tx, _) = watch::channel(ConfigChangeSignal::Restart);
-        let name = device.get_hostname().to_string();
-        
-        Self {
-            name,
-            data: Arc::new(ArcSwap::new(Arc::new(DeviceData::new()))), // Initialize with Arc<ArcSwap>
-            enabled_channels: [true; 10], // All channels enabled by default
-            time_frame: 2.0,             // Default 2 seconds
-            is_paused: false, // Running by default
-            probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
-            trigger_config: TriggerConfig::default(), // Default trigger config
-            waveform_config: WaveformConfig::default(), // Default waveform config
-            fleascope: Arc::new(Mutex::new(device)), // No connection initially
-            config_change_tx,
-            data_generation_handle: Arc::new(Mutex::new(None)),
-        }
-    }
 
-    pub fn start_data_generation(mut self) {
+struct FleaWorker {
+    fleascope: Arc<Mutex<FleaScope>>,
+    data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
+    is_paused: bool,   // Pause/continue state (thread-safe)
+    config_change_rx: watch::Receiver<ConfigChangeSignal>, // Channel for configuration changes
+}
+
+impl FleaWorker {
+    pub fn start_data_generation(self) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes
-        let mut config_change_rx = self.config_change_tx.subscribe();
+        let mut config_change_rx = self.config_change_rx;
         let mut update_rate = 0.0;
         let mut last_rate_update = Instant::now();
         let mut read_count = 0;
 
         // Start the cancellation-aware data generation loop
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             tracing::debug!("Starting cancellation-aware data generation loop");
             
             loop {
+                tracing::debug!("Starting new data generation iteration");
                     // Check if device is paused first
                     if self.is_paused {
                         tracing::debug!("Device is paused, skipping data generation");
@@ -138,22 +113,26 @@ impl FleaScopeDevice {
                             signal = config_change_rx.changed() => {
                                 if signal.is_ok() {
                                     tracing::info!("Configuration changed while paused, will restart");
-                                    break;
                                 }
                             }
                         }
                         continue;
                     }
 
+                    tracing::debug!("Device is running, starting data generation");
                     let start_time = Instant::now();
+                    let capture_config = match config_change_rx.borrow_and_update().clone() {
+                        ConfigChangeSignal::NewConfigSignal(config) => config,
+                    };
+
                     
                     // Try to get real data from FleaScope with cancellation support
                     tokio::select! {
                         result = Self::get_real_fleascope_data(
                             &self.fleascope,
-                            self.probe_multiplier,
-                            &self.trigger_config,
-                            self.time_frame,
+                            capture_config.probe_multiplier,
+                            &capture_config.trigger_config,
+                            capture_config.time_frame,
                         ) => {
                             match result {
                                 Ok(real_data) => {
@@ -205,19 +184,7 @@ impl FleaScopeDevice {
                         tracing::info!("Config changed: {:?}", signal);
                         
                         match signal.clone() {
-                            ConfigChangeSignal::ProbeMultiplierChanged(probe) => {
-                                self.probe_multiplier = probe;
-                            },
-                            ConfigChangeSignal::TriggerConfigChanged(tc) => {
-                                self.trigger_config = tc;
-                            },
-                            ConfigChangeSignal::WaveformConfigChanged(wc) => {
-                                tracing::info!("Waveform config changed: {:?}. Not yet implemented", wc);
-                            },
-                            ConfigChangeSignal::TimeFrameChanged(t) => {
-                                self.time_frame = t;
-                            },
-                            ConfigChangeSignal::Restart => todo!(),
+                            ConfigChangeSignal::NewConfigSignal(capture_config) => {},
                         }
                 }
                 
@@ -225,19 +192,8 @@ impl FleaScopeDevice {
                 // Don't return here, just continue the outer loop to restart data acquisition
                 tracing::info!("Restarting data generation loop with updated configuration");
             }
-        });
+        })
         
-    }
-
-    
-    /// Signal that configuration has changed and data generation should restart
-    fn signal_config_change(&self, signal: ConfigChangeSignal) {
-        tracing::info!("Sent config change");
-        if let Err(_) = self.config_change_tx.send(signal) {
-            tracing::warn!("Failed to send config change signal");
-        } else {
-            tracing::debug!("Sent config change signal");
-        }
     }
 
     async fn get_real_fleascope_data(
@@ -445,6 +401,32 @@ impl FleaScopeDevice {
         (x_values, data_points)
     }
 
+}
+
+impl FleaScopeDevice {
+    pub fn new(name: String, config_change_tx: Sender<ConfigChangeSignal>, data: Arc<ArcSwap<DeviceData>>) -> Self {
+        Self {
+            name,
+            data,
+            enabled_channels: [true; 10], // All channels enabled by default
+            time_frame: 2.0,             // Default 2 seconds
+            is_paused: false, // Running by default
+            probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
+            trigger_config: TriggerConfig::default(), // Default trigger config
+            waveform_config: WaveformConfig::default(), // Default waveform config
+            config_change_tx,
+        }
+    }
+
+    /// Signal that configuration has changed and data generation should restart
+    fn signal_config_change(&self) {
+        self.config_change_tx.send(ConfigChangeSignal::NewConfigSignal(CaptureConfig {
+            probe_multiplier: self.probe_multiplier,
+            trigger_config: self.trigger_config.clone(),
+            time_frame: self.time_frame,
+        })).expect("Failed to send config change signal");
+    }
+
     fn generate_waveform(t: f64, config: &WaveformConfig) -> f64 {
         let freq = config.frequency_hz;
         let phase = 2.0 * std::f64::consts::PI * freq * t;
@@ -508,60 +490,23 @@ impl FleaScopeDevice {
         }
     }
 
-    /// Update probe multiplier and restart data generation with new settings
-    pub fn set_probe_multiplier(&mut self, probe_multiplier: ProbeMultiplier) {
-        if self.probe_multiplier != probe_multiplier {
-            self.probe_multiplier = probe_multiplier;
-            self.signal_config_change(ConfigChangeSignal::ProbeMultiplierChanged(probe_multiplier));
-        }
+    pub fn set_probe_multiplier(&mut self, multiplier: ProbeMultiplier) {
+        self.probe_multiplier = multiplier;
+        self.signal_config_change();
     }
-    
-    /// Update trigger configuration and restart data generation with new settings
-    pub fn set_trigger_config(&mut self, trigger_config: TriggerConfig) {
-        // Simple comparison - in a real implementation, you might want a more sophisticated comparison
-        self.trigger_config = trigger_config.clone();
-        self.signal_config_change(ConfigChangeSignal::TriggerConfigChanged(trigger_config));
-        // The data generation task will restart itself when it receives the signal
-    }
-    
-    /// Update waveform configuration and restart data generation with new settings
-    pub fn set_waveform_config(&mut self, waveform_config: WaveformConfig) {
-        self.waveform_config = waveform_config.clone();
-        self.signal_config_change(ConfigChangeSignal::WaveformConfigChanged(waveform_config));
-        // The data generation task will restart itself when it receives the signal
-    }
-    
-    /// Update enabled channels and restart data generation with new settings
-    pub fn set_enabled_channels(&mut self, enabled_channels: [bool; 10]) {
-        if self.enabled_channels != enabled_channels {
-            self.enabled_channels = enabled_channels;
-        }
-    }
-    
-    /// Update time frame and restart data generation with new settings
-    pub fn set_time_frame(&mut self, time_frame: f64) {
-        if (self.time_frame - time_frame).abs() > f64::EPSILON {
-            self.time_frame = time_frame;
-            self.signal_config_change(ConfigChangeSignal::TimeFrameChanged(time_frame));
-        }
-    }
-}
 
-impl Clone for FleaScopeDevice {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            data: Arc::clone(&self.data),
-            enabled_channels: self.enabled_channels,
-            time_frame: self.time_frame,
-            is_paused: self.is_paused,
-            probe_multiplier: self.probe_multiplier,
-            trigger_config: self.trigger_config.clone(),
-            waveform_config: self.waveform_config.clone(),
-            fleascope: Arc::clone(&self.fleascope),
-            config_change_tx: self.config_change_tx.clone(),
-            data_generation_handle: Arc::new(Mutex::new(None)),
-        }
+    pub fn set_trigger_config(&mut self, trigger_config: TriggerConfig) {
+        self.trigger_config = trigger_config;
+        self.signal_config_change();
+    }
+
+    pub fn set_enabled_channels(&mut self, enabled: [bool; 10]) {
+        self.enabled_channels = enabled;
+    }
+
+    pub fn set_time_frame(&mut self, time_frame: f64) {
+        self.time_frame = time_frame;
+        self.signal_config_change();
     }
 }
 
@@ -579,14 +524,29 @@ impl DeviceManager {
 
     pub fn add_device(&mut self, hostname: String) -> Result<()> {
         let scope = FleaScope::connect(Some(&hostname), None, true);
-        let device = FleaScopeDevice::new(scope?);
+        let (config_change_tx, rx) = watch::channel(ConfigChangeSignal::NewConfigSignal(CaptureConfig {
+            probe_multiplier: ProbeMultiplier::X1,
+            trigger_config: TriggerConfig::default(),
+            time_frame: 0.1, // Default 2 seconds
+        }));
 
-        // Auto-connect and start data generation for demo
-        let device_clone = device.clone();
-        tokio::spawn(async move {
-            let dev = device_clone;
-            dev.start_data_generation();
-        });
+        let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
+                x_values: Vec::new(),
+                data_points: Vec::new(),
+                last_update: Instant::now(),
+                read_duration: Duration::ZERO,
+                update_rate: 0.0,
+            })));
+
+        let worker = FleaWorker {
+            fleascope: Arc::new(Mutex::new(scope?)),
+            data: data.clone(),
+            is_paused: false,
+            config_change_rx: rx,
+        };
+
+        let device = FleaScopeDevice::new(hostname, config_change_tx, data);
+        let _handle = worker.start_data_generation(); // Store handle for proper lifecycle management
 
         self.devices.push(device);
         Ok(())
