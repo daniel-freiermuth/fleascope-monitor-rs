@@ -26,9 +26,6 @@ impl FleaScopeApp {
         // Restore app state using cc.storage (requires the "persistence" feature).
         let mut app = Self::default();
         
-        // Add welcome notification
-        app.notification_manager.add_info("🔬 FleaScope Live Oscilloscope started successfully!");
-        
         // Add a default device named "scope3" automatically
         if let Ok(mut device_manager) = app.device_manager.try_lock() {
             if let Err(e) = device_manager.add_device("scope3".to_string()) {

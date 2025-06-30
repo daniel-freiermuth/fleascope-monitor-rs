@@ -151,8 +151,6 @@ impl ControlPanel {
                 let mut new_channels = device.enabled_channels;
                 new_channels[0] = analog_enabled;
                 device.set_enabled_channels(new_channels);
-                let status = if analog_enabled { "enabled" } else { "disabled" };
-                notifications.add_info(format!("Analog channel {} for {}", status, device.name));
             }
             
             // Digital Channels - Compact
@@ -162,8 +160,6 @@ impl ControlPanel {
                     let mut new_channels = device.enabled_channels;
                     new_channels[ch + 1] = enabled;
                     device.set_enabled_channels(new_channels);
-                    let status = if enabled { "enabled" } else { "disabled" };
-                    notifications.add_info(format!("D{} {} for {}", ch, status, device.name));
                 }
             }
         });
@@ -190,10 +186,8 @@ impl ControlPanel {
                 if paused_state != is_paused {
                     if is_paused {
                         device.resume();
-                        notifications.add_success(format!("Resumed - {}", device.name));
                     } else {
                         device.pause();
-                        notifications.add_info(format!("Paused - {}", device.name));
                     }
                 }
             }
@@ -210,8 +204,6 @@ impl ControlPanel {
                     crate::device::ProbeMultiplier::X10 
                 };
                 device.set_probe_multiplier(new_probe);
-                let new_multiplier = if is_x10 { "x1" } else { "x10" };
-                notifications.add_info(format!("Probe: {} - {}", new_multiplier, device.name));
             }
         });
 
@@ -273,13 +265,11 @@ impl ControlPanel {
                 let mut new_config = device.trigger_config.clone();
                 new_config.source = crate::device::TriggerSource::Analog;
                 device.set_trigger_config(new_config);
-                notifications.add_info(format!("Trigger: Analog - {}", device.name));
             }
             if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
                 let mut new_config = device.trigger_config.clone();
                 new_config.source = crate::device::TriggerSource::Digital;
                 device.set_trigger_config(new_config);
-                notifications.add_info(format!("Trigger: Digital - {}", device.name));
             }
         });
 
@@ -313,25 +303,21 @@ impl ControlPanel {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.pattern = crate::device::AnalogTriggerPattern::Rising;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Pattern: Rising - {}", device.name));
                 }
                 if ui.selectable_label(is_falling, "↘").on_hover_text("Falling Edge").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.pattern = crate::device::AnalogTriggerPattern::Falling;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Pattern: Falling - {}", device.name));
                 }
                 if ui.selectable_label(is_level, "─").on_hover_text("Level").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.pattern = crate::device::AnalogTriggerPattern::Level;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Pattern: Level - {}", device.name));
                 }
                 if ui.selectable_label(is_auto, "⟲").on_hover_text("Level + Auto").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.pattern = crate::device::AnalogTriggerPattern::LevelAuto;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Pattern: Auto - {}", device.name));
                 }
             });
         }
@@ -352,25 +338,21 @@ impl ControlPanel {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.mode = crate::device::DigitalTriggerMode::StartMatching;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Mode: Start - {}", device.name));
                 }
                 if ui.selectable_label(is_stop, "⏹").on_hover_text("Stop Matching").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.mode = crate::device::DigitalTriggerMode::StopMatching;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Mode: Stop - {}", device.name));
                 }
                 if ui.selectable_label(is_while, "⏸").on_hover_text("While Matching").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatching;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Mode: While - {}", device.name));
                 }
                 if ui.selectable_label(is_auto, "⟲").on_hover_text("While + Auto").clicked() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatchingAuto;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Mode: Auto - {}", device.name));
                 }
             });
 
@@ -389,8 +371,6 @@ impl ControlPanel {
                         let mut new_config = device.trigger_config.clone();
                         new_config.digital.bit_pattern[ch] = bit_state.cycle();
                         device.set_trigger_config(new_config.clone());
-                        let new_state = new_config.digital.bit_pattern[ch];
-                        notifications.add_info(format!("D{}: {} - {}", ch, new_state.as_str(), device.name));
                     }
                 }
             });
@@ -407,8 +387,6 @@ impl ControlPanel {
                         let mut new_config = device.trigger_config.clone();
                         new_config.digital.bit_pattern[ch] = bit_state.cycle();
                         device.set_trigger_config(new_config.clone());
-                        let new_state = new_config.digital.bit_pattern[ch];
-                        notifications.add_info(format!("D{}: {} - {}", ch, new_state.as_str(), device.name));
                     }
                 }
                 // Clear button
@@ -416,7 +394,6 @@ impl ControlPanel {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.bit_pattern = [crate::device::DigitalBitState::DontCare; 9];
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Pattern cleared - {}", device.name));
                 }
             });
         }
@@ -437,11 +414,9 @@ impl ControlPanel {
             
             if ui.selectable_label(is_analog, "📊").on_hover_text("Analog Trigger").clicked() {
                 device.trigger_config.source = crate::device::TriggerSource::Analog;
-                notifications.add_info(format!("Trigger source set to Analog for {}", device.name));
             }
             if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
                 device.trigger_config.source = crate::device::TriggerSource::Digital;
-                notifications.add_info(format!("Trigger source set to Digital for {}", device.name));
             }
         });
 
@@ -489,19 +464,15 @@ impl ControlPanel {
             
             if ui.selectable_label(is_rising, "↗").on_hover_text("Rising Edge").clicked() {
                 device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Rising;
-                notifications.add_info(format!("Analog trigger pattern set to Rising Edge for {}", device.name));
             }
             if ui.selectable_label(is_falling, "↘").on_hover_text("Falling Edge").clicked() {
                 device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Falling;
-                notifications.add_info(format!("Analog trigger pattern set to Falling Edge for {}", device.name));
             }
             if ui.selectable_label(is_level, "─").on_hover_text("Level").clicked() {
                 device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Level;
-                notifications.add_info(format!("Analog trigger pattern set to Level for {}", device.name));
             }
             if ui.selectable_label(is_auto, "⟲").on_hover_text("Level + Auto").clicked() {
                 device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::LevelAuto;
-                notifications.add_info(format!("Analog trigger pattern set to Level + Auto for {}", device.name));
             }
         });
     }
@@ -527,19 +498,15 @@ impl ControlPanel {
             
             if ui.selectable_label(is_start, "▶").on_hover_text("Start Matching").clicked() {
                 device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StartMatching;
-                notifications.add_info(format!("Digital trigger mode set to Start Matching for {}", device.name));
             }
             if ui.selectable_label(is_stop, "⏹").on_hover_text("Stop Matching").clicked() {
                 device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StopMatching;
-                notifications.add_info(format!("Digital trigger mode set to Stop Matching for {}", device.name));
             }
             if ui.selectable_label(is_while, "⏸").on_hover_text("While Matching").clicked() {
                 device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatching;
-                notifications.add_info(format!("Digital trigger mode set to While Matching for {}", device.name));
             }
             if ui.selectable_label(is_auto, "⟲").on_hover_text("While + Auto").clicked() {
                 device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatchingAuto;
-                notifications.add_info(format!("Digital trigger mode set to While Matching + Auto for {}", device.name));
             }
         });
 
@@ -562,8 +529,6 @@ impl ControlPanel {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.bit_pattern[ch] = bit_state.cycle();
                     device.set_trigger_config(new_config.clone());
-                    let new_state = new_config.digital.bit_pattern[ch];
-                    notifications.add_info(format!("Digital trigger D{} set to {} for {}", ch, new_state.as_str(), device.name));
                 }
             }
         });
@@ -583,8 +548,6 @@ impl ControlPanel {
                     let mut new_config = device.trigger_config.clone();
                     new_config.digital.bit_pattern[ch] = bit_state.cycle();
                     device.set_trigger_config(new_config.clone());
-                    let new_state = new_config.digital.bit_pattern[ch];
-                    notifications.add_info(format!("Digital trigger D{} set to {} for {}", ch, new_state.as_str(), device.name));
                 }
             }
             
@@ -592,7 +555,6 @@ impl ControlPanel {
                 let mut new_config = device.trigger_config.clone();
                 new_config.digital.bit_pattern = [crate::device::DigitalBitState::DontCare; 9];
                 device.set_trigger_config(new_config);
-                notifications.add_info(format!("Digital trigger pattern cleared for {}", device.name));
             }
         });
 
@@ -622,8 +584,6 @@ impl ControlPanel {
             let mut new_enabled = enabled;
             if ui.toggle_value(&mut new_enabled, button_text).on_hover_text("Enable Waveform Generator").clicked() {
                 device.waveform_config.enabled = new_enabled;
-                let status = if new_enabled { "enabled" } else { "disabled" };
-                notifications.add_info(format!("Waveform generator {} - {}", status, device.name));
             }
         });
 
@@ -642,19 +602,15 @@ impl ControlPanel {
                 
                 if ui.selectable_label(is_sine, "～").on_hover_text("Sine Wave").clicked() {
                     device.waveform_config.waveform_type = crate::device::WaveformType::Sine;
-                    notifications.add_info(format!("Waveform: Sine - {}", device.name));
                 }
                 if ui.selectable_label(is_square, "⊓").on_hover_text("Square Wave").clicked() {
                     device.waveform_config.waveform_type = crate::device::WaveformType::Square;
-                    notifications.add_info(format!("Waveform: Square - {}", device.name));
                 }
                 if ui.selectable_label(is_triangle, "△").on_hover_text("Triangle Wave").clicked() {
                     device.waveform_config.waveform_type = crate::device::WaveformType::Triangle;
-                    notifications.add_info(format!("Waveform: Triangle - {}", device.name));
                 }
                 if ui.selectable_label(is_ekg, "💓").on_hover_text("EKG Wave").clicked() {
                     device.waveform_config.waveform_type = crate::device::WaveformType::Ekg;
-                    notifications.add_info(format!("Waveform: EKG - {}", device.name));
                 }
             });
 
