@@ -7,6 +7,10 @@ use fleascope_rs::{AnalogTrigger, BitState, DigitalTrigger, FleaProbe, IdleFleaS
 use polars::prelude::*;
 use arc_swap::ArcSwap;
 
+// Time frame constants for consistent validation
+pub const MIN_TIME_FRAME: f64 = 0.000122; // 122μs
+pub const MAX_TIME_FRAME: f64 = 3.49;     // 3.49s
+
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub probe_multiplier: ProbeMultiplier,
@@ -138,7 +142,13 @@ impl FleaWorker {
                     ProbeMultiplier::X10 => &self.x10,
                 };
 
-                let trigger_str = probe.trigger_to_string(capture_config.trigger_config.into()).unwrap();
+                let trigger_str = match probe.trigger_to_string(capture_config.trigger_config.into()) {
+                    Ok(str) => str,
+                    Err(e) => {
+                        tracing::error!("Failed to convert trigger to string: {}", e);
+                        continue
+                    }
+                };
 
                 let star_res = self.fleascope.read_async(
                     Duration::from_secs_f64(capture_config.time_frame),
@@ -416,7 +426,8 @@ impl FleaScopeDevice {
     }
 
     pub fn set_time_frame(&mut self, time_frame: f64) {
-        self.time_frame = time_frame;
+        // Clamp time frame to valid range: 122μs to 3.49s
+        self.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
         self.signal_config_change();
     }
 }

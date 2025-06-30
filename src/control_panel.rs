@@ -1,4 +1,4 @@
-use crate::device::{DeviceManager, FleaScopeDevice};
+use crate::device::{DeviceManager, FleaScopeDevice, MIN_TIME_FRAME, MAX_TIME_FRAME};
 use crate::notifications::NotificationManager;
 use egui::{Color32, RichText};
 
@@ -168,13 +168,49 @@ impl ControlPanel {
         ui.add_space(1.0);
         ui.label(RichText::new("CONFIG").size(11.0).strong());
         
-        // Time Window & Controls Row
+        // Time Window & Controls Row - Uses quadratic scaling for better small value control
         ui.horizontal(|ui| {
             ui.label("⏱");
-            let mut time_frame = device.time_frame as f32;
-            if ui.add(egui::Slider::new(&mut time_frame, 0.0001..=3.4).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
-                device.set_time_frame(time_frame as f64);
-                notifications.add_info(format!("Time: {:.1}s - {}", time_frame, device.name));
+            
+            // Convert actual time to quadratic scale (0.0 to 1.0)
+            // This makes it easier to select small time values (122μs - 3.49s range)
+            let min_time = MIN_TIME_FRAME; // 122μs
+            let max_time = MAX_TIME_FRAME; // 3.49s
+            let current_time = device.time_frame.clamp(min_time, max_time);
+            let quadratic_value = ((current_time - min_time) / (max_time - min_time)).sqrt() as f32;
+            
+            let mut slider_value = quadratic_value;
+            if ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0)
+                .show_value(true)
+                .custom_formatter(|v, _| {
+                    // Convert quadratic scale back to time for display
+                    let normalized = v * v; // Square to get quadratic scale
+                    let time_val = min_time + normalized as f64 * (max_time - min_time);
+                    if time_val < 0.001 {
+                        format!("{:.0}μs", time_val * 1_000_000.0)
+                    } else if time_val < 1.0 {
+                        format!("{:.1}ms", time_val * 1000.0)
+                    } else {
+                        format!("{:.2}s", time_val)
+                    }
+                })).changed() {
+                
+                // Convert quadratic slider value back to actual time
+                let normalized = slider_value * slider_value; // Square to get quadratic scale
+                let new_time = min_time + normalized as f64 * (max_time - min_time);
+                device.set_time_frame(new_time);
+            }
+            
+            // Quick time presets
+            if ui.small_button("📐").on_hover_text("Time Presets").clicked() {
+                // This could open a popup with presets, for now just cycle through common values
+                let presets = [MIN_TIME_FRAME, 0.001, 0.01, 0.1, 1.0, MAX_TIME_FRAME]; // 122μs, 1ms, 10ms, 100ms, 1s, 3.49s
+                let current_idx = presets.iter().position(|&x| (x - device.time_frame).abs() < 0.0001);
+                let next_idx = match current_idx {
+                    Some(idx) => (idx + 1) % presets.len(),
+                    None => 0,
+                };
+                device.set_time_frame(presets[next_idx]);
             }
         });
 
