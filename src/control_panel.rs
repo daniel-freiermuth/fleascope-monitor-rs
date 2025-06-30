@@ -168,24 +168,29 @@ impl ControlPanel {
         ui.add_space(1.0);
         ui.label(RichText::new("CONFIG").size(11.0).strong());
         
-        // Time Window & Controls Row - Uses quadratic scaling for better small value control
+        // Time Window & Controls Row - Uses exponential scaling for better small value control
         ui.horizontal(|ui| {
             ui.label("⏱");
             
-            // Convert actual time to quadratic scale (0.0 to 1.0)
-            // This makes it easier to select small time values (122μs - 3.49s range)
+            // Convert actual time to exponential scale (0.0 to 1.0)
+            // This provides logarithmic distribution of values across the slider:
+            // - Small movements at start = precise microsecond control
+            // - Large movements at end = quick access to larger times
+            // Range: 122μs - 3.49s with exponential distribution
             let min_time = MIN_TIME_FRAME; // 122μs
             let max_time = MAX_TIME_FRAME; // 3.49s
             let current_time = device.time_frame.clamp(min_time, max_time);
-            let quadratic_value = ((current_time - min_time) / (max_time - min_time)).sqrt() as f32;
             
-            let mut slider_value = quadratic_value;
+            // Use logarithmic mapping: log(current/min) / log(max/min)
+            let log_ratio = (current_time / min_time).ln() / (max_time / min_time).ln();
+            let exponential_value = log_ratio as f32;
+            
+            let mut slider_value = exponential_value;
             if ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0)
                 .show_value(true)
                 .custom_formatter(|v, _| {
-                    // Convert quadratic scale back to time for display
-                    let normalized = v * v; // Square to get quadratic scale
-                    let time_val = min_time + normalized as f64 * (max_time - min_time);
+                    // Convert exponential scale back to time for display
+                    let time_val = min_time * ((max_time / min_time).powf(v as f64));
                     if time_val < 0.001 {
                         format!("{:.0}μs", time_val * 1_000_000.0)
                     } else if time_val < 1.0 {
@@ -195,9 +200,8 @@ impl ControlPanel {
                     }
                 })).changed() {
                 
-                // Convert quadratic slider value back to actual time
-                let normalized = slider_value * slider_value; // Square to get quadratic scale
-                let new_time = min_time + normalized as f64 * (max_time - min_time);
+                // Convert exponential slider value back to actual time
+                let new_time = min_time * ((max_time / min_time).powf(slider_value as f64));
                 device.set_time_frame(new_time);
             }
             
@@ -269,7 +273,7 @@ impl ControlPanel {
         let update_age = data.last_update.elapsed().as_millis();
         
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&format!("📊 {}ms. {:.2} Hz", update_age, data.update_rate)).size(9.0).weak());
+            ui.label(RichText::new(&format!("📊 {:2.3}Hz. {}ms.", data.update_rate, update_age)).size(9.0).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if device.waveform_config.enabled {
                     let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
