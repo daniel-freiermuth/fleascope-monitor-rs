@@ -3,7 +3,7 @@ use std::{panic};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch::{self, Sender};
-use fleascope_rs::{FleaScope, ProbeType, Trigger, AnalogTrigger, DigitalTrigger, BitState};
+use fleascope_rs::{AnalogTrigger, BitState, DigitalTrigger, FleaProbe, IdleFleaScope, ProbeType, Trigger};
 use polars::prelude::*;
 use arc_swap::ArcSwap;
 
@@ -91,160 +91,116 @@ impl Into<ProbeType> for ProbeMultiplier {
 }
 
 struct FleaWorker {
-    fleascope: Arc<FleaScope>, // Now thread-safe without Mutex!
+    fleascope: IdleFleaScope, // Now thread-safe without Mutex!
     data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
     is_paused: bool,   // Pause/continue state (thread-safe)
     config_change_rx: watch::Receiver<ConfigChangeSignal>, // Channel for configuration changes
+    x1: FleaProbe,
+    x10: FleaProbe,
 }
 
 impl FleaWorker {
-    pub fn start_data_generation(self) -> tokio::task::JoinHandle<()> {
+    pub fn start_data_generation(mut self) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes
-        let mut config_change_rx = self.config_change_rx;
         let mut update_rate = 0.0;
         let mut last_rate_update = Instant::now();
         let mut read_count = 0;
 
         // Start the cancellation-aware data generation loop
         tokio::spawn(async move {
-            let fleascope_arc = self.fleascope;
-            let data = self.data;
-            let is_paused = self.is_paused;
             tracing::debug!("Starting cancellation-aware data generation loop");
             
             loop {
                 tracing::debug!("Starting new data generation iteration");
-                    // Check if device is paused first
-                    if is_paused {
-                        tracing::debug!("Device is paused, skipping data generation");
-                        
-                        // During pause, still check for config changes but less frequently
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
-                            signal = config_change_rx.changed() => {
-                                if signal.is_ok() {
-                                    tracing::info!("Configuration changed while paused, will restart");
+                // Check if device is paused first
+                if self.is_paused {
+                    tracing::debug!("Device is paused, skipping data generation");
+                    
+                    // During pause, still check for config changes but less frequently
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                        signal = self.config_change_rx.changed() => {
+                            if signal.is_ok() {
+                                tracing::info!("Configuration changed while paused, will restart");
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                tracing::debug!("Device is running, starting data generation");
+                let start_time = Instant::now();
+                let capture_config = match self.config_change_rx.borrow_and_update().clone() {
+                    ConfigChangeSignal::NewConfigSignal(config) => config,
+                };
+                let probe = match capture_config.probe_multiplier {
+                    ProbeMultiplier::X1 => &self.x1,
+                    ProbeMultiplier::X10 => &self.x10,
+                };
+
+                let trigger_str = probe.trigger_to_string(capture_config.trigger_config.into()).unwrap();
+
+                let star_res = self.fleascope.read_async(
+                    Duration::from_secs_f64(capture_config.time_frame),
+                    &trigger_str,
+                    None
+                );
+                self.fleascope = match star_res {
+                    Ok(mut fleascope_for_read) => {
+                        tracing::debug!("Successfully started read operation on FleaScope");
+
+                        while !fleascope_for_read.is_done() {
+                            match self.config_change_rx.has_changed() {
+                                Ok(b) => {
+                                    if b {
+                                        tracing::info!("Configuration changed during hardware read, calling unblock()");
+                                        fleascope_for_read.cancel();
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to check for config change: {}", e);
+                                    return;
                                 }
                             }
                         }
-                        continue;
-                    }
-
-                    tracing::debug!("Device is running, starting data generation");
-                    let start_time = Instant::now();
-                    let capture_config = match config_change_rx.borrow_and_update().clone() {
-                        ConfigChangeSignal::NewConfigSignal(config) => config,
-                    };
-
-                    // Clone the Arc for both read and potential cancellation
-                    let fleascope_for_read = fleascope_arc.clone();
-                    let fleascope_for_cancel = fleascope_arc.clone();
-                    
-                    // Start the hardware read in a blocking task
-                    let mut read_handle = {
-                        let probe_multiplier = capture_config.probe_multiplier;
-                        let trigger_config = capture_config.trigger_config.clone();
-                        let time_frame = capture_config.time_frame;
+                        let read_duration = start_time.elapsed();
                         
-                        tokio::task::spawn_blocking(move || {
-                            Self::get_real_fleascope_data_direct(fleascope_for_read, probe_multiplier, &trigger_config, time_frame)
-                        })
-                    };
+                        if last_rate_update.elapsed() >= Duration::from_secs(1) {
+                            update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                            read_count = 0;
+                            last_rate_update = Instant::now();
+                        }
+                        read_count += 1;
 
-                    // Wait for either the read to complete or a config change
-                    tokio::select! {
-                        result = &mut read_handle => {
-                            match result {
-                                Ok(Ok(real_data)) => {
-                                    let read_duration = start_time.elapsed();
-                                    
-                                    tracing::trace!("Successfully got real data with {} points in {:?}", 
-                                                    real_data.1.len(), read_duration);
-                                    
+                        let (idle_scope, f, data_s) = fleascope_for_read.wait();
+                        let data_copy = self.data.clone();
+                        let probe_clone = probe.clone();
+                        tokio::spawn(async move {
+                            IdleFleaScope::parse_csv(&data_s, f)
+                                .map(|df| probe_clone.apply_calibration(df).collect().unwrap())
+                                .map(|df| FleaWorker::convert_polars_to_data_points(df))
+                                .map(|data_points| {
                                     // Update data with lock-free operation using ArcSwap
                                     let new_data = DeviceData {
-                                        x_values : real_data.0,
-                                        data_points : real_data.1,
+                                        x_values : data_points.0,
+                                        data_points : data_points.1,
                                         last_update : Instant::now(),
                                         read_duration : read_duration,
                                         update_rate,
                                     };
-                                    data.store(Arc::new(new_data));
-                                    
-                                    if last_rate_update.elapsed() >= Duration::from_secs(1) {
-                                        update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
-                                        read_count = 0;
-                                        last_rate_update = Instant::now();
-                                    }
-                                    read_count += 1;
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::warn!("Failed to read data from FleaScope (connection preserved): {}", e);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Hardware read task failed: {}", e);
-                                }
-                            }
-                        },
-                        signal = config_change_rx.changed() => {
-                            // Config changed during hardware read - cancel the operation
-                            if let Ok(_) = signal {
-                                tracing::info!("Configuration changed during hardware read, calling unblock()");
-                                
-                                // Call unblock on the fleascope directly - no mutex needed!
-                                if let Err(e) = fleascope_for_cancel.unblock() {
-                                    tracing::warn!("Failed to unblock FleaScope: {}", e);
-                                }
-                                
-                                // Wait for the read operation to complete (it should finish quickly now)
-                                match read_handle.await {
-                                    Ok(_) => {
-                                        tracing::info!("Hardware read cancelled successfully");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Read task finished with error after unblock: {}", e);
-                                    }
-                                }
-                            }
-                        }
+                                    data_copy.store(Arc::new(new_data));
+                                }).ok();
+                        });
+                        idle_scope
                     }
-            }
-        })
-        
-    }
-
-    fn get_real_fleascope_data_direct(
-        fleascope: Arc<FleaScope>,
-        probe_multiplier: ProbeMultiplier,
-        trigger_config: &TriggerConfig,
-        time_frame: f64,
-    ) -> Result<(Vec<f64>, Vec<DataPoint>)> {
-        let duration = Duration::from_secs_f64(time_frame);
-        let trigger_config = trigger_config.clone();
-        
-        tracing::trace!("Reading from FleaScope with duration: {:?}", duration);
-        
-        // Call read directly - no mutex needed since FleaScope is thread-safe!
-        match fleascope.read(probe_multiplier.into(), duration, Some(trigger_config.into()), None) {
-            Ok(lf) => {
-                // Collect the data (this can take time but doesn't block other devices)
-                match lf.collect() {
-                    Ok(df) => {
-                        tracing::trace!("Successfully collected DataFrame with {} rows", df.height());
-                        let data_points = Self::convert_polars_to_data_points(df);
-                        Ok(data_points)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to collect data from FleaScope: {}", e);
-                        Err(anyhow::anyhow!("Data collection failed: {}", e))
+                    Err((s, e)) => {
+                        tracing::error!("Failed to start read operation: {}", e);
+                        s
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to read from FleaScope: {}", e);
-                Err(anyhow::anyhow!("Hardware read failed: {}", e))
-            }
-        }
+        })
+        
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
@@ -478,7 +434,7 @@ impl DeviceManager {
     }
 
     pub fn add_device(&mut self, hostname: String) -> Result<()> {
-        let scope = FleaScope::connect(Some(&hostname), None, true);
+        let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true).unwrap();
         let (config_change_tx, rx) = watch::channel(ConfigChangeSignal::NewConfigSignal(CaptureConfig {
             probe_multiplier: ProbeMultiplier::X1,
             trigger_config: TriggerConfig::default(),
@@ -494,10 +450,11 @@ impl DeviceManager {
             })));
 
         let worker = FleaWorker {
-            fleascope: Arc::new(scope?), // No Mutex needed - FleaScope is now thread-safe!
+            fleascope: scope, // No Mutex needed - FleaScope is now thread-safe!
             data: data.clone(),
             is_paused: false,
             config_change_rx: rx,
+            x1, x10
         };
 
         let device = FleaScopeDevice::new(hostname, config_change_tx, data);
