@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
 use std::{panic};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch::{self, Sender};
-use fleascope_rs::{AnalogTrigger, BitState, DigitalTrigger, FleaProbe, IdleFleaScope, ProbeType, Trigger};
+use fleascope_rs::{AnalogTrigger, AnalogTriggerBuilder, BitState, DigitalTrigger, FleaProbe, IdleFleaScope, ProbeType, Trigger, Waveform};
 use polars::prelude::*;
 use arc_swap::ArcSwap;
 
@@ -13,14 +13,30 @@ pub const MAX_TIME_FRAME: f64 = 3.49;     // 3.49s
 
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
-    pub probe_multiplier: ProbeMultiplier,
+    pub probe_multiplier: ProbeType,
     pub trigger_config: TriggerConfig,
     pub time_frame: f64,
+    pub is_paused: bool,
 }
 
-#[derive(Debug, Clone)]
-pub enum ConfigChangeSignal {
-    NewConfigSignal(CaptureConfig),
+pub enum Notification {
+    Message(String),
+    Success(String),
+    Error(String),  
+}
+
+#[derive(Debug)]
+pub enum ControlCommand {
+    Calibrate0V(ProbeType),
+    Calibrate3V(ProbeType),
+    StoreCalibration(),
+    Exit,
+}
+
+#[derive(Debug)]
+pub enum CalibrationResult {
+    Success(String),
+    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -73,37 +89,72 @@ pub struct FleaScopeDevice {
     pub enabled_channels: [bool; 10], // 1 analog + 9 digital
     pub time_frame: f64,             // Time window in seconds
     pub is_paused: bool,   // Pause/continue state (thread-safe)
-    pub probe_multiplier: ProbeMultiplier, // Probe selection
+    pub probe_multiplier: ProbeType, // Probe selection
     pub trigger_config: TriggerConfig, // Trigger configuration
     pub waveform_config: WaveformConfig, // Waveform generator configuration
-    config_change_tx: watch::Sender<ConfigChangeSignal>, // Channel for configuration changes
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ProbeMultiplier {
-    X1,
-    X10,
-}
-
-impl Into<ProbeType> for ProbeMultiplier {
-    fn into(self) -> ProbeType {
-        match self {
-            ProbeMultiplier::X1 => ProbeType::X1,
-            ProbeMultiplier::X10 => ProbeType::X10,
-        }
-    }
+    config_change_tx: watch::Sender<CaptureConfig>, // Channel for configuration changes
+    control_signal_tx: tokio::sync::mpsc::Sender<ControlCommand>, // Channel for calibration commands
+    pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results
+    waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
 }
 
 struct FleaWorker {
-    fleascope: IdleFleaScope, // Now thread-safe without Mutex!
+    fleascope: IdleFleaScope,
     data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
-    is_paused: bool,   // Pause/continue state (thread-safe)
-    config_change_rx: watch::Receiver<ConfigChangeSignal>, // Channel for configuration changes
+    config_change_rx: watch::Receiver<CaptureConfig>, // Channel for configuration changes
+    control_rx: tokio::sync::mpsc::Receiver<ControlCommand>, // Channel for calibration commands
+    notification_tx: tokio::sync::mpsc::Sender<Notification>, // Channel for calibration results
+    waveform_rx: tokio::sync::watch::Receiver<WaveformConfig>, // Channel for waveform configuration
     x1: FleaProbe,
     x10: FleaProbe,
 }
 
 impl FleaWorker {
+    /// Handle calibration commands received from the UI
+    async fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
+        tracing::info!("Handling calibration command: {:?}", command);
+        
+        match command {
+            ControlCommand::Calibrate0V(probe_multiplier) => {
+                match probe_multiplier {
+                    ProbeType::X1 => match self.x1.calibrate_0(&mut self.fleascope) {
+                        Ok(_) => {},
+                        Err(e) => self.notification_tx.send(Notification::Error(format!("Calibration failed: {}", e))).await.expect("Failed to send calibration result"),
+                    },
+                    ProbeType::X10 => match self.x10.calibrate_0(&mut self.fleascope) {
+                        Ok(_) => {},
+                        Err(e) => self.notification_tx.send(Notification::Error(format!("Calibration failed: {}", e))).await.expect("Failed to send calibration result"),
+
+                    }
+                };
+                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
+                    tracing::error!("Failed to send calibration result: {}", e);
+                }
+            }
+            ControlCommand::Calibrate3V(probe_multiplier) => {
+                match probe_multiplier {
+                    ProbeType::X1 => self.x1.calibrate_3v3(&mut self.fleascope),
+                    ProbeType::X10 => self.x10.calibrate_3v3(&mut self.fleascope),
+                };
+                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
+                    tracing::error!("Failed to send calibration result: {}", e);
+                }
+            }
+            ControlCommand::StoreCalibration() => {
+                self.x1.write_calibration_to_flash(&mut self.fleascope);
+                self.x10.write_calibration_to_flash(&mut self.fleascope);
+                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
+                    tracing::error!("Failed to send calibration result: {}", e);
+                }
+            },
+            ControlCommand::Exit => {
+                tracing::info!("Exiting FleaWorker");
+                return Err(Error::msg("Exiting FleaWorker")); // Handle exit logic if needed
+            },
+        };
+        Ok(())
+    }
+
     pub fn start_data_generation(mut self) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes
         let mut update_rate = 0.0;
@@ -113,14 +164,30 @@ impl FleaWorker {
         // Start the cancellation-aware data generation loop
         tokio::spawn(async move {
             tracing::debug!("Starting cancellation-aware data generation loop");
-            
             loop {
+                match self.control_rx.try_recv() {
+                    Ok(command) => {
+                        tracing::info!("Received calibration command while paused: {:?}", command);
+                        match self.handle_control_command(command).await {
+                            Err(_) => break,
+                            _ => {}
+                        }
+                    },
+                    _ => {}
+                }
+                if self.waveform_rx.has_changed().expect("Failed to check for waveform config change") {
+                    tracing::info!("Waveform configuration changed, updating waveform");
+                    let waveform_config = self.waveform_rx.borrow_and_update().clone();
+                    self.fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz); 
+                }
+            
                 tracing::debug!("Starting new data generation iteration");
                 // Check if device is paused first
-                if self.is_paused {
+                let capture_config = self.config_change_rx.borrow_and_update().clone();
+                if capture_config.is_paused {
                     tracing::debug!("Device is paused, skipping data generation");
                     
-                    // During pause, still check for config changes but less frequently
+                    // During pause, still check for config changes and calibration commands
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(500)) => {},
                         signal = self.config_change_rx.changed() => {
@@ -128,19 +195,30 @@ impl FleaWorker {
                                 tracing::info!("Configuration changed while paused, will restart");
                             }
                         }
+                        signal = self.waveform_rx.changed() => {
+                            if signal.is_ok() {
+                                tracing::info!("Configuration changed while paused, will restart");
+                            }
+                        }
+                        Some(command) = self.control_rx.recv() => {
+                            tracing::info!("Received calibration command while paused: {:?}", command);
+                            match self.handle_control_command(command).await {
+                                Err(_) => break,
+                                _ => {},
+                            }
+                        }
                     }
                     continue;
                 }
 
                 tracing::debug!("Device is running, starting data generation");
+                
                 let start_time = Instant::now();
-                let capture_config = match self.config_change_rx.borrow_and_update().clone() {
-                    ConfigChangeSignal::NewConfigSignal(config) => config,
-                };
                 let probe = match capture_config.probe_multiplier {
-                    ProbeMultiplier::X1 => &self.x1,
-                    ProbeMultiplier::X10 => &self.x10,
+                    ProbeType::X1 => &self.x1,
+                    ProbeType::X10 => &self.x10,
                 };
+                let probe_clone = probe.clone(); // Clone early to avoid borrowing issues
 
                 let trigger_str = match probe.trigger_to_string(capture_config.trigger_config.into()) {
                     Ok(str) => str,
@@ -155,23 +233,25 @@ impl FleaWorker {
                     &trigger_str,
                     None
                 );
-                self.fleascope = match star_res {
+                match star_res {
                     Ok(mut fleascope_for_read) => {
                         tracing::debug!("Successfully started read operation on FleaScope");
 
                         while !fleascope_for_read.is_done() {
-                            match self.config_change_rx.has_changed() {
-                                Ok(b) => {
-                                    if b {
-                                        tracing::info!("Configuration changed during hardware read, calling unblock()");
-                                        fleascope_for_read.cancel();
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to check for config change: {}", e);
-                                    return;
-                                }
+                            if self.config_change_rx.has_changed().expect("Failed to check for config change") {
+                                tracing::info!("Configuration changed during hardware read, calling unblock()");
+                                fleascope_for_read.cancel();
+                                break;
                             }
+                            if self.waveform_rx.has_changed().expect("Failed to check for waveform change") {
+                                tracing::info!("Waveform changed during hardware read, calling unblock()");
+                                fleascope_for_read.cancel();
+                                break;
+                            }
+                            if !self.control_rx.is_empty() {
+                                fleascope_for_read.cancel();
+                                break;
+                            };
                         }
                         let read_duration = start_time.elapsed();
                         
@@ -183,8 +263,9 @@ impl FleaWorker {
                         read_count += 1;
 
                         let (idle_scope, f, data_s) = fleascope_for_read.wait();
+                        self.fleascope = idle_scope;
+
                         let data_copy = self.data.clone();
-                        let probe_clone = probe.clone();
                         tokio::spawn(async move {
                             IdleFleaScope::parse_csv(&data_s, f)
                                 .map(|df| probe_clone.apply_calibration(df).collect().unwrap())
@@ -201,14 +282,14 @@ impl FleaWorker {
                                     data_copy.store(Arc::new(new_data));
                                 }).ok();
                         });
-                        idle_scope
                     }
                     Err((s, e)) => {
                         tracing::error!("Failed to start read operation: {}", e);
-                        s
+                        self.fleascope = s; // Restore idle scope on error
                     }
                 }
             }
+            self.fleascope.teardown();
         })
         
     }
@@ -325,83 +406,74 @@ impl FleaWorker {
 }
 
 impl FleaScopeDevice {
-    pub fn new(name: String, config_change_tx: Sender<ConfigChangeSignal>, data: Arc<ArcSwap<DeviceData>>) -> Self {
+    pub fn new(
+        name: String, 
+        config_change_tx: Sender<CaptureConfig>, 
+        data: Arc<ArcSwap<DeviceData>>,
+        calibration_tx: tokio::sync::mpsc::Sender<ControlCommand>,
+        notification_rx: tokio::sync::mpsc::Receiver<Notification>,
+        initial_config: CaptureConfig,
+        waveform_tx: Sender<WaveformConfig>,
+        initial_waveform: WaveformConfig,
+    ) -> Self {
         Self {
             name,
             data,
             enabled_channels: [true; 10], // All channels enabled by default
-            time_frame: 2.0,             // Default 2 seconds
-            is_paused: false, // Running by default
-            probe_multiplier: ProbeMultiplier::X1, // Default x1 probe
-            trigger_config: TriggerConfig::default(), // Default trigger config
-            waveform_config: WaveformConfig::default(), // Default waveform config
+            time_frame: initial_config.time_frame,             // Default 2 seconds
+            is_paused: initial_config.is_paused,
+            probe_multiplier: initial_config.probe_multiplier, // Default x1 probe
+            trigger_config: initial_config.trigger_config, // Default trigger config
+            waveform_config: initial_waveform, // Default waveform config
             config_change_tx,
+            control_signal_tx: calibration_tx,
+            notification_rx,
+            waveform_tx,
         }
     }
 
     /// Signal that configuration has changed and data generation should restart
     fn signal_config_change(&self) {
-        self.config_change_tx.send(ConfigChangeSignal::NewConfigSignal(CaptureConfig {
+        self.config_change_tx.send(CaptureConfig {
             probe_multiplier: self.probe_multiplier,
             trigger_config: self.trigger_config.clone(),
             time_frame: self.time_frame,
-        })).expect("Failed to send config change signal");
-    }
-
-    fn generate_waveform(t: f64, config: &WaveformConfig) -> f64 {
-        let freq = config.frequency_hz;
-        let phase = 2.0 * std::f64::consts::PI * freq * t;
-        
-        let signal = match config.waveform_type {
-            WaveformType::Sine => phase.sin(),
-            WaveformType::Square => if phase.sin() > 0.0 { 1.0 } else { -1.0 },
-            WaveformType::Triangle => {
-                let normalized_phase = (phase / (2.0 * std::f64::consts::PI)) % 1.0;
-                if normalized_phase < 0.5 {
-                    4.0 * normalized_phase - 1.0
-                } else {
-                    3.0 - 4.0 * normalized_phase
-                }
-            }
-            WaveformType::Ekg => {
-                // Simple EKG-like waveform
-                let beat_phase = (phase / (2.0 * std::f64::consts::PI)) % 1.0;
-                if beat_phase < 0.1 {
-                    10.0 * beat_phase * (1.0 - 10.0 * beat_phase).max(0.0)
-                } else if beat_phase < 0.2 {
-                    -5.0 * (beat_phase - 0.1)
-                } else {
-                    0.0
-                }
-            }
-        };
-
-        // Normalize to 0-1 range and add some noise
-        ((signal + 1.0) / 2.0 + 0.02 * rand::random::<f64>()).clamp(0.0, 1.0)
+            is_paused: self.is_paused,
+        }).expect("Failed to send config change signal");
     }
 
     pub fn pause(&mut self) {
         self.is_paused = true;
+        self.signal_config_change();
+    }
+
+    pub fn stop(mut self) {
+        self.control_signal_tx
+            .try_send(ControlCommand::Exit)
+            .expect("Failed to send exit command");
     }
 
     pub fn resume(&mut self) {
         self.is_paused = false;
+        self.signal_config_change();
     }
 
     pub fn is_paused(&self) -> bool {
         self.is_paused
     }
 
-    pub fn set_waveform(&mut self, waveform_type: WaveformType, frequency_hz: f64) {
+    pub fn set_waveform(&mut self, waveform_type: Waveform, frequency_hz: i32) {
         self.waveform_config.waveform_type = waveform_type;
-        self.waveform_config.frequency_hz = frequency_hz.clamp(10.0, 4000.0);
+        self.waveform_config.frequency_hz = frequency_hz.clamp(10, 4000);
         self.waveform_config.enabled = true;
+        self.waveform_tx.send(self.waveform_config.clone())
+            .expect("Failed to send waveform configuration");
     }
 
     pub fn get_waveform_status(&self) -> String {
         if self.waveform_config.enabled {
-            let freq_str = if self.waveform_config.frequency_hz >= 1000.0 {
-                format!("{:.1}kHz", self.waveform_config.frequency_hz / 1000.0)
+            let freq_str = if self.waveform_config.frequency_hz >= 1000 {
+                format!("{:.1}kHz", self.waveform_config.frequency_hz / 1000)
             } else {
                 format!("{:.0}Hz", self.waveform_config.frequency_hz)
             };
@@ -411,7 +483,7 @@ impl FleaScopeDevice {
         }
     }
 
-    pub fn set_probe_multiplier(&mut self, multiplier: ProbeMultiplier) {
+    pub fn set_probe_multiplier(&mut self, multiplier: ProbeType) {
         self.probe_multiplier = multiplier;
         self.signal_config_change();
     }
@@ -430,6 +502,27 @@ impl FleaScopeDevice {
         self.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
         self.signal_config_change();
     }
+
+    /// Send 0V calibration command (non-blocking)
+    pub fn start_calibrate_0v(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::Calibrate0V(self.probe_multiplier))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+    }
+
+    /// Send 3V calibration command (non-blocking)  
+    pub fn start_calibrate_3v(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::Calibrate3V(self.probe_multiplier))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+    }
+
+    /// Send store calibration command (non-blocking)
+    pub fn start_store_calibration(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::StoreCalibration())
+            .map_err(|e| anyhow::anyhow!("Failed to send storage command: {}", e))
+    }
 }
 
 #[derive(Default)]
@@ -438,19 +531,22 @@ pub struct DeviceManager {
 }
 
 impl DeviceManager {
-    pub fn new() -> Self {
-        Self {
-            devices: Vec::new(),
-        }
-    }
-
     pub fn add_device(&mut self, hostname: String) -> Result<()> {
-        let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true).unwrap();
-        let (config_change_tx, rx) = watch::channel(ConfigChangeSignal::NewConfigSignal(CaptureConfig {
-            probe_multiplier: ProbeMultiplier::X1,
+        let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true)?;
+        let initial_config = CaptureConfig {
+            probe_multiplier: ProbeType::X1,
             trigger_config: TriggerConfig::default(),
             time_frame: 0.1, // Default 2 seconds
-        }));
+            is_paused: false,
+        };
+        let initial_waveform = WaveformConfig::default();
+
+        let (capture_config_tx, capture_config_rx) = watch::channel(initial_config.clone());
+        let (waveform_tx, waveform_rx) = watch::channel(initial_waveform.clone());
+
+        // Create calibration channels
+        let (calibration_tx, calibration_rx) = tokio::sync::mpsc::channel::<ControlCommand>(32);
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<Notification>(32);
 
         let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
                 x_values: Vec::new(),
@@ -461,14 +557,25 @@ impl DeviceManager {
             })));
 
         let worker = FleaWorker {
-            fleascope: scope, // No Mutex needed - FleaScope is now thread-safe!
+            fleascope: scope, // Wrap in Some for handling during calibration
             data: data.clone(),
-            is_paused: false,
-            config_change_rx: rx,
-            x1, x10
+            config_change_rx: capture_config_rx,
+            control_rx: calibration_rx,
+            notification_tx,
+            x1, x10,
+            waveform_rx, // Channel for waveform configuration
         };
 
-        let device = FleaScopeDevice::new(hostname, config_change_tx, data);
+        let device = FleaScopeDevice::new(
+            hostname,
+            capture_config_tx,
+            data,
+            calibration_tx,
+            notification_rx,
+            initial_config,
+            waveform_tx,
+            initial_waveform,
+        );
         let _handle = worker.start_data_generation(); // Store handle for proper lifecycle management
 
         self.devices.push(device);
@@ -483,10 +590,9 @@ impl DeviceManager {
         &mut self.devices
     }
 
-    pub fn remove_device(&mut self, index: usize) -> Result<()> {
+    pub fn remove_device(&mut self, index: usize) -> Result<FleaScopeDevice> {
         if index < self.devices.len() {
-            self.devices.remove(index);
-            Ok(())
+            Ok(self.devices.remove(index))
         } else {
             Err(anyhow::anyhow!("Device index out of bounds"))
         }
@@ -499,86 +605,11 @@ pub enum TriggerSource {
     Digital,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AnalogTriggerPattern {
-    Rising,
-    Falling,
-    Level,
-    LevelAuto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DigitalTriggerMode {
-    StartMatching,  // Trigger when pattern starts matching
-    StopMatching,   // Trigger when pattern stops matching
-    WhileMatching,  // Trigger while pattern is matching
-    WhileMatchingAuto, // Auto mode while matching
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DigitalBitState {
-    DontCare,  // X - bit value doesn't matter
-    Low,       // 0 - bit must be low
-    High,      // 1 - bit must be high
-}
-
-impl Into<BitState> for &DigitalBitState {
-    fn into(self) -> BitState {
-        match self {
-            DigitalBitState::DontCare => BitState::DontCare,
-            DigitalBitState::Low => BitState::Low,
-            DigitalBitState::High => BitState::High,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AnalogTriggerConfig {
-    pub level: f64,           // Trigger level (0.0 to 1.0)
-    pub pattern: AnalogTriggerPattern,
-}
-
-impl Into<Trigger> for AnalogTriggerConfig {
-    fn into(self) -> Trigger {
-        let analog_trigger = match self.pattern {
-            AnalogTriggerPattern::Rising => AnalogTrigger::start_capturing_when().rising_edge(self.level),
-            AnalogTriggerPattern::Falling => AnalogTrigger::start_capturing_when().falling_edge(self.level),
-            AnalogTriggerPattern::Level => AnalogTrigger::start_capturing_when().level(self.level),
-            AnalogTriggerPattern::LevelAuto => AnalogTrigger::start_capturing_when().auto(self.level),
-        };
-        Trigger::from(analog_trigger)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DigitalTriggerConfig {
-    pub bit_pattern: [DigitalBitState; 9], // Pattern for 9 digital channels
-    pub mode: DigitalTriggerMode,
-}
-
-impl Into<Trigger> for DigitalTriggerConfig {
-    fn into(self) -> Trigger {
-        let mut digital_trigger = DigitalTrigger::start_capturing_when();
-        
-        // Set bit patterns
-        for (i, bit_state) in self.bit_pattern.iter().enumerate() {
-            digital_trigger = digital_trigger.set_bit(i, bit_state.into());
-        }
-        
-        // Set trigger mode
-        Trigger::from(match self.mode {
-            DigitalTriggerMode::StartMatching => digital_trigger.starts_matching(),
-            DigitalTriggerMode::StopMatching => digital_trigger.stops_matching(),
-            DigitalTriggerMode::WhileMatching => digital_trigger.is_matching(),
-            DigitalTriggerMode::WhileMatchingAuto => digital_trigger.is_matching(), // Note: auto not directly supported
-        })
-    }
-}
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub source: TriggerSource,
-    pub analog: AnalogTriggerConfig,
-    pub digital: DigitalTriggerConfig,
+    pub analog: AnalogTrigger,
+    pub digital: DigitalTrigger,
 }
 
 impl Into<Trigger> for TriggerConfig {
@@ -594,87 +625,69 @@ impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             source: TriggerSource::Digital,
-            analog: AnalogTriggerConfig {
-                level: 0.5,
-                pattern: AnalogTriggerPattern::Rising,
-            },
-            digital: DigitalTriggerConfig {
-                bit_pattern: [DigitalBitState::DontCare; 9],
-                mode: DigitalTriggerMode::WhileMatchingAuto,
-            },
+            analog: AnalogTrigger::start_capturing_when().auto(0.0),
+            digital: DigitalTrigger::start_capturing_when().is_matching(),
         }
     }
 }
 
-impl DigitalBitState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            DigitalBitState::DontCare => "X",
-            DigitalBitState::Low => "0",
-            DigitalBitState::High => "1",
-        }
-    }
-
-    pub fn cycle(&self) -> Self {
-        match self {
-            DigitalBitState::DontCare => DigitalBitState::Low,
-            DigitalBitState::Low => DigitalBitState::High,
-            DigitalBitState::High => DigitalBitState::DontCare,
-        }
+pub fn bitstate_to_str(state: BitState) -> &'static str {
+    match state {
+        BitState::DontCare => "?",
+        BitState::High => "1",
+        BitState::Low => "0",
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WaveformType {
-    Sine,
-    Square,
-    Triangle,
-    Ekg,
+pub fn cycle_bitstate(state: BitState) -> BitState {
+    match state {
+        BitState::DontCare => BitState::High,
+        BitState::High => BitState::Low,
+        BitState::Low => BitState::DontCare,
+    }
 }
 
-impl WaveformType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            WaveformType::Sine => "Sine",
-            WaveformType::Square => "Square",
-            WaveformType::Triangle => "Triangle",
-            WaveformType::Ekg => "EKG",
-        }
+pub fn waveform_to_str(waveform: Waveform) -> &'static str {
+    match waveform {
+        Waveform::Sine => "Sine",
+        Waveform::Square => "Square",
+        Waveform::Triangle => "Triangle",
+        Waveform::Ekg => "EKG",
     }
+}
 
-    pub fn icon(&self) -> &'static str {
-        match self {
-            WaveformType::Sine => "～",
-            WaveformType::Square => "⊓",
-            WaveformType::Triangle => "△",
-            WaveformType::Ekg => "💓",
-        }
+pub fn waveform_to_icon(waveform: Waveform) -> &'static str {
+    match waveform {
+        Waveform::Sine => "～",
+        Waveform::Square => "⊓",
+        Waveform::Triangle => "△",
+        Waveform::Ekg => "💓",
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct WaveformConfig {
     pub enabled: bool,
-    pub waveform_type: WaveformType,
-    pub frequency_hz: f64, // 10 Hz to 4000 Hz
+    pub waveform_type: Waveform,
+    pub frequency_hz: i32, // 10 Hz to 4000 Hz
 }
 
 impl Default for WaveformConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            waveform_type: WaveformType::Sine,
-            frequency_hz: 100.0, // Default 100 Hz
+            waveform_type: Waveform::Sine,
+            frequency_hz: 100, // Default 100 Hz
         }
     }
 }
 
 impl WaveformConfig {
     pub fn is_frequency_valid(&self) -> bool {
-        self.frequency_hz >= 10.0 && self.frequency_hz <= 4000.0
+        self.frequency_hz >= 10 && self.frequency_hz <= 4000
     }
 
     pub fn clamp_frequency(&mut self) {
-        self.frequency_hz = self.frequency_hz.clamp(10.0, 4000.0);
+        self.frequency_hz = self.frequency_hz.clamp(10, 4000);
     }
 }
