@@ -9,6 +9,97 @@ pub struct ControlPanel {
     show_add_device: bool,
 }
 
+/// Custom dial widget with optional label and value display
+fn dial_widget(
+    ui: &mut egui::Ui, 
+    value: &mut f32, 
+    range: std::ops::RangeInclusive<f32>,
+    size: f32,
+    label: Option<&str>,
+    unit: Option<&str>
+) -> egui::Response {
+    let desired_size = egui::vec2(size, size);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+    
+    // Handle interaction FIRST (before drawing anything)
+    if response.clicked() || response.dragged() {
+        if let Some(pointer_pos) = response.interact_pointer_pos() {
+            let center = rect.center();
+            let delta = pointer_pos - center;
+            let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
+            let normalized = (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0);
+            let new_value = range.start() + normalized * (range.end() - range.start());
+            if (*value - new_value).abs() > 0.001 {  // Only update if there's a meaningful change
+                *value = new_value;
+                response.mark_changed();
+            }
+        }
+    }
+    
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.35;
+        
+        // Draw dial background circle
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
+        
+        // Draw tick marks
+        for i in 0..12 {
+            let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
+            let inner_radius = radius * 0.85;
+            let outer_radius = radius * 0.95;
+            let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
+            let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
+            painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
+        }
+        
+        // Calculate angle from value (270° range, starting from top-left)
+        let normalized = (*value - range.start()) / (range.end() - range.start());
+        let angle = -std::f32::consts::PI * 0.75 + normalized * std::f32::consts::PI * 1.5;
+        
+        // Draw pointer
+        let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.7;
+        painter.line_segment([center, pointer_end], egui::Stroke::new(3.0, Color32::LIGHT_BLUE));
+        
+        // Draw center dot
+        painter.circle_filled(center, 3.0, Color32::WHITE);
+        
+        // Draw optional label in top-left corner (outside the interactive area)
+        if let Some(label_text) = label {
+            let label_pos = rect.min + egui::vec2(1.0, 1.0);
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_TOP,
+                label_text,
+                egui::FontId::proportional(8.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+        
+        // Draw current value in bottom-right corner (outside the interactive area)
+        let value_text = if let Some(unit_text) = unit {
+            if *value >= 1000.0 && unit == Some("Hz") {
+                format!("{:.1}k{}", *value / 1000.0, unit_text)
+            } else {
+                format!("{:.1}{}", value, unit_text)
+            }
+        } else {
+            format!("{:.1}", value)
+        };
+        let value_pos = rect.max - egui::vec2(1.0, 1.0);
+        painter.text(
+            value_pos,
+            egui::Align2::RIGHT_BOTTOM,
+            &value_text,
+            egui::FontId::proportional(8.0),
+            Color32::WHITE,
+        );
+    }
+    
+    response
+}
+
 impl ControlPanel {
     pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &mut DeviceManager, notifications: &mut NotificationManager) {
         ui.heading("🎛️ Control Panel");
@@ -353,15 +444,14 @@ impl ControlPanel {
 
         // Analog Trigger - Compact
         if device.trigger_config.source == crate::device::TriggerSource::Analog {
-            // Level Slider
+            // Level Dial
             ui.horizontal(|ui| {
                 ui.label("LVL:");
                 let mut level = device.trigger_config.analog.level as f32;
-                if ui.add(egui::Slider::new(&mut level, -6.6..=6.6).custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
+                if dial_widget(ui, &mut level, -6.6..=6.6, 45.0, Some("LVL"), Some("V")).changed() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.level = level as f64;
                     device.set_trigger_config(new_config);
-                    notifications.add_info(format!("Level: {:.2}V - {}", level, device.name));
                 }
             });
 
@@ -699,22 +789,9 @@ impl ControlPanel {
             ui.horizontal(|ui| {
                 ui.label("FREQ:");
                 let mut freq = device.waveform_config.frequency_hz as f32;
-                if ui.add(egui::Slider::new(&mut freq, 10.0..=4000.0)
-                    .logarithmic(true)
-                    .custom_formatter(|v, _| {
-                        if v >= 1000.0 {
-                            format!("{:.1}kHz", v / 1000.0)
-                        } else {
-                            format!("{:.0}Hz", v)
-                        }
-                    })).changed() {
+                if dial_widget(ui, &mut freq, 10.0..=4000.0, 50.0, Some("FREQ"), Some("Hz")).changed() {
                     device.waveform_config.frequency_hz = freq as i32;
                     device.waveform_config.clamp_frequency();
-                    let freq_str = if freq >= 1000.0 {
-                        format!("{:.1}kHz", freq / 1000.0)
-                    } else {
-                        format!("{:.0}Hz", freq)
-                    };
                     device.set_waveform(device.waveform_config.waveform_type, device.waveform_config.frequency_hz);
                 }
             });
