@@ -357,7 +357,7 @@ impl ControlPanel {
             ui.horizontal(|ui| {
                 ui.label("LVL:");
                 let mut level = device.trigger_config.analog.level as f32;
-                if ui.add(egui::Slider::new(&mut level, -6.6..=6.6).suffix("V").custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
+                if ui.add(egui::Slider::new(&mut level, -6.6..=6.6).custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
                     let mut new_config = device.trigger_config.clone();
                     new_config.analog.level = level as f64;
                     device.set_trigger_config(new_config);
@@ -701,7 +701,6 @@ impl ControlPanel {
                 let mut freq = device.waveform_config.frequency_hz as f32;
                 if ui.add(egui::Slider::new(&mut freq, 10.0..=4000.0)
                     .logarithmic(true)
-                    .suffix("Hz")
                     .custom_formatter(|v, _| {
                         if v >= 1000.0 {
                             format!("{:.1}kHz", v / 1000.0)
