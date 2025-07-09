@@ -107,6 +107,9 @@ pub enum ControlCommand {
     Calibrate0V(ProbeType),
     Calibrate3V(ProbeType),
     StoreCalibration(),
+    Pause,
+    Resume,
+    Step,
     Exit,
 }
 

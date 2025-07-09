@@ -60,8 +60,9 @@ impl FleaScopeDevice {
     }
 
     pub fn pause(&mut self) {
-        self.is_paused = true;
-        self.signal_config_change();
+        self.control_signal_tx
+            .try_send(ControlCommand::Pause)
+            .expect("Failed to send resume command");
     }
 
     pub fn stop(mut self) {
@@ -71,12 +72,9 @@ impl FleaScopeDevice {
     }
 
     pub fn resume(&mut self) {
-        self.is_paused = false;
-        self.signal_config_change();
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.is_paused
+        self.control_signal_tx
+            .try_send(ControlCommand::Resume)
+            .expect("Failed to send resume command");
     }
 
     pub fn set_waveform(&mut self, waveform_type: Waveform, frequency_hz: i32) {

@@ -108,13 +108,39 @@ impl FleaWorker {
                         )))
                         .expect("Failed to send calibration save error"),
                 }
-            },
+            }
             ControlCommand::Exit => {
                 tracing::info!("Exiting FleaWorker");
                 return Err(Error::msg("Exiting FleaWorker")); // Handle exit logic if needed
-            },
+            }
+            ControlCommand::Pause => {
+                self.set_as_paused().await;
+            }
+            ControlCommand::Resume => {
+                self.set_as_running();
+            }
+            ControlCommand::Step => {
+                tracing::info!("Stepping FleaWorker");
+                // Implement step logic if needed, e.g., trigger a single read
+                // This could be a no-op if stepping is not supported
+            }
         };
         Ok(())
+    }
+
+    async fn set_as_paused(&mut self) {
+        tracing::info!("Setting FleaWorker as paused");
+        self.running = false;
+        sleep(Duration::from_millis(20)).await;
+        let data = self.data.load();
+        self.data.store(Arc::new(DeviceData {
+            x_values: data.x_values.clone(),
+            data_points: data.data_points.clone(),
+            last_update: data.last_update,
+            update_rate: 0.0,
+            connected: true,
+            running: self.running,
+        }));
     }
 
     async fn set_lost_connection(&mut self) {
@@ -138,6 +164,10 @@ impl FleaWorker {
         }));
     }
 
+    fn set_as_running(&mut self) {
+        tracing::info!("Setting FleaWorker as running");
+        self.running = true;
+    }
 
     pub fn start_data_generation(mut self) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes

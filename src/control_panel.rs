@@ -228,8 +228,13 @@ impl ControlPanel {
 
         // Device Header - Compact
         ui.horizontal(|ui| {
-            // let status_color = if device.is_connected() { Color32::GREEN } else { Color32::RED };
-            let status_color = Color32::GREEN;
+            // Large power LED with classic styling
+            let status_color = if device.data.load().connected {
+                Color32::GREEN
+            } else {
+                Color32::RED
+            };
+            ui.add_space(2.0);
             ui.colored_label(status_color, "●");
             ui.label(RichText::new(&device.name).strong().size(14.0));
             
