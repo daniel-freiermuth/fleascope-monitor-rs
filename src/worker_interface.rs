@@ -10,11 +10,10 @@ use crate::device::{CaptureConfig, ControlCommand, DeviceData, Notification, Tri
 pub struct FleaScopeDevice {
     pub name: String,
     pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
-    pub enabled_channels: [bool; 10], // 1 analog + 9 digital
-    pub time_frame: f64,             // Time window in seconds
-    pub is_paused: bool,   // Pause/continue state (thread-safe)
-    pub probe_multiplier: ProbeType, // Probe selection
-    pub trigger_config: TriggerConfig, // Trigger configuration
+    pub enabled_channels: [bool; 10],   // 1 analog + 9 digital
+    pub time_frame: f64,                // Time window in seconds
+    pub probe_multiplier: ProbeType,    // Probe selection
+    pub trigger_config: TriggerConfig,  // Trigger configuration
     pub waveform_config: WaveformConfig, // Waveform generator configuration
     config_change_tx: watch::Sender<CaptureConfig>, // Channel for configuration changes
     control_signal_tx: tokio::sync::mpsc::Sender<ControlCommand>, // Channel for calibration commands
@@ -38,8 +37,7 @@ impl FleaScopeDevice {
             name,
             data,
             enabled_channels: [true; 10], // All channels enabled by default
-            time_frame: initial_config.time_frame,             // Default 2 seconds
-            is_paused: initial_config.is_paused,
+            time_frame: initial_config.time_frame, // Default 2 seconds
             probe_multiplier: initial_config.probe_multiplier, // Default x1 probe
             trigger_config: initial_config.trigger_config, // Default trigger config
             waveform_config: initial_waveform, // Default waveform config
@@ -52,12 +50,13 @@ impl FleaScopeDevice {
 
     /// Signal that configuration has changed and data generation should restart
     fn signal_config_change(&self) {
-        self.config_change_tx.send(CaptureConfig {
-            probe_multiplier: self.probe_multiplier,
-            trigger_config: self.trigger_config.clone(),
-            time_frame: self.time_frame,
-            is_paused: self.is_paused,
-        }).expect("Failed to send config change signal");
+        self.config_change_tx
+            .send(CaptureConfig {
+                probe_multiplier: self.probe_multiplier,
+                trigger_config: self.trigger_config.clone(),
+                time_frame: self.time_frame,
+            })
+            .expect("Failed to send config change signal");
     }
 
     pub fn pause(&mut self) {

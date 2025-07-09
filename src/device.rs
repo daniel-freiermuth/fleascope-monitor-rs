@@ -1,23 +1,99 @@
-use anyhow::{Result};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::watch::{self};
-use fleascope_rs::{AnalogTrigger, BitState, DigitalTrigger, IdleFleaScope, ProbeType, Trigger, Waveform};
 use arc_swap::ArcSwap;
+use fleascope_rs::{
+    AnalogTrigger, BitState, DigitalTrigger, FleaConnectorError, IdleFleaScope, ProbeType, Trigger,
+    Waveform,
+};
+use std::{sync::Arc, time::Instant};
+use tokio::sync::watch;
 
-use crate::device_worker::FleaWorker;
-use crate::worker_interface::FleaScopeDevice;
+use crate::{device_worker::FleaWorker, worker_interface::FleaScopeDevice};
 
 // Time frame constants for consistent validation
 pub const MIN_TIME_FRAME: f64 = 0.000122; // 122μs
-pub const MAX_TIME_FRAME: f64 = 3.49;     // 3.49s
+pub const MAX_TIME_FRAME: f64 = 3.49; // 3.49s
+
+#[derive(Default)]
+pub struct DeviceManager {
+    devices: Vec<FleaScopeDevice>,
+}
+
+impl DeviceManager {
+    pub fn add_device(&mut self, hostname: String) -> Result<(), FleaConnectorError> {
+        let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true)?;
+        let initial_config = CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            trigger_config: TriggerConfig::default(),
+            time_frame: 0.1, // Default 2 seconds
+        };
+        let initial_waveform = WaveformConfig::default();
+
+        let (capture_config_tx, capture_config_rx) = watch::channel(initial_config.clone());
+        let (waveform_tx, waveform_rx) = watch::channel(initial_waveform.clone());
+
+        // Create calibration channels
+        let (calibration_tx, calibration_rx) = tokio::sync::mpsc::channel::<ControlCommand>(32);
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<Notification>(32);
+
+        let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
+            x_values: Vec::new(),
+            data_points: Vec::new(),
+            last_update: Instant::now(),
+            update_rate: 0.0,
+            connected: true,
+            running: true,
+        })));
+
+        let worker = FleaWorker {
+            fleascope: scope, // Wrap in Some for handling during calibration
+            data: data.clone(),
+            config_change_rx: capture_config_rx,
+            control_rx: calibration_rx,
+            notification_tx,
+            x1,
+            x10,
+            waveform_rx, // Channel for waveform configuration
+            running: true,
+        };
+
+        let device = FleaScopeDevice::new(
+            hostname,
+            capture_config_tx,
+            data,
+            calibration_tx,
+            notification_rx,
+            initial_config,
+            waveform_tx,
+            initial_waveform,
+        );
+        let _handle = worker.start_data_generation(); // Store handle for proper lifecycle management
+
+        self.devices.push(device);
+        Ok(())
+    }
+
+    pub fn get_devices(&self) -> &[FleaScopeDevice] {
+        &self.devices
+    }
+
+    pub fn get_devices_mut(&mut self) -> &mut [FleaScopeDevice] {
+        &mut self.devices
+    }
+
+    pub fn remove_device(&mut self, index: usize) {
+        if index < self.devices.len() {
+            let d = self.devices.remove(index);
+            d.stop();
+        } else {
+            panic!("Device index out of bounds");
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub probe_multiplier: ProbeType,
     pub trigger_config: TriggerConfig,
     pub time_frame: f64,
-    pub is_paused: bool,
 }
 
 pub enum Notification {
@@ -52,8 +128,9 @@ pub struct DeviceData {
     pub x_values: Vec<f64>,
     pub data_points: Vec<DataPoint>,
     pub last_update: Instant,
-    pub read_duration: Duration,      // Last read operation duration
     pub update_rate: f64,
+    pub connected: bool,
+    pub running: bool,
 }
 
 impl DeviceData {
@@ -81,80 +158,6 @@ impl DeviceData {
             })
             .collect();
         (x, y)
-    }
-}
-
-#[derive(Default)]
-pub struct DeviceManager {
-    devices: Vec<FleaScopeDevice>,
-}
-
-impl DeviceManager {
-    pub fn add_device(&mut self, hostname: String) -> Result<()> {
-        let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true)?;
-        let initial_config = CaptureConfig {
-            probe_multiplier: ProbeType::X1,
-            trigger_config: TriggerConfig::default(),
-            time_frame: 0.1, // Default 2 seconds
-            is_paused: false,
-        };
-        let initial_waveform = WaveformConfig::default();
-
-        let (capture_config_tx, capture_config_rx) = watch::channel(initial_config.clone());
-        let (waveform_tx, waveform_rx) = watch::channel(initial_waveform.clone());
-
-        // Create calibration channels
-        let (calibration_tx, calibration_rx) = tokio::sync::mpsc::channel::<ControlCommand>(32);
-        let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<Notification>(32);
-
-        let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
-                x_values: Vec::new(),
-                data_points: Vec::new(),
-                last_update: Instant::now(),
-                read_duration: Duration::ZERO,
-                update_rate: 0.0,
-            })));
-
-        let worker = FleaWorker {
-            fleascope: scope, // Wrap in Some for handling during calibration
-            data: data.clone(),
-            config_change_rx: capture_config_rx,
-            control_rx: calibration_rx,
-            notification_tx,
-            x1, x10,
-            waveform_rx, // Channel for waveform configuration
-        };
-
-        let device = FleaScopeDevice::new(
-            hostname,
-            capture_config_tx,
-            data,
-            calibration_tx,
-            notification_rx,
-            initial_config,
-            waveform_tx,
-            initial_waveform,
-        );
-        let _handle = worker.start_data_generation(); // Store handle for proper lifecycle management
-
-        self.devices.push(device);
-        Ok(())
-    }
-
-    pub fn get_devices(&self) -> &[FleaScopeDevice] {
-        &self.devices
-    }
-
-    pub fn get_devices_mut(&mut self) -> &mut [FleaScopeDevice] {
-        &mut self.devices
-    }
-
-    pub fn remove_device(&mut self, index: usize) -> Result<FleaScopeDevice> {
-        if index < self.devices.len() {
-            Ok(self.devices.remove(index))
-        } else {
-            Err(anyhow::anyhow!("Device index out of bounds"))
-        }
     }
 }
 

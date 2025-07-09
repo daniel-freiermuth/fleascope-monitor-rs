@@ -18,6 +18,7 @@ pub struct FleaWorker {
     pub waveform_rx: tokio::sync::watch::Receiver<WaveformConfig>, // Channel for waveform configuration
     pub x1: FleaProbe,
     pub x10: FleaProbe,
+    pub running: bool,
 }
 
 impl FleaWorker {
@@ -29,33 +30,83 @@ impl FleaWorker {
             ControlCommand::Calibrate0V(probe_multiplier) => {
                 match probe_multiplier {
                     ProbeType::X1 => match self.x1.calibrate_0(&mut self.fleascope) {
-                        Ok(_) => {},
-                        Err(e) => self.notification_tx.send(Notification::Error(format!("Calibration failed: {}", e))).await.expect("Failed to send calibration result"),
+                        Ok(_) => {}
+                        Err(e) => self
+                            .notification_tx
+                            .send(Notification::Error(format!("Calibration failed: {}", e)))
+                            .await
+                            .expect("Failed to send calibration result"),
                     },
                     ProbeType::X10 => match self.x10.calibrate_0(&mut self.fleascope) {
-                        Ok(_) => {},
-                        Err(e) => self.notification_tx.send(Notification::Error(format!("Calibration failed: {}", e))).await.expect("Failed to send calibration result"),
-
-                    }
+                        Ok(_) => {}
+                        Err(e) => self
+                            .notification_tx
+                            .send(Notification::Error(format!("Calibration failed: {}", e)))
+                            .await
+                            .expect("Failed to send calibration result"),
+                    },
                 };
-                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
+                if let Err(e) = self
+                    .notification_tx
+                    .send(Notification::Success(
+                        "Calibration completed successfully".to_string(),
+                    ))
+                    .await
+                {
                     tracing::error!("Failed to send calibration result: {}", e);
                 }
             }
             ControlCommand::Calibrate3V(probe_multiplier) => {
                 match probe_multiplier {
-                    ProbeType::X1 => self.x1.calibrate_3v3(&mut self.fleascope),
-                    ProbeType::X10 => self.x10.calibrate_3v3(&mut self.fleascope),
+                    ProbeType::X1 => {
+                        if let Err(e) = self.x1.calibrate_3v3(&mut self.fleascope) {
+                            self.notification_tx
+                                .blocking_send(Notification::Error(format!(
+                                    "Calibration failed: {}",
+                                    e
+                                )))
+                                .expect("Failed to send calibration error")
+                        }
+                    }
+                    ProbeType::X10 => {
+                        if let Err(e) = self.x10.calibrate_3v3(&mut self.fleascope) {
+                            self.notification_tx
+                                .blocking_send(Notification::Error(format!(
+                                    "Calibration failed: {}",
+                                    e
+                                )))
+                                .expect("Failed to send calibration error")
+                        }
+                    }
                 };
-                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
+                if let Err(e) = self
+                    .notification_tx
+                    .send(Notification::Success(
+                        "Calibration completed successfully".to_string(),
+                    ))
+                    .await
+                {
                     tracing::error!("Failed to send calibration result: {}", e);
                 }
             }
             ControlCommand::StoreCalibration() => {
-                self.x1.write_calibration_to_flash(&mut self.fleascope);
-                self.x10.write_calibration_to_flash(&mut self.fleascope);
-                if let Err(e) = self.notification_tx.send(Notification::Success("Calibration completed successfully".to_string())).await {
-                    tracing::error!("Failed to send calibration result: {}", e);
+                match Ok(())
+                    .and(self.x1.write_calibration_to_flash(&mut self.fleascope))
+                    .and(self.x10.write_calibration_to_flash(&mut self.fleascope))
+                {
+                    Ok(_) => self
+                        .notification_tx
+                        .blocking_send(Notification::Success(
+                            "Calibration saved successfully".to_string(),
+                        ))
+                        .expect("Failed to send calibration save success"),
+                    Err(e) => self
+                        .notification_tx
+                        .blocking_send(Notification::Error(format!(
+                            "Failed to save calibration: {}",
+                            e
+                        )))
+                        .expect("Failed to send calibration save error"),
                 }
             },
             ControlCommand::Exit => {
@@ -74,13 +125,16 @@ impl FleaWorker {
             ))
             .await
             .expect("Failed to send read error notification");
+        self.running = false;
+        sleep(Duration::from_millis(20)).await;
         let data = self.data.load();
         self.data.store(Arc::new(DeviceData {
             x_values: data.x_values.clone(),
             data_points: data.data_points.clone(),
             last_update: data.last_update,
             update_rate: 0.0,
-            read_duration: Duration::from_secs_f32(0.0),
+            connected: false,
+            running: self.running,
         }));
     }
 
@@ -114,7 +168,7 @@ impl FleaWorker {
                 tracing::debug!("Starting new data generation iteration");
                 // Check if device is paused first
                 let capture_config = self.config_change_rx.borrow_and_update().clone();
-                if capture_config.is_paused {
+                if !self.running {
                     tracing::debug!("Device is paused, skipping data generation");
                     
                     // During pause, still check for config changes and calibration commands
@@ -150,13 +204,21 @@ impl FleaWorker {
                 };
                 let probe_clone = probe.clone(); // Clone early to avoid borrowing issues
 
-                let trigger_str = match probe.trigger_to_string(capture_config.trigger_config.into()) {
-                    Ok(str) => str,
-                    Err(e) => {
-                        tracing::error!("Failed to convert trigger to string: {}", e);
-                        continue
-                    }
-                };
+                let trigger_str =
+                    match probe.trigger_to_string(capture_config.trigger_config.into()) {
+                        Ok(str) => str,
+                        Err(e) => {
+                            tracing::error!("Failed to convert trigger to string: {}", e);
+                            self.notification_tx
+                                .blocking_send(Notification::Error(format!(
+                                    "Invalid trigger configuration: {}",
+                                    e
+                                )))
+                                .expect("Failed to send error notification");
+                            self.set_as_paused().await;
+                            continue;
+                        }
+                    };
 
                 let star_res = self.fleascope.read_async(
                     Duration::from_secs_f64(capture_config.time_frame),
@@ -183,8 +245,6 @@ impl FleaWorker {
                                 break;
                             };
                         }
-                        let read_duration = start_time.elapsed();
-                        
                         if last_rate_update.elapsed() >= Duration::from_secs(1) {
                             update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
                             read_count = 0;
@@ -210,11 +270,12 @@ impl FleaWorker {
                                 .map(|data_points| {
                                     // Update data with lock-free operation using ArcSwap
                                     let new_data = DeviceData {
-                                        x_values : data_points.0,
-                                        data_points : data_points.1,
-                                        last_update : Instant::now(),
-                                        read_duration : read_duration,
+                                        x_values: data_points.0,
+                                        data_points: data_points.1,
+                                        last_update: Instant::now(),
                                         update_rate,
+                                        connected: true,
+                                        running: self.running,
                                     };
                                     data_copy.store(Arc::new(new_data));
                                 }).ok();
@@ -227,8 +288,16 @@ impl FleaWorker {
                 }
             }
             self.fleascope.teardown();
+            let data = self.data.load();
+            self.data.store(Arc::new(DeviceData {
+                x_values: data.x_values.clone(),
+                data_points: data.data_points.clone(),
+                last_update: data.last_update,
+                update_rate: 0.0,
+                connected: false,
+                running: false,
+            }));
         })
-        
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
