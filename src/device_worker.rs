@@ -1,13 +1,16 @@
-use std::{sync::Arc, time::{Duration, Instant}};
-
 use anyhow::{Error, Result};
 use arc_swap::ArcSwap;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
-use polars::frame::DataFrame;
+use polars::prelude::*;
+use std::panic;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tokio::time::sleep;
 
-use crate::device::{CaptureConfig, ControlCommand, DataPoint, DeviceData, Notification, WaveformConfig};
-
+use crate::device::{
+    CaptureConfig, ControlCommand, DataPoint, DeviceData, Notification, WaveformConfig,
+};
 
 pub struct FleaWorker {
     pub fleascope: IdleFleaScope,
@@ -25,7 +28,7 @@ impl FleaWorker {
     /// Handle calibration commands received from the UI
     async fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
         tracing::info!("Handling calibration command: {:?}", command);
-        
+
         match command {
             ControlCommand::Calibrate0V(probe_multiplier) => {
                 match probe_multiplier {
@@ -179,36 +182,31 @@ impl FleaWorker {
         tokio::spawn(async move {
             tracing::debug!("Starting cancellation-aware data generation loop");
             loop {
-                match self.control_rx.try_recv() {
-                    Ok(command) => {
-                        tracing::info!("Received calibration command while paused: {:?}", command);
-                        match self.handle_control_command(command).await {
-                            Err(_) => break,
-                            _ => {}
-                        }
-                    },
-                    _ => {}
+                if let Ok(command) = self.control_rx.try_recv() {
+                    tracing::info!("Received control command: {:?}", command);
+                    if (self.handle_control_command(command).await).is_err() {
+                        break;
+                    }
                 }
-                if self.waveform_rx.has_changed().expect("Failed to check for waveform config change") {
+                if self
+                    .waveform_rx
+                    .has_changed()
+                    .expect("Failed to check for waveform config change")
+                {
                     tracing::info!("Waveform configuration changed, updating waveform");
                     let waveform_config = self.waveform_rx.borrow_and_update().clone();
-                    self.fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz); 
+                    self.fleascope
+                        .set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
                 }
-            
+
                 tracing::debug!("Starting new data generation iteration");
                 // Check if device is paused first
                 let capture_config = self.config_change_rx.borrow_and_update().clone();
                 if !self.running {
                     tracing::debug!("Device is paused, skipping data generation");
-                    
+
                     // During pause, still check for config changes and calibration commands
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {},
-                        signal = self.config_change_rx.changed() => {
-                            if signal.is_ok() {
-                                tracing::info!("Configuration changed while paused, will restart");
-                            }
-                        }
                         signal = self.waveform_rx.changed() => {
                             if signal.is_ok() {
                                 tracing::info!("Configuration changed while paused, will restart");
@@ -216,9 +214,8 @@ impl FleaWorker {
                         }
                         Some(command) = self.control_rx.recv() => {
                             tracing::info!("Received calibration command while paused: {:?}", command);
-                            match self.handle_control_command(command).await {
-                                Err(_) => break,
-                                _ => {},
+                            if (self.handle_control_command(command).await).is_err() {
+                                break;
                             }
                         }
                     }
@@ -226,8 +223,7 @@ impl FleaWorker {
                 }
 
                 tracing::debug!("Device is running, starting data generation");
-                
-                let start_time = Instant::now();
+
                 let probe = match capture_config.probe_multiplier {
                     ProbeType::X1 => &self.x1,
                     ProbeType::X10 => &self.x10,
@@ -253,30 +249,44 @@ impl FleaWorker {
                 let star_res = self.fleascope.read_async(
                     Duration::from_secs_f64(capture_config.time_frame),
                     trigger_str,
-                    None
+                    None,
                 );
                 match star_res {
                     Ok(mut fleascope_for_read) => {
                         tracing::debug!("Successfully started read operation on FleaScope");
 
                         while !fleascope_for_read.is_done() {
-                            if self.config_change_rx.has_changed().expect("Failed to check for config change") {
-                                tracing::info!("Configuration changed during hardware read, calling unblock()");
+                            if self
+                                .config_change_rx
+                                .has_changed()
+                                .expect("Failed to check for config change")
+                            {
+                                tracing::info!(
+                                    "Configuration changed during hardware read, calling unblock()"
+                                );
                                 fleascope_for_read.cancel();
                                 break;
                             }
-                            if self.waveform_rx.has_changed().expect("Failed to check for waveform change") {
-                                tracing::info!("Waveform changed during hardware read, calling unblock()");
+                            if self
+                                .waveform_rx
+                                .has_changed()
+                                .expect("Failed to check for waveform change")
+                            {
+                                tracing::info!(
+                                    "Waveform changed during hardware read, calling unblock()"
+                                );
                                 fleascope_for_read.cancel();
                                 break;
                             }
                             if !self.control_rx.is_empty() {
+                                tracing::info!("Received control command during hardware read");
                                 fleascope_for_read.cancel();
                                 break;
                             };
                         }
                         if last_rate_update.elapsed() >= Duration::from_secs(1) {
-                            update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                            update_rate =
+                                read_count as f64 / last_rate_update.elapsed().as_secs_f64();
                             read_count = 0;
                             last_rate_update = Instant::now();
                         }
@@ -296,7 +306,7 @@ impl FleaWorker {
                         tokio::spawn(async move {
                             IdleFleaScope::parse_csv(&data_s, f)
                                 .map(|df| probe_clone.apply_calibration(df).collect().unwrap())
-                                .map(|df| FleaWorker::convert_polars_to_data_points(df))
+                                .map(FleaWorker::convert_polars_to_data_points)
                                 .map(|data_points| {
                                     // Update data with lock-free operation using ArcSwap
                                     let new_data = DeviceData {
@@ -308,7 +318,8 @@ impl FleaWorker {
                                         running: self.running,
                                     };
                                     data_copy.store(Arc::new(new_data));
-                                }).ok();
+                                })
+                                .ok();
                         });
                     }
                     Err((s, e)) => {
@@ -331,9 +342,16 @@ impl FleaWorker {
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
-        tracing::debug!("Converting DataFrame with columns: {:?}", df.get_column_names());
-        tracing::debug!("DataFrame shape: {} rows, {} columns", df.height(), df.width());
-        
+        tracing::debug!(
+            "Converting DataFrame with columns: {:?}",
+            df.get_column_names()
+        );
+        tracing::debug!(
+            "DataFrame shape: {} rows, {} columns",
+            df.height(),
+            df.width()
+        );
+
         // Extract columns from the DataFrame
         let time_col = match df.column("time") {
             Ok(col) => col,
@@ -342,7 +360,7 @@ impl FleaWorker {
                 panic!("Time column not found in DataFrame");
             }
         };
-        
+
         let bnc_col = match df.column("bnc") {
             Ok(col) => col,
             Err(e) => {
@@ -350,7 +368,7 @@ impl FleaWorker {
                 panic!("BNC column not found in DataFrame");
             }
         };
-        
+
         let bitmap_col = match df.column("bitmap") {
             Ok(col) => col,
             Err(e) => {
@@ -366,7 +384,7 @@ impl FleaWorker {
                 panic!("Time column conversion failed");
             }
         };
-        
+
         let bnc_values: Vec<f64> = match bnc_col.f64() {
             Ok(chunked) => chunked.into_no_null_iter().collect(),
             Err(e) => {
@@ -374,9 +392,10 @@ impl FleaWorker {
                 panic!("BNC column conversion failed");
             }
         };
-        
+
         // Convert bitmap column - handle both string and numeric formats
-        let bitmap_values: Vec<u16> = if bitmap_col.dtype() == &polars::datatypes::DataType::String {
+        let bitmap_values: Vec<u16> = if bitmap_col.dtype() == &polars::datatypes::DataType::String
+        {
             // Handle string bitmap data (e.g., "0x1ff", "0101010101", or "255")
             // TODO maybe use the fleascope-rs function
             match bitmap_col.str() {
@@ -389,7 +408,11 @@ impl FleaWorker {
                                 match u16::from_str_radix(&s[2..], 16) {
                                     Ok(val) => values.push(val),
                                     Err(e) => {
-                                        tracing::error!("Failed to parse hex string '{}': {}", s, e);
+                                        tracing::error!(
+                                            "Failed to parse hex string '{}': {}",
+                                            s,
+                                            e
+                                        );
                                         panic!("Invalid bitmap hex string");
                                     }
                                 }
@@ -411,25 +434,35 @@ impl FleaWorker {
             panic!("Bitmap column is not a string type, expected string or numeric format");
         };
 
-        tracing::debug!("Extracted {} time values, {} BNC values, {} bitmap values", 
-                       time_values.len(), bnc_values.len(), bitmap_values.len());
+        tracing::debug!(
+            "Extracted {} time values, {} BNC values, {} bitmap values",
+            time_values.len(),
+            bnc_values.len(),
+            bitmap_values.len()
+        );
 
-        tracing::debug!("Successfully converted DataFrame to vectors, processing {} data points", time_values.len());
+        tracing::debug!(
+            "Successfully converted DataFrame to vectors, processing {} data points",
+            time_values.len()
+        );
 
         let mut x_values = Vec::new();
         let mut data_points = Vec::new();
 
-        for ((time, bnc), bitmap) in time_values.iter().zip(bnc_values.iter()).zip(bitmap_values.iter()) {
+        for ((time, bnc), bitmap) in time_values
+            .iter()
+            .zip(bnc_values.iter())
+            .zip(bitmap_values.iter())
+        {
             x_values.push(*time);
-            
+
             // Extract digital channels from bitmap
             let mut digital_channels = [false; 9];
-            for i in 0..9 {
-                digital_channels[i] = (bitmap & (1 << i)) != 0;
+            for (i, ch) in digital_channels.iter_mut().enumerate() {
+                *ch = (bitmap & (1 << i)) != 0;
             }
 
             data_points.push(DataPoint {
-                timestamp: *time,
                 analog_channel: *bnc,
                 digital_channels,
             });
@@ -438,5 +471,4 @@ impl FleaWorker {
         tracing::debug!("Converted to {} data points", data_points.len());
         (x_values, data_points)
     }
-
 }

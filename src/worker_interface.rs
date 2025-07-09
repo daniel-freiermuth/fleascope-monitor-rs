@@ -1,11 +1,13 @@
-use std::sync::Arc;
-
+use anyhow::Result;
 use arc_swap::ArcSwap;
 use fleascope_rs::{ProbeType, Waveform};
+use std::sync::Arc;
 use tokio::sync::watch::{self, Sender};
 
-use crate::device::{CaptureConfig, ControlCommand, DeviceData, Notification, TriggerConfig, WaveformConfig, MAX_TIME_FRAME, MIN_TIME_FRAME};
-
+use crate::device::{
+    CaptureConfig, ControlCommand, DeviceData, Notification, TriggerConfig, WaveformConfig,
+    MAX_TIME_FRAME, MIN_TIME_FRAME,
+};
 
 pub struct FleaScopeDevice {
     pub name: String,
@@ -21,11 +23,10 @@ pub struct FleaScopeDevice {
     waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
 }
 
-
 impl FleaScopeDevice {
     pub fn new(
-        name: String, 
-        config_change_tx: Sender<CaptureConfig>, 
+        name: String,
+        config_change_tx: Sender<CaptureConfig>,
         data: Arc<ArcSwap<DeviceData>>,
         calibration_tx: tokio::sync::mpsc::Sender<ControlCommand>,
         notification_rx: tokio::sync::mpsc::Receiver<Notification>,
@@ -81,21 +82,9 @@ impl FleaScopeDevice {
         self.waveform_config.waveform_type = waveform_type;
         self.waveform_config.frequency_hz = frequency_hz.clamp(10, 4000);
         self.waveform_config.enabled = true;
-        self.waveform_tx.send(self.waveform_config.clone())
+        self.waveform_tx
+            .send(self.waveform_config.clone())
             .expect("Failed to send waveform configuration");
-    }
-
-    pub fn get_waveform_status(&self) -> String {
-        if self.waveform_config.enabled {
-            let freq_str = if self.waveform_config.frequency_hz >= 1000 {
-                format!("{:.1}kHz", self.waveform_config.frequency_hz / 1000)
-            } else {
-                format!("{:.0}Hz", self.waveform_config.frequency_hz)
-            };
-            format!("{} {}", self.waveform_config.waveform_type.as_str(), freq_str)
-        } else {
-            "Off".to_string()
-        }
     }
 
     pub fn set_probe_multiplier(&mut self, multiplier: ProbeType) {
@@ -104,6 +93,7 @@ impl FleaScopeDevice {
     }
 
     pub fn set_trigger_config(&mut self, trigger_config: TriggerConfig) {
+        tracing::debug!("Setting trigger config: {:?}", trigger_config);
         self.trigger_config = trigger_config;
         self.signal_config_change();
     }

@@ -1,4 +1,4 @@
-use crate::device::{DeviceManager, FleaScopeDevice};
+use crate::{device::DeviceManager, worker_interface::FleaScopeDevice};
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
@@ -61,13 +61,13 @@ impl PlotArea {
                                 |ui| {
                                     ui.label(format!("📡 {}", device.name));
                                     let status_color = Color32::GREEN; // Default to green
-                                    /*
-                                    let status_color = if device.is_connected() {
-                                        Color32::GREEN
-                                    } else {
-                                        Color32::RED
-                                    };
-                                    */
+                                                                       /*
+                                                                       let status_color = if device.is_connected() {
+                                                                           Color32::GREEN
+                                                                       } else {
+                                                                           Color32::RED
+                                                                       };
+                                                                       */
                                     ui.colored_label(status_color, "●");
                                 },
                             );

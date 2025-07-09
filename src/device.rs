@@ -97,9 +97,8 @@ pub struct CaptureConfig {
 }
 
 pub enum Notification {
-    Message(String),
     Success(String),
-    Error(String),  
+    Error(String),
 }
 
 #[derive(Debug)]
@@ -113,15 +112,8 @@ pub enum ControlCommand {
     Exit,
 }
 
-#[derive(Debug)]
-pub enum CalibrationResult {
-    Success(String),
-    Error(String),
-}
-
 #[derive(Debug, Clone)]
 pub struct DataPoint {
-    pub timestamp: f64,
     pub analog_channel: f64,
     pub digital_channels: [bool; 9],
 }
@@ -177,11 +169,11 @@ pub struct TriggerConfig {
     pub digital: DigitalTrigger,
 }
 
-impl Into<Trigger> for TriggerConfig {
-    fn into(self) -> Trigger {
-        match self.source {
-            TriggerSource::Analog => self.analog.into(),
-            TriggerSource::Digital => self.digital.into(),
+impl From<TriggerConfig> for Trigger {
+    fn from(tc: TriggerConfig) -> Self {
+        match tc.source {
+            TriggerSource::Analog => tc.analog.into(),
+            TriggerSource::Digital => tc.digital.into(),
         }
     }
 }
@@ -196,28 +188,11 @@ impl Default for TriggerConfig {
     }
 }
 
-pub fn bitstate_to_str(state: BitState) -> &'static str {
-    match state {
-        BitState::DontCare => "?",
-        BitState::High => "1",
-        BitState::Low => "0",
-    }
-}
-
 pub fn cycle_bitstate(state: BitState) -> BitState {
     match state {
         BitState::DontCare => BitState::High,
         BitState::High => BitState::Low,
         BitState::Low => BitState::DontCare,
-    }
-}
-
-pub fn waveform_to_str(waveform: Waveform) -> &'static str {
-    match waveform {
-        Waveform::Sine => "Sine",
-        Waveform::Square => "Square",
-        Waveform::Triangle => "Triangle",
-        Waveform::Ekg => "EKG",
     }
 }
 
@@ -248,10 +223,6 @@ impl Default for WaveformConfig {
 }
 
 impl WaveformConfig {
-    pub fn is_frequency_valid(&self) -> bool {
-        self.frequency_hz >= 10 && self.frequency_hz <= 4000
-    }
-
     pub fn clamp_frequency(&mut self) {
         self.frequency_hz = self.frequency_hz.clamp(10, 4000);
     }
