@@ -4,8 +4,10 @@ use tokio::sync::Mutex;
 
 mod control_panel;
 mod device;
+mod device_worker;
 mod notifications;
 mod plot_area;
+mod worker_interface;
 
 use control_panel::ControlPanel;
 use device::DeviceManager;
