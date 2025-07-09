@@ -111,8 +111,8 @@ impl eframe::App for FleaScopeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Use available space more efficiently
             let available_rect = ui.available_rect_before_wrap();
-            let plot_width = available_rect.width() * 0.65;
-            let control_width = available_rect.width() * 0.35;
+            let control_width = 300.0;
+            let plot_width = available_rect.width() - control_width;
 
             ui.horizontal(|ui| {
                 // Left side - Plot area (takes most of the space)
