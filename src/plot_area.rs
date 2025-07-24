@@ -1,4 +1,4 @@
-use crate::device::{DeviceManager, FleaScopeDevice};
+use crate::{device::DeviceManager, worker_interface::FleaScopeDevice};
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
@@ -6,7 +6,6 @@ pub struct PlotArea {
     plot_height: f32,
     colors: Vec<Color32>,
     show_grid: bool,
-    auto_scale: bool,
 }
 
 impl Default for PlotArea {
@@ -26,7 +25,6 @@ impl Default for PlotArea {
                 Color32::from_rgb(50, 205, 50),   // Lime Green
             ],
             show_grid: true,
-            auto_scale: true,
         }
     }
 }
@@ -37,7 +35,6 @@ impl PlotArea {
 
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_grid, "Show Grid");
-            ui.checkbox(&mut self.auto_scale, "Auto Scale");
             ui.separator();
             ui.label("Plot Height:");
             ui.add(egui::Slider::new(&mut self.plot_height, 100.0..=400.0).suffix("px"));
@@ -56,22 +53,21 @@ impl PlotArea {
                 ui.set_min_width(ui.available_width());
 
                 for (device_idx, device) in device_manager.get_devices().iter().enumerate() {
-                    if !device.is_connected() {
-                        continue;
-                    }
-
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&device.name).heading().strong());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(format!("📡 {}", device.hostname));
-                                    let status_color = if device.is_connected() {
-                                        Color32::GREEN
-                                    } else {
-                                        Color32::RED
-                                    };
+                                    ui.label(format!("📡 {}", device.name));
+                                    let status_color = Color32::GREEN; // Default to green
+                                                                       /*
+                                                                       let status_color = if device.is_connected() {
+                                                                           Color32::GREEN
+                                                                       } else {
+                                                                           Color32::RED
+                                                                       };
+                                                                       */
                                     ui.colored_label(status_color, "●");
                                 },
                             );
@@ -111,9 +107,9 @@ impl PlotArea {
         device: &FleaScopeDevice,
         device_idx: usize,
     ) {
-        let data_guard = device.data.lock().unwrap();
-        let (x_data, y_data) = data_guard.get_analog_data();
-        drop(data_guard);
+        // Use ArcSwap load for lock-free, smooth data access
+        let data = device.data.load();
+        let (x_data, y_data) = data.get_analog_data();
 
         if x_data.is_empty() {
             ui.label("No data available");
@@ -129,14 +125,9 @@ impl PlotArea {
             .allow_scroll(false);
 
         plot.show(ui, |plot_ui| {
-            // Filter data to device's time window
-            let latest_time = x_data.last().copied().unwrap_or(0.0);
-            let min_time = latest_time - device.time_frame;
-
             let filtered_data: Vec<[f64; 2]> = x_data
                 .iter()
                 .zip(y_data.iter())
-                .filter(|(x, _)| **x >= min_time)
                 .map(|(x, y)| [*x, *y])
                 .collect();
 
@@ -157,16 +148,14 @@ impl PlotArea {
         device: &FleaScopeDevice,
         device_idx: usize,
     ) {
-        let data_guard = device.data.lock().unwrap();
-        let x_data = &data_guard.x_values;
+        // Use ArcSwap load for lock-free, smooth data access
+        let data = device.data.load();
+        let x_data = &data.x_values;
 
         if x_data.is_empty() {
             ui.label("No data available");
             return;
         }
-
-        let latest_time = x_data.last().copied().unwrap_or(0.0);
-        let min_time = latest_time - device.time_frame;
 
         let plot = Plot::new(format!("digital_plot_{}", device_idx))
             .height(self.plot_height * 1.5) // Taller for multiple digital channels
@@ -183,12 +172,11 @@ impl PlotArea {
                     continue;
                 }
 
-                let (x_data, y_data) = data_guard.get_digital_channel_data(ch);
+                let (x_data, y_data) = data.get_digital_channel_data(ch);
 
                 let filtered_data: Vec<[f64; 2]> = x_data
                     .iter()
                     .zip(y_data.iter())
-                    .filter(|(x, _)| **x >= min_time)
                     .map(|(x, y)| [*x, *y + ch as f64 * 1.2]) // Offset each channel vertically
                     .collect();
 
@@ -203,6 +191,5 @@ impl PlotArea {
                 }
             }
         });
-        drop(data_guard);
     }
 }

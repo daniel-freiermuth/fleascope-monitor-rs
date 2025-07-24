@@ -1,0 +1,131 @@
+use anyhow::Result;
+use arc_swap::ArcSwap;
+use fleascope_rs::{ProbeType, Waveform};
+use std::sync::Arc;
+use tokio::sync::watch::{self, Sender};
+
+use crate::device::{
+    CaptureConfig, ControlCommand, DeviceData, Notification, TriggerConfig, WaveformConfig,
+    MAX_TIME_FRAME, MIN_TIME_FRAME,
+};
+
+pub struct FleaScopeDevice {
+    pub name: String,
+    pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
+    pub enabled_channels: [bool; 10],   // 1 analog + 9 digital
+    pub time_frame: f64,                // Time window in seconds
+    pub probe_multiplier: ProbeType,    // Probe selection
+    pub trigger_config: TriggerConfig,  // Trigger configuration
+    pub waveform_config: WaveformConfig, // Waveform generator configuration
+    config_change_tx: watch::Sender<CaptureConfig>, // Channel for configuration changes
+    control_signal_tx: tokio::sync::mpsc::Sender<ControlCommand>, // Channel for calibration commands
+    pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results
+    waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
+}
+
+impl FleaScopeDevice {
+    pub fn new(
+        name: String,
+        config_change_tx: Sender<CaptureConfig>,
+        data: Arc<ArcSwap<DeviceData>>,
+        calibration_tx: tokio::sync::mpsc::Sender<ControlCommand>,
+        notification_rx: tokio::sync::mpsc::Receiver<Notification>,
+        initial_config: CaptureConfig,
+        waveform_tx: Sender<WaveformConfig>,
+        initial_waveform: WaveformConfig,
+    ) -> Self {
+        Self {
+            name,
+            data,
+            enabled_channels: [true; 10], // All channels enabled by default
+            time_frame: initial_config.time_frame, // Default 2 seconds
+            probe_multiplier: initial_config.probe_multiplier, // Default x1 probe
+            trigger_config: initial_config.trigger_config, // Default trigger config
+            waveform_config: initial_waveform, // Default waveform config
+            config_change_tx,
+            control_signal_tx: calibration_tx,
+            notification_rx,
+            waveform_tx,
+        }
+    }
+
+    /// Signal that configuration has changed and data generation should restart
+    fn signal_config_change(&self) {
+        self.config_change_tx
+            .send(CaptureConfig {
+                probe_multiplier: self.probe_multiplier,
+                trigger_config: self.trigger_config.clone(),
+                time_frame: self.time_frame,
+            })
+            .expect("Failed to send config change signal");
+    }
+
+    pub fn pause(&mut self) {
+        self.control_signal_tx
+            .try_send(ControlCommand::Pause)
+            .expect("Failed to send resume command");
+    }
+
+    pub fn stop(mut self) {
+        self.control_signal_tx
+            .try_send(ControlCommand::Exit)
+            .expect("Failed to send exit command");
+    }
+
+    pub fn resume(&mut self) {
+        self.control_signal_tx
+            .try_send(ControlCommand::Resume)
+            .expect("Failed to send resume command");
+    }
+
+    pub fn set_waveform(&mut self, waveform_type: Waveform, frequency_hz: i32) {
+        self.waveform_config.waveform_type = waveform_type;
+        self.waveform_config.frequency_hz = frequency_hz.clamp(10, 4000);
+        self.waveform_config.enabled = true;
+        self.waveform_tx
+            .send(self.waveform_config.clone())
+            .expect("Failed to send waveform configuration");
+    }
+
+    pub fn set_probe_multiplier(&mut self, multiplier: ProbeType) {
+        self.probe_multiplier = multiplier;
+        self.signal_config_change();
+    }
+
+    pub fn set_trigger_config(&mut self, trigger_config: TriggerConfig) {
+        tracing::debug!("Setting trigger config: {:?}", trigger_config);
+        self.trigger_config = trigger_config;
+        self.signal_config_change();
+    }
+
+    pub fn set_enabled_channels(&mut self, enabled: [bool; 10]) {
+        self.enabled_channels = enabled;
+    }
+
+    pub fn set_time_frame(&mut self, time_frame: f64) {
+        // Clamp time frame to valid range: 122μs to 3.49s
+        self.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
+        self.signal_config_change();
+    }
+
+    /// Send 0V calibration command (non-blocking)
+    pub fn start_calibrate_0v(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::Calibrate0V(self.probe_multiplier))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+    }
+
+    /// Send 3V calibration command (non-blocking)  
+    pub fn start_calibrate_3v(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::Calibrate3V(self.probe_multiplier))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+    }
+
+    /// Send store calibration command (non-blocking)
+    pub fn start_store_calibration(&self) -> Result<(), anyhow::Error> {
+        self.control_signal_tx
+            .try_send(ControlCommand::StoreCalibration())
+            .map_err(|e| anyhow::anyhow!("Failed to send storage command: {}", e))
+    }
+}
