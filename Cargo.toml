@@ -1,7 +1,11 @@
 [package]
-name = "fleascope-live-rs"
+name = "fleascope-monitor"
 version = "0.1.0"
 edition = "2021"
+description = "Live Monitor for Fleascopes"
+license = "MIT OR Apache"
+homepage = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
+repository = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
 
 [dependencies]
 eframe = "0.28"
@@ -15,7 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-fleascope-rs = { path = "../fleascope-rs" }
+fleascope-rs = "0.2.0"
 polars = { version = "0.45", features = ["lazy"] }
 arc-swap = "1.6"
 
