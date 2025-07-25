@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
 repository = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
 
+[features]
+default = []
+puffin = ["dep:puffin", "dep:puffin_egui"]
+
 [dependencies]
 eframe = "0.28"
 egui = "0.28"
@@ -22,6 +26,8 @@ tracing-subscriber = "0.3"
 fleascope-rs = "0.2.0"
 polars = { version = "0.45", features = ["lazy"] }
 arc-swap = "1.6"
+puffin = { version = "0.19", optional = true }
+puffin_egui = { version = "0.29", optional = true }
 
 [dependencies.egui_extras]
 version = "0.28"

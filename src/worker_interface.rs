@@ -66,7 +66,7 @@ impl FleaScopeDevice {
             .expect("Failed to send resume command");
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(self) {
         self.control_signal_tx
             .try_send(ControlCommand::Exit)
             .expect("Failed to send exit command");

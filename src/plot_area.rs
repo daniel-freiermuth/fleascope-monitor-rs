@@ -31,6 +31,9 @@ impl Default for PlotArea {
 
 impl PlotArea {
     pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &DeviceManager) {
+        #[cfg(feature = "puffin")]
+        puffin::profile_function!();
+        
         ui.heading("📈 Oscilloscope Display");
 
         ui.horizontal(|ui| {
