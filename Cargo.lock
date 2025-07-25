@@ -1541,7 +1541,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fleascope-live-rs"
+name = "fleascope-monitor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1564,6 +1564,8 @@ dependencies = [
 [[package]]
 name = "fleascope-rs"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f1b58d0ae4ca62a9f43e08650c584e91a215d5a2d4db1716a3310cc1d1d1a69"
 dependencies = [
  "log",
  "polars",
