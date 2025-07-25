@@ -3,7 +3,7 @@ name = "fleascope-monitor"
 version = "0.1.0"
 edition = "2021"
 description = "Live Monitor for Fleascopes"
-license = "MIT OR Apache"
+license = "MIT OR Apache-2.0"
 homepage = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
 repository = "https://github.com/daniel-freiermuth/fleascope-monitor-rs"
 
