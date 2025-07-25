@@ -4,8 +4,10 @@ use tokio::sync::Mutex;
 
 mod control_panel;
 mod device;
+mod device_worker;
 mod notifications;
 mod plot_area;
+mod worker_interface;
 
 use control_panel::ControlPanel;
 use device::DeviceManager;
@@ -24,11 +26,17 @@ impl FleaScopeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
-        let mut app = Self::default();
-        
-        // Add welcome notification
-        app.notification_manager.add_info("🔬 FleaScope Live Oscilloscope started successfully!");
-        
+        let app = Self::default();
+
+        // Add a default device named "scope3" automatically
+        if let Ok(mut device_manager) = app.device_manager.try_lock() {
+            if let Err(e) = device_manager.add_device("scope3".to_string()) {
+                tracing::warn!("Failed to add default device: {}", e);
+            } else {
+                tracing::info!("Added default device 'scope3' automatically");
+            }
+        }
+
         app
     }
 }
@@ -37,7 +45,7 @@ impl eframe::App for FleaScopeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Update notifications (remove expired ones)
         self.notification_manager.update();
-        
+
         // Request repaint for real-time updates
         ctx.request_repaint();
 
@@ -58,13 +66,18 @@ impl eframe::App for FleaScopeApp {
 
                 ui.menu_button("Help", |ui| {
                     if ui.button("Demo Notifications").clicked() {
-                        self.notification_manager.add_info("This is an info notification");
-                        self.notification_manager.add_success("Operation completed successfully!");
-                        self.notification_manager.add_error("This is an error notification");
+                        self.notification_manager
+                            .add_info("This is an info notification");
+                        self.notification_manager
+                            .add_success("Operation completed successfully!");
+                        self.notification_manager
+                            .add_error("This is an error notification");
                     }
                     ui.separator();
                     if ui.button("About").clicked() {
-                        self.notification_manager.add_info("FleaScope Live Oscilloscope v0.1.0\nBuilt with Rust and egui");
+                        self.notification_manager.add_info(
+                            "FleaScope Live Oscilloscope v0.1.0\nBuilt with Rust and egui",
+                        );
                     }
                 });
 
@@ -103,8 +116,8 @@ impl eframe::App for FleaScopeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Use available space more efficiently
             let available_rect = ui.available_rect_before_wrap();
-            let plot_width = available_rect.width() * 0.65;
-            let control_width = available_rect.width() * 0.35;
+            let control_width = 300.0;
+            let plot_width = available_rect.width() - control_width;
 
             ui.horizontal(|ui| {
                 // Left side - Plot area (takes most of the space)
@@ -136,7 +149,8 @@ impl eframe::App for FleaScopeApp {
 
                         // Access device manager safely for control panel
                         if let Ok(mut manager) = self.device_manager.try_lock() {
-                            self.control_panel.ui(ui, &mut manager, &mut self.notification_manager);
+                            self.control_panel
+                                .ui(ui, &mut manager, &mut self.notification_manager);
                         } else {
                             ui.label("Loading control panel...");
                         }

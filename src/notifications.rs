@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 pub enum NotificationType {
     Info,
     Success,
-    Warning,
+    // Warning,
     Error,
 }
 
@@ -28,17 +28,18 @@ impl Notification {
             created_at: Utc::now(),
             duration_secs: match notification_type {
                 NotificationType::Error => 8.0,
-                NotificationType::Warning => 6.0,
+                // NotificationType::Warning => 6.0,
                 NotificationType::Success => 4.0,
                 NotificationType::Info => 3.0,
             },
         }
     }
 
+    /*
     pub fn with_duration(mut self, duration_secs: f32) -> Self {
         self.duration_secs = duration_secs;
         self
-    }
+    } */
 
     pub fn is_expired(&self) -> bool {
         let elapsed = Utc::now().signed_duration_since(self.created_at);
@@ -49,7 +50,7 @@ impl Notification {
         match self.notification_type {
             NotificationType::Info => Color32::LIGHT_BLUE,
             NotificationType::Success => Color32::LIGHT_GREEN,
-            NotificationType::Warning => Color32::from_rgb(255, 165, 0), // Orange
+            // NotificationType::Warning => Color32::from_rgb(255, 165, 0), // Orange
             NotificationType::Error => Color32::LIGHT_RED,
         }
     }
@@ -58,7 +59,7 @@ impl Notification {
         match self.notification_type {
             NotificationType::Info => "ℹ️",
             NotificationType::Success => "✅",
-            NotificationType::Warning => "⚠️",
+            // NotificationType::Warning => "⚠️",
             NotificationType::Error => "❌",
         }
     }
@@ -81,10 +82,6 @@ impl Default for NotificationManager {
 }
 
 impl NotificationManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn add_notification(&mut self, mut notification: Notification) {
         notification.id = self.next_id;
         self.next_id += 1;
@@ -107,10 +104,11 @@ impl NotificationManager {
         self.add_notification(notification);
     }
 
+    /*
     pub fn add_warning(&mut self, message: impl Into<String>) {
         let notification = Notification::new(message.into(), NotificationType::Warning);
         self.add_notification(notification);
-    }
+    } */
 
     pub fn add_error(&mut self, message: impl Into<String>) {
         let notification = Notification::new(message.into(), NotificationType::Error);
@@ -149,7 +147,11 @@ impl NotificationManager {
         }
     }
 
-    fn render_notification(&self, ui: &mut egui::Ui, notification: &Notification) -> egui::Response {
+    fn render_notification(
+        &self,
+        ui: &mut egui::Ui,
+        notification: &Notification,
+    ) -> egui::Response {
         let color = notification.get_color();
         let icon = notification.get_icon();
 
@@ -170,11 +172,7 @@ impl NotificationManager {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icon).size(16.0));
                     ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(&notification.message)
-                                .color(color)
-                                .strong(),
-                        );
+                        ui.label(RichText::new(&notification.message).color(color).strong());
 
                         // Show time remaining as a progress bar
                         let elapsed = Utc::now()
@@ -192,11 +190,7 @@ impl NotificationManager {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui
-                            .small_button("✖")
-                            .on_hover_text("Dismiss")
-                            .clicked()
-                        {
+                        if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
                             // Will be handled by the caller
                         }
                     });

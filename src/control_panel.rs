@@ -1,6 +1,10 @@
-use crate::device::{DeviceManager, FleaScopeDevice};
+use crate::device::{
+    cycle_bitstate, waveform_to_icon, DeviceManager, Notification, MAX_TIME_FRAME, MIN_TIME_FRAME,
+};
 use crate::notifications::NotificationManager;
+use crate::worker_interface::FleaScopeDevice;
 use egui::{Color32, RichText};
+use fleascope_rs::{AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, Waveform};
 
 #[derive(Default)]
 pub struct ControlPanel {
@@ -8,8 +12,106 @@ pub struct ControlPanel {
     show_add_device: bool,
 }
 
+/// Custom dial widget with optional label and value display
+fn dial_widget(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    size: f32,
+    label: Option<&str>,
+    unit: Option<&str>,
+) -> egui::Response {
+    let desired_size = egui::vec2(size, size);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+
+    // Handle interaction FIRST (before drawing anything)
+    if response.clicked() || response.dragged() {
+        if let Some(pointer_pos) = response.interact_pointer_pos() {
+            let center = rect.center();
+            let delta = pointer_pos - center;
+            let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
+            let normalized = (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0);
+            let new_value = range.start() + normalized * (range.end() - range.start());
+            if (*value - new_value).abs() > 0.001 {
+                // Only update if there's a meaningful change
+                *value = new_value;
+                response.mark_changed();
+            }
+        }
+    }
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.35;
+
+        // Draw dial background circle
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
+
+        // Draw tick marks
+        for i in 0..12 {
+            let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
+            let inner_radius = radius * 0.85;
+            let outer_radius = radius * 0.95;
+            let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
+            let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
+            painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
+        }
+
+        // Calculate angle from value (270° range, starting from top-left)
+        let normalized = (*value - range.start()) / (range.end() - range.start());
+        let angle = -std::f32::consts::PI * 0.75 + normalized * std::f32::consts::PI * 1.5;
+
+        // Draw pointer
+        let pointer_start = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.3;
+        let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
+        painter.line_segment(
+            [pointer_start, pointer_end],
+            egui::Stroke::new(3.0, Color32::LIGHT_BLUE),
+        );
+
+        // Draw optional label in top-left corner (outside the interactive area)
+        if let Some(label_text) = label {
+            let label_pos = rect.min + egui::vec2(1.0, 1.0);
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_TOP,
+                label_text,
+                egui::FontId::proportional(8.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+
+        // Draw current value in bottom-right corner (outside the interactive area)
+        let value_text = if let Some(unit_text) = unit {
+            if *value >= 1000.0 && unit == Some("Hz") {
+                format!("{:.1}k{}", *value / 1000.0, unit_text)
+            } else {
+                format!("{:.1}{}", value, unit_text)
+            }
+        } else {
+            format!("{:.1}", value)
+        };
+        let value_pos = rect.max - egui::vec2(1.0, 1.0);
+        painter.text(
+            value_pos,
+            egui::Align2::RIGHT_BOTTOM,
+            &value_text,
+            egui::FontId::proportional(8.0),
+            Color32::WHITE,
+        );
+    }
+
+    response
+}
+
 impl ControlPanel {
-    pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &mut DeviceManager, notifications: &mut NotificationManager) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        device_manager: &mut DeviceManager,
+        notifications: &mut NotificationManager,
+    ) {
         ui.heading("🎛️ Control Panel");
 
         ui.separator();
@@ -36,12 +138,18 @@ impl ControlPanel {
                     if ui.button("Connect").clicked() && !self.new_device_hostname.is_empty() {
                         match device_manager.add_device(self.new_device_hostname.clone()) {
                             Ok(_) => {
-                                notifications.add_success(format!("Connected to device: {}", self.new_device_hostname));
+                                notifications.add_success(format!(
+                                    "Connected to device: {}",
+                                    self.new_device_hostname
+                                ));
                                 self.new_device_hostname.clear();
                                 self.show_add_device = false;
                             }
                             Err(e) => {
-                                notifications.add_error(format!("Failed to connect to {}: {}", self.new_device_hostname, e));
+                                notifications.add_error(format!(
+                                    "Failed to connect to {}: {}",
+                                    self.new_device_hostname, e
+                                ));
                                 tracing::error!("Failed to add device: {}", e);
                             }
                         }
@@ -55,14 +163,18 @@ impl ControlPanel {
                 ui.separator();
                 ui.label("💡 Quick Add:");
                 ui.horizontal_wrapped(|ui| {
-                    for hostname in ["scope-001", "scope-002", "scope-003", "localhost:8080"] {
+                    for hostname in ["scope1", "scope-002", "scope3", "localhost:8080"] {
                         if ui.small_button(hostname).clicked() {
                             match device_manager.add_device(hostname.to_string()) {
                                 Ok(_) => {
-                                    notifications.add_success(format!("Connected to device: {}", hostname));
+                                    notifications
+                                        .add_success(format!("Connected to device: {}", hostname));
                                 }
                                 Err(e) => {
-                                    notifications.add_error(format!("Failed to connect to {}: {}", hostname, e));
+                                    notifications.add_error(format!(
+                                        "Failed to connect to {}: {}",
+                                        hostname, e
+                                    ));
                                     tracing::error!("Failed to add device: {}", e);
                                 }
                             }
@@ -96,17 +208,29 @@ impl ControlPanel {
 
                         let mut to_remove = None;
 
-                        for (idx, device) in device_manager.get_devices_mut().iter_mut().enumerate() {
+                        for (idx, device) in device_manager.get_devices_mut().iter_mut().enumerate()
+                        {
                             ui.group(|ui| {
-                                self.render_device_rack(ui, device, idx, &mut to_remove, notifications);
+                                self.render_device_rack(
+                                    ui,
+                                    device,
+                                    idx,
+                                    &mut to_remove,
+                                    notifications,
+                                );
                             });
                             ui.add_space(5.0);
                         }
 
                         if let Some(idx) = to_remove {
-                            let device_name = device_manager.get_devices().get(idx).map(|d| d.name.clone()).unwrap_or_else(|| "Unknown".to_string());
+                            let device_name = device_manager
+                                .get_devices()
+                                .get(idx)
+                                .map(|d| d.name.clone())
+                                .unwrap_or_else(|| "Unknown".to_string());
                             notifications.add_info(format!("Removed device: {}", device_name));
-                            let _ = device_manager.remove_device(idx);
+                            tracing::info!("Removing device: {}", device_name);
+                            device_manager.remove_device(idx);
                         }
                     });
             }
@@ -121,19 +245,61 @@ impl ControlPanel {
         to_remove: &mut Option<usize>,
         notifications: &mut NotificationManager,
     ) {
-        // Device Header - Compact
+        // Check for calibration results at the beginning of each frame
+        device
+            .notification_rx
+            .try_recv()
+            .map(|notification| match notification {
+                Notification::Success(msg) => notifications.add_success(msg),
+                Notification::Error(msg) => notifications.add_error(msg),
+            })
+            .ok();
+
+        // Device Header - Retro Style with LED Status
         ui.horizontal(|ui| {
-            let status_color = if device.is_connected() { Color32::GREEN } else { Color32::RED };
+            // Large power LED with classic styling
+            let status_color = if device.data.load().connected {
+                Color32::GREEN
+            } else {
+                Color32::RED
+            };
+            ui.add_space(2.0);
             ui.colored_label(status_color, "●");
-            ui.label(RichText::new(&device.name).strong().size(14.0));
-            
-            // Waveform indicator
+            ui.add_space(2.0);
+
+            // Device name with retro font styling
+            ui.label(
+                RichText::new(&device.name)
+                    .strong()
+                    .size(14.0)
+                    .color(Color32::LIGHT_YELLOW),
+            );
+
+            // Active waveform indicator with classic scope styling
             if device.waveform_config.enabled {
-                ui.label(RichText::new(device.waveform_config.waveform_type.icon()).size(12.0).color(Color32::LIGHT_BLUE));
+                ui.add_space(5.0);
+                ui.colored_label(Color32::from_rgb(0, 255, 100), "●");
+                ui.label(RichText::new("GEN").size(8.0).color(Color32::LIGHT_GRAY));
+                ui.label(
+                    RichText::new(waveform_to_icon(device.waveform_config.waveform_type))
+                        .size(12.0)
+                        .color(Color32::LIGHT_BLUE),
+                );
             }
-            
+
+            // Hardware-style model indicator
+            ui.add_space(10.0);
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                // Classic red power button
+                if ui
+                    .add_sized(
+                        [25.0, 20.0],
+                        egui::Button::new(RichText::new("⏻").size(12.0).color(Color32::RED)),
+                    )
+                    .on_hover_text("Disconnect Device")
+                    .clicked()
+                {
                     *to_remove = Some(idx);
                 }
             });
@@ -141,538 +307,801 @@ impl ControlPanel {
 
         ui.separator();
 
-        // Channel Controls - Compact Grid
-        ui.label(RichText::new("CHANNELS").size(11.0).strong());
-        ui.horizontal(|ui| {
-            // Analog Channel
-            let mut analog_enabled = device.enabled_channels[0];
-            if ui.toggle_value(&mut analog_enabled, "A").on_hover_text("Analog Channel").clicked() {
-                device.enabled_channels[0] = analog_enabled;
-                let status = if analog_enabled { "enabled" } else { "disabled" };
-                notifications.add_info(format!("Analog channel {} for {}", status, device.name));
-            }
-            
-            // Digital Channels - Compact
-            for ch in 0..9 {
-                let mut enabled = device.enabled_channels[ch + 1];
-                if ui.toggle_value(&mut enabled, &format!("{}", ch)).on_hover_text(&format!("Digital Channel D{}", ch)).clicked() {
-                    device.enabled_channels[ch + 1] = enabled;
-                    let status = if enabled { "enabled" } else { "disabled" };
-                    notifications.add_info(format!("D{} {} for {}", ch, status, device.name));
-                }
-            }
-        });
+        // Retro Channel Panel - Dense Grid Layout
+        ui.group(|ui| {
+            ui.label(
+                RichText::new("CHANNEL INPUT")
+                    .size(10.0)
+                    .strong()
+                    .color(Color32::YELLOW),
+            );
 
-        // Device Configuration - Compact
-        ui.add_space(1.0);
-        ui.label(RichText::new("CONFIG").size(11.0).strong());
-        
-        // Time Window & Controls Row
-        ui.horizontal(|ui| {
-            ui.label("⏱");
-            let mut time_frame = device.time_frame as f32;
-            if ui.add(egui::Slider::new(&mut time_frame, 0.1..=10.0).suffix("s").show_value(false).custom_formatter(|v, _| format!("{:.1}s", v))).changed() {
-                device.time_frame = time_frame as f64;
-                notifications.add_info(format!("Time: {:.1}s - {}", time_frame, device.name));
-            }
-        });
-
-        ui.horizontal(|ui| {
-            // Pause/Resume - Toggle Button
-            let is_paused = device.is_paused();
-            let mut paused_state = is_paused;
-            if ui.toggle_value(&mut paused_state, if is_paused { "⏸" } else { "▶" }).on_hover_text(if is_paused { "Resume" } else { "Pause" }).clicked() {
-                if paused_state != is_paused {
-                    if is_paused {
-                        device.resume();
-                        notifications.add_success(format!("Resumed - {}", device.name));
-                    } else {
-                        device.pause();
-                        notifications.add_info(format!("Paused - {}", device.name));
+            egui::Grid::new(format!("channels_grid_{}", idx))
+                .num_columns(5)
+                .spacing([3.0, 3.0])
+                .show(ui, |ui| {
+                    // Row 1: Analog channel with larger toggle
+                    ui.label(RichText::new("ANALOG").size(8.0).color(Color32::LIGHT_GRAY));
+                    let mut analog_enabled = device.enabled_channels[0];
+                    if ui
+                        .add_sized(
+                            [30.0, 20.0],
+                            egui::Button::new(
+                                RichText::new(if analog_enabled { "ON" } else { "OFF" })
+                                    .size(8.0)
+                                    .color(if analog_enabled {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::RED
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        analog_enabled = !analog_enabled;
+                        let mut new_channels = device.enabled_channels;
+                        new_channels[0] = analog_enabled;
+                        device.set_enabled_channels(new_channels);
                     }
-                }
-            }
 
-            // Probe Selection - Single Toggle Button
-            ui.label("🔍");
-            let is_x10 = device.probe_multiplier == crate::device::ProbeMultiplier::X10;
-            let probe_text = if is_x10 { "x10" } else { "x1" };
-            
-            if ui.toggle_value(&mut false, probe_text).clicked() {
-                device.probe_multiplier = if is_x10 { 
-                    crate::device::ProbeMultiplier::X1 
-                } else { 
-                    crate::device::ProbeMultiplier::X10 
-                };
-                let new_multiplier = if is_x10 { "x1" } else { "x10" };
-                notifications.add_info(format!("Probe: {} - {}", new_multiplier, device.name));
-            }
-        });
-
-        // Trigger Settings - Very Compact
-        ui.add_space(1.0);
-        egui::CollapsingHeader::new(RichText::new("⚡ TRIGGER").size(11.0).strong())
-            .id_source(format!("trigger_device_{}", idx))
-            .default_open(false)
-            .show(ui, |ui| {
-                self.render_compact_trigger_config(ui, device, idx, notifications);
-            });
-
-        // Waveform Generator - Very Compact
-        ui.add_space(1.0);
-        egui::CollapsingHeader::new(RichText::new("🌊 WAVEFORM").size(11.0).strong())
-            .id_source(format!("waveform_device_{}", idx))
-            .default_open(false)
-            .show(ui, |ui| {
-                self.render_waveform_config(ui, device, idx, notifications);
-            });
-
-        // Statistics - Minimal
-        if device.is_connected() {
-            ui.add_space(1.0);
-            let data_guard = device.data.lock().unwrap();
-            let update_age = data_guard.last_update.elapsed().as_millis();
-            drop(data_guard);
-            
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&format!("📊 {}ms", update_age)).size(9.0).weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if device.waveform_config.enabled {
-                        let freq_str = if device.waveform_config.frequency_hz >= 1000.0 {
-                            format!("{:.1}k", device.waveform_config.frequency_hz / 1000.0)
+                    // Add probe multiplier controls
+                    ui.label(RichText::new("PROBE").size(8.0).color(Color32::LIGHT_GRAY));
+                    let is_x10 =
+                        device.probe_multiplier == fleascope_rs::flea_scope::ProbeType::X10;
+                    if ui
+                        .add_sized(
+                            [25.0, 20.0],
+                            egui::Button::new(
+                                RichText::new(if is_x10 { "×10" } else { "×1" })
+                                    .size(8.0)
+                                    .color(if is_x10 {
+                                        Color32::YELLOW
+                                    } else {
+                                        Color32::WHITE
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        let new_probe = if is_x10 {
+                            fleascope_rs::flea_scope::ProbeType::X1
                         } else {
-                            format!("{:.0}", device.waveform_config.frequency_hz)
+                            fleascope_rs::flea_scope::ProbeType::X10
                         };
-                        ui.label(RichText::new(&format!("🌊{}", freq_str)).size(9.0).color(Color32::LIGHT_BLUE));
+                        device.set_probe_multiplier(new_probe);
                     }
-                    ui.label(RichText::new("1kHz").size(9.0).weak());
-                });
-            });
-        }
-    }
 
-    fn render_compact_trigger_config(
-        &self,
-        ui: &mut egui::Ui,
-        device: &mut FleaScopeDevice,
-        idx: usize,
-        notifications: &mut NotificationManager,
-    ) {
-        // Source Selection - Toggle Buttons
-        ui.horizontal(|ui| {
-            ui.label("SRC:");
-            let is_analog = device.trigger_config.source == crate::device::TriggerSource::Analog;
-            let is_digital = device.trigger_config.source == crate::device::TriggerSource::Digital;
-            
-            if ui.selectable_label(is_analog, "📊").on_hover_text("Analog Trigger").clicked() {
-                device.trigger_config.source = crate::device::TriggerSource::Analog;
-                device.trigger_config.analog.enabled = true;
-                device.trigger_config.digital.enabled = false;
-                notifications.add_info(format!("Trigger: Analog - {}", device.name));
-            }
-            if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
-                device.trigger_config.source = crate::device::TriggerSource::Digital;
-                device.trigger_config.analog.enabled = false;
-                device.trigger_config.digital.enabled = true;
-                notifications.add_info(format!("Trigger: Digital - {}", device.name));
-            }
-        });
+                    ui.end_row();
 
-        ui.add_space(1.0);
+                    // Row 2: Digital channels header
+                    ui.label(
+                        RichText::new("DIGITAL")
+                            .size(8.0)
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                    ui.label(RichText::new("D0-D3").size(7.0).color(Color32::GRAY));
+                    ui.label(RichText::new("D4-D7").size(7.0).color(Color32::GRAY));
+                    ui.label(RichText::new("D8").size(7.0).color(Color32::GRAY));
+                    ui.label(RichText::new("ALL").size(7.0).color(Color32::GRAY));
+                    ui.end_row();
 
-        // Analog Trigger - Compact
-        if device.trigger_config.source == crate::device::TriggerSource::Analog {
-            // Level Slider
-            ui.horizontal(|ui| {
-                ui.label("LVL:");
-                let mut level = device.trigger_config.analog.level as f32;
-                if ui.add(egui::Slider::new(&mut level, 0.0..=1.0).suffix("V").show_value(false).custom_formatter(|v, _| format!("{:.2}V", v))).changed() {
-                    device.trigger_config.analog.level = level as f64;
-                    notifications.add_info(format!("Level: {:.2}V - {}", level, device.name));
-                }
-            });
-
-            // Pattern Buttons
-            ui.horizontal(|ui| {
-                ui.label("PAT:");
-                let pattern = device.trigger_config.analog.pattern;
-                
-                let is_rising = pattern == crate::device::AnalogTriggerPattern::Rising;
-                let is_falling = pattern == crate::device::AnalogTriggerPattern::Falling;
-                let is_level = pattern == crate::device::AnalogTriggerPattern::Level;
-                let is_auto = pattern == crate::device::AnalogTriggerPattern::LevelAuto;
-                
-                if ui.selectable_label(is_rising, "↗").on_hover_text("Rising Edge").clicked() {
-                    device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Rising;
-                    notifications.add_info(format!("Pattern: Rising - {}", device.name));
-                }
-                if ui.selectable_label(is_falling, "↘").on_hover_text("Falling Edge").clicked() {
-                    device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Falling;
-                    notifications.add_info(format!("Pattern: Falling - {}", device.name));
-                }
-                if ui.selectable_label(is_level, "─").on_hover_text("Level").clicked() {
-                    device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Level;
-                    notifications.add_info(format!("Pattern: Level - {}", device.name));
-                }
-                if ui.selectable_label(is_auto, "⟲").on_hover_text("Level + Auto").clicked() {
-                    device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::LevelAuto;
-                    notifications.add_info(format!("Pattern: Auto - {}", device.name));
-                }
-            });
-        }
-
-        // Digital Trigger - Compact
-        if device.trigger_config.source == crate::device::TriggerSource::Digital {
-            // Mode Buttons
-            ui.horizontal(|ui| {
-                ui.label("MOD:");
-                let mode = device.trigger_config.digital.mode;
-                
-                let is_start = mode == crate::device::DigitalTriggerMode::StartMatching;
-                let is_stop = mode == crate::device::DigitalTriggerMode::StopMatching;
-                let is_while = mode == crate::device::DigitalTriggerMode::WhileMatching;
-                let is_auto = mode == crate::device::DigitalTriggerMode::WhileMatchingAuto;
-                
-                if ui.selectable_label(is_start, "▶").on_hover_text("Start Matching").clicked() {
-                    device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StartMatching;
-                    notifications.add_info(format!("Mode: Start - {}", device.name));
-                }
-                if ui.selectable_label(is_stop, "⏹").on_hover_text("Stop Matching").clicked() {
-                    device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StopMatching;
-                    notifications.add_info(format!("Mode: Stop - {}", device.name));
-                }
-                if ui.selectable_label(is_while, "⏸").on_hover_text("While Matching").clicked() {
-                    device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatching;
-                    notifications.add_info(format!("Mode: While - {}", device.name));
-                }
-                if ui.selectable_label(is_auto, "⟲").on_hover_text("While + Auto").clicked() {
-                    device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatchingAuto;
-                    notifications.add_info(format!("Mode: Auto - {}", device.name));
-                }
-            });
-
-            // Bit Pattern - Two Rows
-            ui.label(RichText::new("BIT:").size(10.0));
-            ui.horizontal(|ui| {
-                for ch in 0..5 {
-                    let bit_state = device.trigger_config.digital.bit_pattern[ch];
-                    let (text, color) = match bit_state {
-                        crate::device::DigitalBitState::DontCare => ("X", Color32::GRAY),
-                        crate::device::DigitalBitState::Low => ("0", Color32::LIGHT_RED),
-                        crate::device::DigitalBitState::High => ("1", Color32::LIGHT_GREEN),
-                    };
-                    
-                    if ui.small_button(RichText::new(text).color(color)).on_hover_text(&format!("D{}", ch)).clicked() {
-                        device.trigger_config.digital.bit_pattern[ch] = bit_state.cycle();
-                        let new_state = device.trigger_config.digital.bit_pattern[ch];
-                        notifications.add_info(format!("D{}: {} - {}", ch, new_state.as_str(), device.name));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                for ch in 5..9 {
-                    let bit_state = device.trigger_config.digital.bit_pattern[ch];
-                    let (text, color) = match bit_state {
-                        crate::device::DigitalBitState::DontCare => ("X", Color32::GRAY),
-                        crate::device::DigitalBitState::Low => ("0", Color32::LIGHT_RED),
-                        crate::device::DigitalBitState::High => ("1", Color32::LIGHT_GREEN),
-                    };
-                    
-                    if ui.small_button(RichText::new(text).color(color)).on_hover_text(&format!("D{}", ch)).clicked() {
-                        device.trigger_config.digital.bit_pattern[ch] = bit_state.cycle();
-                        let new_state = device.trigger_config.digital.bit_pattern[ch];
-                        notifications.add_info(format!("D{}: {} - {}", ch, new_state.as_str(), device.name));
-                    }
-                }
-                // Clear button
-                if ui.small_button("CLR").on_hover_text("Clear All").clicked() {
-                    device.trigger_config.digital.bit_pattern = [crate::device::DigitalBitState::DontCare; 9];
-                    notifications.add_info(format!("Pattern cleared - {}", device.name));
-                }
-            });
-        }
-    }
-
-    fn render_trigger_config(
-        &self,
-        ui: &mut egui::Ui,
-        device: &mut FleaScopeDevice,
-        idx: usize,
-        notifications: &mut NotificationManager,
-    ) {
-        // Trigger Source Selection - Toggle Buttons
-        ui.horizontal(|ui| {
-            ui.label("SRC:");
-            let is_analog = device.trigger_config.source == crate::device::TriggerSource::Analog;
-            let is_digital = device.trigger_config.source == crate::device::TriggerSource::Digital;
-            
-            if ui.selectable_label(is_analog, "📊").on_hover_text("Analog Trigger").clicked() {
-                device.trigger_config.source = crate::device::TriggerSource::Analog;
-                device.trigger_config.analog.enabled = true;
-                device.trigger_config.digital.enabled = false;
-                notifications.add_info(format!("Trigger source set to Analog for {}", device.name));
-            }
-            if ui.selectable_label(is_digital, "💻").on_hover_text("Digital Trigger").clicked() {
-                device.trigger_config.source = crate::device::TriggerSource::Digital;
-                device.trigger_config.analog.enabled = false;
-                device.trigger_config.digital.enabled = true;
-                notifications.add_info(format!("Trigger source set to Digital for {}", device.name));
-            }
-        });
-
-        ui.add_space(5.0);
-
-        // Analog Trigger Configuration
-        if device.trigger_config.source == crate::device::TriggerSource::Analog {
-            self.render_analog_trigger_config(ui, device, idx, notifications);
-        }
-
-        // Digital Trigger Configuration
-        if device.trigger_config.source == crate::device::TriggerSource::Digital {
-            self.render_digital_trigger_config(ui, device, idx, notifications);
-        }
-    }
-
-    fn render_analog_trigger_config(
-        &self,
-        ui: &mut egui::Ui,
-        device: &mut FleaScopeDevice,
-        idx: usize,
-        notifications: &mut NotificationManager,
-    ) {
-        ui.label(RichText::new("📊 Analog Trigger").strong().size(12.0));
-
-        // Trigger Level - Compact
-        ui.horizontal(|ui| {
-            ui.label("LVL:");
-            let mut level = device.trigger_config.analog.level as f32;
-            if ui.add(egui::Slider::new(&mut level, 0.0..=1.0).suffix("V").show_value(true)).changed() {
-                device.trigger_config.analog.level = level as f64;
-                notifications.add_info(format!("Analog trigger level set to {:.2}V for {}", level, device.name));
-            }
-        });
-
-        // Trigger Pattern - Toggle Buttons
-        ui.horizontal(|ui| {
-            ui.label("PAT:");
-            let pattern = device.trigger_config.analog.pattern;
-            
-            let is_rising = pattern == crate::device::AnalogTriggerPattern::Rising;
-            let is_falling = pattern == crate::device::AnalogTriggerPattern::Falling;
-            let is_level = pattern == crate::device::AnalogTriggerPattern::Level;
-            let is_auto = pattern == crate::device::AnalogTriggerPattern::LevelAuto;
-            
-            if ui.selectable_label(is_rising, "↗").on_hover_text("Rising Edge").clicked() {
-                device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Rising;
-                notifications.add_info(format!("Analog trigger pattern set to Rising Edge for {}", device.name));
-            }
-            if ui.selectable_label(is_falling, "↘").on_hover_text("Falling Edge").clicked() {
-                device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Falling;
-                notifications.add_info(format!("Analog trigger pattern set to Falling Edge for {}", device.name));
-            }
-            if ui.selectable_label(is_level, "─").on_hover_text("Level").clicked() {
-                device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::Level;
-                notifications.add_info(format!("Analog trigger pattern set to Level for {}", device.name));
-            }
-            if ui.selectable_label(is_auto, "⟲").on_hover_text("Level + Auto").clicked() {
-                device.trigger_config.analog.pattern = crate::device::AnalogTriggerPattern::LevelAuto;
-                notifications.add_info(format!("Analog trigger pattern set to Level + Auto for {}", device.name));
-            }
-        });
-    }
-
-    fn render_digital_trigger_config(
-        &self,
-        ui: &mut egui::Ui,
-        device: &mut FleaScopeDevice,
-        idx: usize,
-        notifications: &mut NotificationManager,
-    ) {
-        ui.label(RichText::new("💻 Digital Trigger").strong().size(12.0));
-
-        // Trigger Mode - Toggle Buttons
-        ui.horizontal(|ui| {
-            ui.label("MOD:");
-            let mode = device.trigger_config.digital.mode;
-            
-            let is_start = mode == crate::device::DigitalTriggerMode::StartMatching;
-            let is_stop = mode == crate::device::DigitalTriggerMode::StopMatching;
-            let is_while = mode == crate::device::DigitalTriggerMode::WhileMatching;
-            let is_auto = mode == crate::device::DigitalTriggerMode::WhileMatchingAuto;
-            
-            if ui.selectable_label(is_start, "▶").on_hover_text("Start Matching").clicked() {
-                device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StartMatching;
-                notifications.add_info(format!("Digital trigger mode set to Start Matching for {}", device.name));
-            }
-            if ui.selectable_label(is_stop, "⏹").on_hover_text("Stop Matching").clicked() {
-                device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::StopMatching;
-                notifications.add_info(format!("Digital trigger mode set to Stop Matching for {}", device.name));
-            }
-            if ui.selectable_label(is_while, "⏸").on_hover_text("While Matching").clicked() {
-                device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatching;
-                notifications.add_info(format!("Digital trigger mode set to While Matching for {}", device.name));
-            }
-            if ui.selectable_label(is_auto, "⟲").on_hover_text("While + Auto").clicked() {
-                device.trigger_config.digital.mode = crate::device::DigitalTriggerMode::WhileMatchingAuto;
-                notifications.add_info(format!("Digital trigger mode set to While Matching + Auto for {}", device.name));
-            }
-        });
-
-        // Bit Pattern Configuration - Compact Layout
-        ui.add_space(3.0);
-        ui.label("BIT PATTERN:");
-        
-        // First row: D0-D4
-        ui.horizontal(|ui| {
-            ui.label("D0-4:");
-            for ch in 0..5 {
-                let bit_state = device.trigger_config.digital.bit_pattern[ch];
-                let (text, color) = match bit_state {
-                    crate::device::DigitalBitState::DontCare => ("X", Color32::GRAY),
-                    crate::device::DigitalBitState::Low => ("0", Color32::LIGHT_RED),
-                    crate::device::DigitalBitState::High => ("1", Color32::LIGHT_GREEN),
-                };
-                
-                if ui.button(RichText::new(text).color(color)).on_hover_text(&format!("D{}", ch)).clicked() {
-                    device.trigger_config.digital.bit_pattern[ch] = bit_state.cycle();
-                    let new_state = device.trigger_config.digital.bit_pattern[ch];
-                    notifications.add_info(format!("Digital trigger D{} set to {} for {}", ch, new_state.as_str(), device.name));
-                }
-            }
-        });
-        
-        // Second row: D5-D8 + Clear
-        ui.horizontal(|ui| {
-            ui.label("D5-8:");
-            for ch in 5..9 {
-                let bit_state = device.trigger_config.digital.bit_pattern[ch];
-                let (text, color) = match bit_state {
-                    crate::device::DigitalBitState::DontCare => ("X", Color32::GRAY),
-                    crate::device::DigitalBitState::Low => ("0", Color32::LIGHT_RED),
-                    crate::device::DigitalBitState::High => ("1", Color32::LIGHT_GREEN),
-                };
-                
-                if ui.button(RichText::new(text).color(color)).on_hover_text(&format!("D{}", ch)).clicked() {
-                    device.trigger_config.digital.bit_pattern[ch] = bit_state.cycle();
-                    let new_state = device.trigger_config.digital.bit_pattern[ch];
-                    notifications.add_info(format!("Digital trigger D{} set to {} for {}", ch, new_state.as_str(), device.name));
-                }
-            }
-            
-            if ui.small_button("CLR").on_hover_text("Clear All").clicked() {
-                device.trigger_config.digital.bit_pattern = [crate::device::DigitalBitState::DontCare; 9];
-                notifications.add_info(format!("Digital trigger pattern cleared for {}", device.name));
-            }
-        });
-
-        // Pattern Preview - Compact
-        ui.horizontal(|ui| {
-            ui.label("PAT:");
-            let pattern_str: String = device.trigger_config.digital.bit_pattern.iter()
-                .map(|bit| bit.as_str())
-                .collect::<Vec<_>>()
-                .join("");
-            ui.code(RichText::new(pattern_str).size(11.0));
-        });
-    }
-
-    fn render_waveform_config(
-        &self,
-        ui: &mut egui::Ui,
-        device: &mut FleaScopeDevice,
-        idx: usize,
-        notifications: &mut NotificationManager,
-    ) {
-        // Enable/Disable Toggle
-        ui.horizontal(|ui| {
-            ui.label("EN:");
-            let enabled = device.waveform_config.enabled;
-            let button_text = if enabled { "ON" } else { "OFF" };
-            let mut new_enabled = enabled;
-            if ui.toggle_value(&mut new_enabled, button_text).on_hover_text("Enable Waveform Generator").clicked() {
-                device.waveform_config.enabled = new_enabled;
-                let status = if new_enabled { "enabled" } else { "disabled" };
-                notifications.add_info(format!("Waveform generator {} - {}", status, device.name));
-            }
-        });
-
-        if device.waveform_config.enabled {
-            ui.add_space(1.0);
-
-            // Waveform Type Selection
-            ui.horizontal(|ui| {
-                ui.label("TYPE:");
-                let current_type = device.waveform_config.waveform_type;
-                
-                let is_sine = current_type == crate::device::WaveformType::Sine;
-                let is_square = current_type == crate::device::WaveformType::Square;
-                let is_triangle = current_type == crate::device::WaveformType::Triangle;
-                let is_ekg = current_type == crate::device::WaveformType::Ekg;
-                
-                if ui.selectable_label(is_sine, "～").on_hover_text("Sine Wave").clicked() {
-                    device.waveform_config.waveform_type = crate::device::WaveformType::Sine;
-                    notifications.add_info(format!("Waveform: Sine - {}", device.name));
-                }
-                if ui.selectable_label(is_square, "⊓").on_hover_text("Square Wave").clicked() {
-                    device.waveform_config.waveform_type = crate::device::WaveformType::Square;
-                    notifications.add_info(format!("Waveform: Square - {}", device.name));
-                }
-                if ui.selectable_label(is_triangle, "△").on_hover_text("Triangle Wave").clicked() {
-                    device.waveform_config.waveform_type = crate::device::WaveformType::Triangle;
-                    notifications.add_info(format!("Waveform: Triangle - {}", device.name));
-                }
-                if ui.selectable_label(is_ekg, "💓").on_hover_text("EKG Wave").clicked() {
-                    device.waveform_config.waveform_type = crate::device::WaveformType::Ekg;
-                    notifications.add_info(format!("Waveform: EKG - {}", device.name));
-                }
-            });
-
-            // Frequency Control
-            ui.horizontal(|ui| {
-                ui.label("FREQ:");
-                let mut freq = device.waveform_config.frequency_hz as f32;
-                if ui.add(egui::Slider::new(&mut freq, 10.0..=4000.0)
-                    .logarithmic(true)
-                    .suffix("Hz")
-                    .show_value(false)
-                    .custom_formatter(|v, _| {
-                        if v >= 1000.0 {
-                            format!("{:.1}kHz", v / 1000.0)
-                        } else {
-                            format!("{:.0}Hz", v)
+                    // Row 3: Digital channel toggles D0-D3
+                    ui.label(""); // Empty label instead of add_space
+                    for ch in 0..4 {
+                        let mut enabled = device.enabled_channels[ch + 1];
+                        if ui
+                            .add_sized(
+                                [15.0, 15.0],
+                                egui::Button::new(
+                                    RichText::new(format!("{}", ch))
+                                        .size(7.0)
+                                        .color(if enabled {
+                                            Color32::GREEN
+                                        } else {
+                                            Color32::DARK_GRAY
+                                        }),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            enabled = !enabled;
+                            let mut new_channels = device.enabled_channels;
+                            new_channels[ch + 1] = enabled;
+                            device.set_enabled_channels(new_channels);
                         }
-                    })).changed() {
-                    device.waveform_config.frequency_hz = freq as f64;
-                    device.waveform_config.clamp_frequency();
-                    let freq_str = if freq >= 1000.0 {
-                        format!("{:.1}kHz", freq / 1000.0)
-                    } else {
-                        format!("{:.0}Hz", freq)
-                    };
-                    notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
-                }
-            });
-
-            // Quick Frequency Presets
-            ui.horizontal(|ui| {
-                ui.label("PRESET:");
-                for freq in [10.0, 50.0, 100.0, 500.0, 1000.0, 2000.0] {
-                    let label = if freq >= 1000.0 {
-                        format!("{}k", freq / 1000.0)
-                    } else {
-                        format!("{}", freq)
-                    };
-                    if ui.small_button(label).on_hover_text(&format!("{}Hz", freq)).clicked() {
-                        device.waveform_config.frequency_hz = freq;
-                        let freq_str = if freq >= 1000.0 {
-                            format!("{:.1}kHz", freq / 1000.0)
-                        } else {
-                            format!("{:.0}Hz", freq)
-                        };
-                        notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
                     }
+
+                    // All digital toggle
+                    let all_digital_on = device.enabled_channels[1..].iter().all(|&x| x);
+                    if ui
+                        .add_sized(
+                            [20.0, 15.0],
+                            egui::Button::new(
+                                RichText::new(if all_digital_on { "CLR" } else { "ALL" })
+                                    .size(7.0)
+                                    .color(if all_digital_on {
+                                        Color32::RED
+                                    } else {
+                                        Color32::GREEN
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        let mut new_channels = device.enabled_channels;
+                        let new_state = !all_digital_on;
+                        for ch in new_channels.iter_mut().skip(1) {
+                            *ch = new_state;
+                        }
+                        device.set_enabled_channels(new_channels);
+                    }
+                    ui.end_row();
+
+                    // Row 4: Digital channel toggles D4-D8
+                    ui.label(""); // Empty label instead of add_space
+                    for ch in 4..8 {
+                        let mut enabled = device.enabled_channels[ch + 1];
+                        if ui
+                            .add_sized(
+                                [15.0, 15.0],
+                                egui::Button::new(
+                                    RichText::new(format!("{}", ch))
+                                        .size(7.0)
+                                        .color(if enabled {
+                                            Color32::GREEN
+                                        } else {
+                                            Color32::DARK_GRAY
+                                        }),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            enabled = !enabled;
+                            let mut new_channels = device.enabled_channels;
+                            new_channels[ch + 1] = enabled;
+                            device.set_enabled_channels(new_channels);
+                        }
+                    }
+
+                    // D8 channel
+                    let mut enabled_d8 = device.enabled_channels[9];
+                    if ui
+                        .add_sized(
+                            [15.0, 15.0],
+                            egui::Button::new(RichText::new("8").size(7.0).color(if enabled_d8 {
+                                Color32::GREEN
+                            } else {
+                                Color32::DARK_GRAY
+                            })),
+                        )
+                        .clicked()
+                    {
+                        enabled_d8 = !enabled_d8;
+                        let mut new_channels = device.enabled_channels;
+                        new_channels[9] = enabled_d8;
+                        device.set_enabled_channels(new_channels);
+                    }
+
+                    ui.label(""); // Empty label instead of add_space
+                    ui.end_row();
+                });
+        });
+
+        // Retro Timebase Control Panel
+        ui.add_space(3.0);
+        ui.group(|ui| {
+            ui.label(
+                RichText::new("TIME BASE")
+                    .size(10.0)
+                    .strong()
+                    .color(Color32::YELLOW),
+            );
+
+            egui::Grid::new(format!("timebase_grid_{}", idx))
+                .num_columns(4)
+                .spacing([4.0, 4.0])
+                .show(ui, |ui| {
+                    // Row 1: Main time dial
+                    ui.label(
+                        RichText::new("SEC/DIV")
+                            .size(8.0)
+                            .color(Color32::LIGHT_GRAY),
+                    );
+
+                    // Convert actual time to exponential scale for the dial
+                    let min_time = MIN_TIME_FRAME;
+                    let max_time = MAX_TIME_FRAME;
+                    let current_time = device.time_frame.clamp(min_time, max_time);
+                    let log_ratio = (current_time / min_time).ln() / (max_time / min_time).ln();
+                    let mut exponential_value = log_ratio as f32;
+
+                    if dial_widget(
+                        ui,
+                        &mut exponential_value,
+                        0.0..=1.0,
+                        45.0,
+                        Some("TIME"),
+                        None,
+                    )
+                    .changed()
+                    {
+                        let new_time =
+                            min_time * ((max_time / min_time).powf(exponential_value as f64));
+                        device.set_time_frame(new_time);
+                    }
+
+                    ui.end_row();
+
+                    // Row 3: Control buttons
+                    ui.label(
+                        RichText::new("CONTROL")
+                            .size(8.0)
+                            .color(Color32::LIGHT_GRAY),
+                    );
+
+                    // Pause/Resume button
+                    let is_paused = !device.data.load().running;
+                    if ui
+                        .add_sized(
+                            [25.0, 20.0],
+                            egui::Button::new(
+                                RichText::new(if is_paused { "RUN" } else { "STOP" })
+                                    .size(8.0)
+                                    .color(if is_paused {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::RED
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        if is_paused {
+                            device.resume();
+                        } else {
+                            device.pause();
+                        }
+                    }
+
+                    ui.end_row();
+                });
+        });
+
+        // Retro Calibration & Utility Panel
+        ui.add_space(3.0);
+        ui.group(|ui| {
+            ui.label(
+                RichText::new("CALIBRATION & UTIL")
+                    .size(10.0)
+                    .strong()
+                    .color(Color32::YELLOW),
+            );
+
+            egui::Grid::new(format!("cal_grid_{}", idx))
+                .num_columns(4)
+                .spacing([3.0, 3.0])
+                .show(ui, |ui| {
+                    // Row 1: Calibration controls
+                    ui.label(
+                        RichText::new("CAL REF")
+                            .size(8.0)
+                            .color(Color32::LIGHT_GRAY),
+                    );
+
+                    if ui
+                        .add_sized(
+                            [22.0, 18.0],
+                            egui::Button::new(
+                                RichText::new("0V").size(8.0).color(Color32::LIGHT_BLUE),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        match device.start_calibrate_0v() {
+                            Ok(()) => {
+                                notifications.add_info(format!("0V cal started - {}", device.name))
+                            }
+                            Err(e) => notifications
+                                .add_error(format!("0V cal failed - {}: {}", device.name, e)),
+                        }
+                    }
+
+                    if ui
+                        .add_sized(
+                            [22.0, 18.0],
+                            egui::Button::new(
+                                RichText::new("3V").size(8.0).color(Color32::LIGHT_BLUE),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        match device.start_calibrate_3v() {
+                            Ok(()) => {
+                                notifications.add_info(format!("3V cal started - {}", device.name))
+                            }
+                            Err(e) => notifications
+                                .add_error(format!("3V cal failed - {}: {}", device.name, e)),
+                        }
+                    }
+
+                    if ui
+                        .add_sized(
+                            [25.0, 18.0],
+                            egui::Button::new(
+                                RichText::new("STORE").size(7.0).color(Color32::YELLOW),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        match device.start_store_calibration() {
+                            Ok(()) => {
+                                notifications.add_info(format!("Cal stored - {}", device.name))
+                            }
+                            Err(e) => notifications
+                                .add_error(format!("Store failed - {}: {}", device.name, e)),
+                        }
+                    }
+                    ui.end_row();
+                });
+        });
+
+        // Retro Trigger Control Panel
+        ui.add_space(3.0);
+        egui::CollapsingHeader::new(
+            RichText::new("⚡ TRIGGER CONTROLS")
+                .size(10.0)
+                .strong()
+                .color(Color32::YELLOW),
+        )
+        .id_source(format!("trigger_device_{}", idx))
+        .default_open(true)
+        .show(ui, |ui| {
+            self.render_retro_trigger_config(ui, device, idx, notifications);
+        });
+
+        // Retro Waveform Generator Panel
+        ui.add_space(3.0);
+        egui::CollapsingHeader::new(
+            RichText::new("🌊 SIGNAL GENERATOR")
+                .size(10.0)
+                .strong()
+                .color(Color32::YELLOW),
+        )
+        .id_source(format!("waveform_device_{}", idx))
+        .default_open(true)
+        .show(ui, |ui| {
+            self.render_retro_waveform_config(ui, device, idx, notifications);
+        });
+
+        // Retro System Status Panel - Even more compact
+        ui.add_space(3.0);
+        ui.group(|ui| {
+            ui.label(
+                RichText::new("SYSTEM STATUS")
+                    .size(10.0)
+                    .strong()
+                    .color(Color32::YELLOW),
+            );
+
+            // Use ArcSwap load for data access
+            let data = device.data.load();
+            let update_age = data.last_update.elapsed().as_millis();
+
+            egui::Grid::new(format!("status_grid_{}", idx))
+                .num_columns(6)
+                .spacing([2.0, 2.0])
+                .show(ui, |ui| {
+                    // Row 2: Compact statistics
+                    ui.label(RichText::new("STATS").size(7.0).color(Color32::LIGHT_GRAY));
+                    ui.label(
+                        RichText::new(format!("{:.1}Hz", data.update_rate))
+                            .size(6.0)
+                            .color(Color32::WHITE),
+                    );
+                    ui.label(RichText::new("RATE").size(6.0).color(Color32::LIGHT_GRAY));
+                    ui.label(
+                        RichText::new(format!("{}ms", update_age))
+                            .size(6.0)
+                            .color(Color32::WHITE),
+                    );
+                    ui.label(RichText::new("AGE").size(6.0).color(Color32::LIGHT_GRAY));
+                    ui.label(""); // Empty label instead of add_space
+                    ui.end_row();
+                });
+        });
+
+        // Hardware-Style Footer with Model Info and Calibration Status
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(5.0);
+
+            // Model info in classic oscilloscope style
+            ui.label(
+                RichText::new("FleaScope")
+                    .size(8.0)
+                    .color(Color32::LIGHT_YELLOW)
+                    .family(egui::FontFamily::Monospace),
+            );
+            ui.label(RichText::new("•").size(6.0).color(Color32::DARK_GRAY));
+            ui.label(
+                RichText::new("v2.1")
+                    .size(7.0)
+                    .color(Color32::DARK_GRAY)
+                    .family(egui::FontFamily::Monospace),
+            );
+
+            ui.add_space(10.0);
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Temperature indicator (classic scope feature)
+                ui.add_space(5.0);
+
+                // Active waveform frequency display
+                if device.waveform_config.enabled {
+                    let freq_str = if device.waveform_config.frequency_hz >= 1000 {
+                        format!(
+                            "{:.1}kHz",
+                            device.waveform_config.frequency_hz as f32 / 1000.0
+                        )
+                    } else {
+                        format!("{}Hz", device.waveform_config.frequency_hz)
+                    };
+                    ui.label(RichText::new("GEN:").size(7.0).color(Color32::LIGHT_GRAY));
+                    ui.label(
+                        RichText::new(&freq_str)
+                            .size(8.0)
+                            .color(Color32::LIGHT_BLUE)
+                            .family(egui::FontFamily::Monospace),
+                    );
                 }
             });
-        }
+        });
+    }
+
+    fn render_retro_trigger_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        _notifications: &mut NotificationManager,
+    ) {
+        ui.group(|ui| {
+            egui::Grid::new(format!("retro_trigger_{}", idx))
+                .num_columns(5)
+                .spacing([4.0, 4.0])
+                .show(ui, |ui| {
+                    // Row 1: Source selection with LED-style indicators
+                    ui.label(RichText::new("SOURCE").size(8.0).color(Color32::LIGHT_GRAY));
+
+                    let is_analog =
+                        device.trigger_config.source == crate::device::TriggerSource::Analog;
+                    if ui
+                        .add_sized(
+                            [30.0, 22.0],
+                            egui::Button::new(RichText::new("ANALOG").size(8.0).color(
+                                if is_analog {
+                                    Color32::GREEN
+                                } else {
+                                    Color32::DARK_GRAY
+                                },
+                            )),
+                        )
+                        .clicked()
+                    {
+                        let mut new_config = device.trigger_config.clone();
+                        new_config.source = crate::device::TriggerSource::Analog;
+                        device.set_trigger_config(new_config);
+                    }
+
+                    let is_digital =
+                        device.trigger_config.source == crate::device::TriggerSource::Digital;
+                    if ui
+                        .add_sized(
+                            [35.0, 22.0],
+                            egui::Button::new(RichText::new("DIGITAL").size(8.0).color(
+                                if is_digital {
+                                    Color32::GREEN
+                                } else {
+                                    Color32::DARK_GRAY
+                                },
+                            )),
+                        )
+                        .clicked()
+                    {
+                        let mut new_config = device.trigger_config.clone();
+                        new_config.source = crate::device::TriggerSource::Digital;
+                        device.set_trigger_config(new_config);
+                    }
+
+                    ui.label(""); // Empty labels instead of add_space
+                    ui.label("");
+                    ui.end_row();
+
+                    // Row 2: Analog trigger controls
+                    if is_analog {
+                        ui.label(RichText::new("LEVEL").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        let mut level = device.trigger_config.analog.level as f32;
+                        if dial_widget(ui, &mut level, -6.6..=6.6, 40.0, Some("LVL"), Some("V"))
+                            .changed()
+                        {
+                            let mut new_config = device.trigger_config.clone();
+                            new_config.analog.level = level as f64;
+                            device.set_trigger_config(new_config);
+                        }
+
+                        ui.label(RichText::new("SLOPE").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        let pattern = device.trigger_config.analog.behavior;
+                        let behaviors = [
+                            (AnalogTriggerBehavior::Rising, "↗", "RISE"),
+                            (AnalogTriggerBehavior::Falling, "↘", "FALL"),
+                            (AnalogTriggerBehavior::Level, "─", "LEVEL"),
+                            (AnalogTriggerBehavior::Auto, "⟲", "AUTO"),
+                        ];
+
+                        for (behavior, _icon, label) in behaviors {
+                            let is_selected = pattern == behavior;
+                            if ui
+                                .add_sized(
+                                    [25.0, 18.0],
+                                    egui::Button::new(RichText::new(label).size(7.0).color(
+                                        if is_selected {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::LIGHT_GRAY
+                                        },
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                let mut new_config = device.trigger_config.clone();
+                                new_config.analog.behavior = behavior;
+                                device.set_trigger_config(new_config);
+                            }
+                        }
+                        ui.end_row();
+                    }
+
+                    // Digital trigger controls
+                    if is_digital {
+                        ui.label(RichText::new("MODE").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        let mode = device.trigger_config.digital.behavior;
+                        let modes = [
+                            (DigitalTriggerBehavior::Start, "START"),
+                            (DigitalTriggerBehavior::Stop, "STOP"),
+                            (DigitalTriggerBehavior::While, "WHILE"),
+                            (DigitalTriggerBehavior::Auto, "AUTO"),
+                        ];
+
+                        for (behavior, label) in modes {
+                            let is_selected = mode == behavior;
+                            if ui
+                                .add_sized(
+                                    [25.0, 18.0],
+                                    egui::Button::new(RichText::new(label).size(7.0).color(
+                                        if is_selected {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::LIGHT_GRAY
+                                        },
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                let mut new_config = device.trigger_config.clone();
+                                new_config.digital.behavior = behavior;
+                                device.set_trigger_config(new_config);
+                            }
+                        }
+                        ui.end_row();
+
+                        // Digital bit pattern in retro style
+                        ui.label(
+                            RichText::new("PATTERN")
+                                .size(8.0)
+                                .color(Color32::LIGHT_GRAY),
+                        );
+
+                        // D0-D4 buttons
+                        for ch in 0..5 {
+                            let bit_state = device.trigger_config.digital.bit_states[ch];
+                            let (text, color) = match bit_state {
+                                BitState::DontCare => ("X", Color32::GRAY),
+                                BitState::Low => ("0", Color32::RED),
+                                BitState::High => ("1", Color32::GREEN),
+                            };
+
+                            if ui
+                                .add_sized(
+                                    [15.0, 15.0],
+                                    egui::Button::new(RichText::new(text).size(8.0).color(color)),
+                                )
+                                .clicked()
+                            {
+                                let mut new_config = device.trigger_config.clone();
+                                new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
+                                device.set_trigger_config(new_config);
+                            }
+                        }
+                        ui.end_row();
+
+                        // Second row for D5-D8 + Clear
+                        ui.label(""); // Empty label instead of add_space
+                        for ch in 5..9 {
+                            let bit_state = device.trigger_config.digital.bit_states[ch];
+                            let (text, color) = match bit_state {
+                                BitState::DontCare => ("X", Color32::GRAY),
+                                BitState::Low => ("0", Color32::RED),
+                                BitState::High => ("1", Color32::GREEN),
+                            };
+
+                            if ui
+                                .add_sized(
+                                    [15.0, 15.0],
+                                    egui::Button::new(RichText::new(text).size(8.0).color(color)),
+                                )
+                                .clicked()
+                            {
+                                let mut new_config = device.trigger_config.clone();
+                                new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
+                                device.set_trigger_config(new_config);
+                            }
+                        }
+
+                        if ui
+                            .add_sized(
+                                [25.0, 15.0],
+                                egui::Button::new(
+                                    RichText::new("CLEAR").size(7.0).color(Color32::RED),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            let mut new_config = device.trigger_config.clone();
+                            new_config.digital.bit_states = [BitState::DontCare; 9];
+                            device.set_trigger_config(new_config);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn render_retro_waveform_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        idx: usize,
+        _notifications: &mut NotificationManager,
+    ) {
+        ui.group(|ui| {
+            egui::Grid::new(format!("retro_waveform_{}", idx))
+                .num_columns(5)
+                .spacing([4.0, 4.0])
+                .show(ui, |ui| {
+                    // Row 1: Enable/Power switch
+                    ui.label(RichText::new("POWER").size(8.0).color(Color32::LIGHT_GRAY));
+
+                    let enabled = device.waveform_config.enabled;
+                    if ui
+                        .add_sized(
+                            [30.0, 22.0],
+                            egui::Button::new(
+                                RichText::new(if enabled { "ON" } else { "OFF" })
+                                    .size(8.0)
+                                    .color(if enabled {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::RED
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        device.waveform_config.enabled = !enabled;
+                        device.set_waveform(
+                            device.waveform_config.waveform_type,
+                            device.waveform_config.frequency_hz,
+                        );
+                    }
+
+                    ui.label(""); // Empty labels instead of add_space
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+
+                    if enabled {
+                        // Row 2: Waveform type selection with retro styling
+                        ui.label(RichText::new("WAVE").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        let current_type = device.waveform_config.waveform_type;
+                        let waveforms = [
+                            (Waveform::Sine, "～", "SINE"),
+                            (Waveform::Square, "⊓", "SQR"),
+                            (Waveform::Triangle, "△", "TRI"),
+                            (Waveform::Ekg, "💓", "EKG"),
+                        ];
+
+                        for (wave_type, _icon, label) in waveforms {
+                            let is_selected = current_type == wave_type;
+                            if ui
+                                .add_sized(
+                                    [22.0, 18.0],
+                                    egui::Button::new(RichText::new(label).size(7.0).color(
+                                        if is_selected {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::LIGHT_GRAY
+                                        },
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                device.waveform_config.waveform_type = wave_type;
+                                device.set_waveform(
+                                    device.waveform_config.waveform_type,
+                                    device.waveform_config.frequency_hz,
+                                );
+                            }
+                        }
+                        ui.end_row();
+
+                        // Row 3: Frequency control with dial
+                        ui.label(RichText::new("FREQ").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        let mut freq = device.waveform_config.frequency_hz as f32;
+                        if dial_widget(ui, &mut freq, 10.0..=4000.0, 45.0, Some("FREQ"), Some("Hz"))
+                            .changed()
+                        {
+                            device.waveform_config.frequency_hz = freq as i32;
+                            device.waveform_config.clamp_frequency();
+                            device.set_waveform(
+                                device.waveform_config.waveform_type,
+                                device.waveform_config.frequency_hz,
+                            );
+                        }
+
+                        ui.label(
+                            RichText::new("PRESETS")
+                                .size(8.0)
+                                .color(Color32::LIGHT_GRAY),
+                        );
+
+                        // Frequency preset buttons
+                        for &freq_val in &[100.0, 1000.0, 2000.0] {
+                            let label = if freq_val >= 1000.0 {
+                                format!("{}k", freq_val / 1000.0)
+                            } else {
+                                format!("{}", freq_val)
+                            };
+
+                            if ui
+                                .add_sized(
+                                    [20.0, 18.0],
+                                    egui::Button::new(
+                                        RichText::new(label).size(7.0).color(Color32::LIGHT_BLUE),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                device.waveform_config.frequency_hz = freq_val as i32;
+                                device.set_waveform(
+                                    device.waveform_config.waveform_type,
+                                    device.waveform_config.frequency_hz,
+                                );
+                                // let freq_str = if freq_val >= 1000.0 {
+                                //     format!("{:.1}kHz", freq_val / 1000.0)
+                                // } else {
+                                //     format!("{:.0}Hz", freq_val)
+                                // };
+                                // notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
     }
 }
