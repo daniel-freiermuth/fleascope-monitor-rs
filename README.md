@@ -12,3 +12,7 @@ Design inspired by analog oscilloscope.
 ```bash
 cargo install fleascope-monitor
 ```
+
+## Releated Projects
+- Underlying fleascope lib https://github.com/daniel-freiermuth/fleascope-rs
+- Sibling implementation in python https://github.com/daniel-freiermuth/fleascope-live
