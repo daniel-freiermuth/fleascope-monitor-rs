@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "fleascope-monitor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1584,6 +1584,8 @@ dependencies = [
 [[package]]
 name = "fleascope-rs"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e314e73aa2c459d8665ddb62d36e84ed96015e54715f47872b70bd00b95384f7"
 dependencies = [
  "log",
  "polars",

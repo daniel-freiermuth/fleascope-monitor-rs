@@ -32,3 +32,30 @@ puffin_egui = { version = "0.29", optional = true }
 [dependencies.egui_extras]
 version = "0.28"
 features = ["default", "all_loaders"]
+
+# ====== BUILD PROFILES ======
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+# Fast compilation for development
+
+[profile.release]
+# Optimized for cargo install users - maximum performance
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Full link-time optimization across all crates
+codegen-units = 1       # Single codegen unit for best optimization
+panic = "abort"         # Faster execution, smaller binary
+strip = true            # Remove debug symbols for smaller binary
+overflow-checks = false # Faster math operations for real-time app
+debug = false           # No debug info for production
+
+[profile.release-profile]
+# For developers who need profiling in release mode
+inherits = "release"
+lto = "thin"            # Some optimization, preserves call structure for profiling
+debug = true            # Keep debug symbols for profiling
+strip = false           # Keep symbols for meaningful stack traces
+codegen-units = 4       # Balance optimization and symbol preservation
+panic = "unwind"        # Better stack traces for profiling
