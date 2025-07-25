@@ -28,14 +28,6 @@ impl FleaScopeApp {
         // Restore app state using cc.storage (requires the "persistence" feature).
         let app = Self::default();
 
-        // Add a default device named "scope3" automatically
-        if let Ok(mut device_manager) = app.device_manager.try_lock() {
-            if let Err(e) = device_manager.add_device("scope3".to_string()) {
-                tracing::warn!("Failed to add default device: {}", e);
-            } else {
-                tracing::info!("Added default device 'scope3' automatically");
-            }
-        }
 
         app
     }

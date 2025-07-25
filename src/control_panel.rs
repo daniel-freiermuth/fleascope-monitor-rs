@@ -4,12 +4,11 @@ use crate::device::{
 use crate::notifications::NotificationManager;
 use crate::worker_interface::FleaScopeDevice;
 use egui::{Color32, RichText};
-use fleascope_rs::{AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, Waveform};
+use fleascope_rs::{AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, FleaConnector, Waveform};
 
 #[derive(Default)]
 pub struct ControlPanel {
-    new_device_hostname: String,
-    show_add_device: bool,
+    available_devices: Vec<String>,
 }
 
 /// Custom dial widget with optional label and value display
@@ -118,70 +117,38 @@ impl ControlPanel {
 
         // Add Device Section
         ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Add Device").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("➕").clicked() {
-                        self.show_add_device = !self.show_add_device;
+            ui.label("Connect:");
+            if ui.button("Refresh devices").clicked() {
+                match FleaConnector::get_available_devices(None) {
+                    Ok(it) => self.available_devices = it.map(|d| d.name).collect(),
+                    Err(e) => {
+                        notifications.add_error(format!("Failed to load devices: {}", e));
+                        tracing::error!("Failed to load devices: {}", e);
                     }
-                });
-            });
-
-            if self.show_add_device {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Hostname:");
-                    ui.text_edit_singleline(&mut self.new_device_hostname);
-                });
-
-                ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() && !self.new_device_hostname.is_empty() {
-                        match device_manager.add_device(self.new_device_hostname.clone()) {
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                for hostname in &self.available_devices {
+                    if device_manager.get_devices().iter().find(|d| d.name == *hostname).is_some() {
+                        continue;
+                    }
+                    if ui.small_button(hostname).clicked() {
+                        match device_manager.add_device(hostname.to_string()) {
                             Ok(_) => {
-                                notifications.add_success(format!(
-                                    "Connected to device: {}",
-                                    self.new_device_hostname
-                                ));
-                                self.new_device_hostname.clear();
-                                self.show_add_device = false;
+                                notifications
+                                    .add_success(format!("Connected to device: {}", hostname));
                             }
                             Err(e) => {
                                 notifications.add_error(format!(
                                     "Failed to connect to {}: {}",
-                                    self.new_device_hostname, e
+                                    hostname, e
                                 ));
                                 tracing::error!("Failed to add device: {}", e);
                             }
                         }
                     }
-                    if ui.button("Cancel").clicked() {
-                        self.show_add_device = false;
-                        self.new_device_hostname.clear();
-                    }
-                });
-
-                ui.separator();
-                ui.label("💡 Quick Add:");
-                ui.horizontal_wrapped(|ui| {
-                    for hostname in ["scope1", "scope-002", "scope3", "localhost:8080"] {
-                        if ui.small_button(hostname).clicked() {
-                            match device_manager.add_device(hostname.to_string()) {
-                                Ok(_) => {
-                                    notifications
-                                        .add_success(format!("Connected to device: {}", hostname));
-                                }
-                                Err(e) => {
-                                    notifications.add_error(format!(
-                                        "Failed to connect to {}: {}",
-                                        hostname, e
-                                    ));
-                                    tracing::error!("Failed to add device: {}", e);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
+                }
+            });
         });
 
         ui.add_space(10.0);
