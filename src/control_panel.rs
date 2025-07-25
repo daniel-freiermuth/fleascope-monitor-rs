@@ -104,6 +104,131 @@ fn dial_widget(
     response
 }
 
+/// Custom exponential dial widget for logarithmic ranges (like time scales)
+fn exponential_dial_widget(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    min_value: f64,
+    max_value: f64,
+    size: f32,
+    label: Option<&str>,
+    unit: Option<&str>,
+) -> egui::Response {
+    // Convert current value to 0.0-1.0 exponential scale
+    let clamped_value = value.clamp(min_value, max_value);
+    let log_ratio = (clamped_value / min_value).ln() / (max_value / min_value).ln();
+    let dial_position = log_ratio as f32;
+
+    let desired_size = egui::vec2(size, size);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+
+    // Handle interaction FIRST (before drawing anything)
+    if response.clicked() || response.dragged() {
+        if let Some(pointer_pos) = response.interact_pointer_pos() {
+            let center = rect.center();
+            let delta = pointer_pos - center;
+            let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
+            let normalized = (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0);
+
+            // Convert back from exponential scale to actual value
+            let new_value = min_value * ((max_value / min_value).powf(normalized as f64));
+            if (*value - new_value).abs() > min_value * 0.001 {
+                // Only update if there's a meaningful change
+                *value = new_value;
+                response.mark_changed();
+            }
+        }
+    }
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.35;
+
+        // Draw dial background circle
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
+
+        // Draw tick marks
+        for i in 0..12 {
+            let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
+            let inner_radius = radius * 0.85;
+            let outer_radius = radius * 0.95;
+            let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
+            let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
+            painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
+        }
+
+        // Calculate angle from dial position (270° range, starting from top-left)
+        let angle = -std::f32::consts::PI * 0.75 + dial_position * std::f32::consts::PI * 1.5;
+
+        // Draw pointer
+        let pointer_start = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.3;
+        let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
+        painter.line_segment(
+            [pointer_start, pointer_end],
+            egui::Stroke::new(3.0, Color32::LIGHT_BLUE),
+        );
+
+        // Draw optional label in top-left corner
+        if let Some(label_text) = label {
+            let label_pos = rect.min + egui::vec2(1.0, 1.0);
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_TOP,
+                label_text,
+                egui::FontId::proportional(8.0),
+                Color32::LIGHT_GRAY,
+            );
+        }
+
+        // Draw current value with appropriate formatting
+        let value_text = pretty_print_number(*value, unit, 2);
+        let value_pos = rect.max - egui::vec2(1.0, 1.0);
+        painter.text(
+            value_pos,
+            egui::Align2::RIGHT_BOTTOM,
+            &value_text,
+            egui::FontId::proportional(8.0),
+            Color32::WHITE,
+        );
+    }
+
+    response
+}
+
+fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize) -> String {
+    if value == 0.0 {
+        return format!("0{}", unit.unwrap_or(""));
+    }
+    
+    let abs_value = value.abs();
+    const MAGNITUDES: &[(f64, &str)] = &[
+        (1e9, "G"), (1e6, "M"), (1e3, "k"), (1.0, ""), (1e-3, "m"), (1e-6, "μ"), (1e-9, "n"),
+    ];
+    
+    let (factor, prefix) = MAGNITUDES.iter()
+        .find(|&&(f, _)| abs_value >= f)
+        .copied()
+        .unwrap_or((1.0, ""));
+    
+    let scaled = value / factor;
+    let abs_scaled = scaled.abs();
+    
+    // Calculate decimal places needed to show the requested significant digits
+    let decimal_places = if abs_scaled >= 100.0 {
+        // For 100+ : show as integer (e.g., "123k" not "123.k")
+        (significant_digits.saturating_sub(3)).max(0)
+    } else if abs_scaled >= 10.0 {
+        // For 10-99: show 1 less decimal place (e.g., "12.3k" for 3 sig digits)
+        (significant_digits.saturating_sub(2)).max(0)
+    } else {
+        // For 1-9.99: show full decimal places (e.g., "1.23k" for 3 sig digits)
+        (significant_digits.saturating_sub(1)).max(0)
+    };
+    
+    format!("{:.*}{}{}", decimal_places, scaled, prefix, unit.unwrap_or(""))
+}
+
 impl ControlPanel {
     pub fn ui(
         &mut self,
@@ -476,25 +601,20 @@ impl ControlPanel {
                     );
 
                     // Convert actual time to exponential scale for the dial
-                    let min_time = MIN_TIME_FRAME;
-                    let max_time = MAX_TIME_FRAME;
-                    let current_time = device.time_frame.clamp(min_time, max_time);
-                    let log_ratio = (current_time / min_time).ln() / (max_time / min_time).ln();
-                    let mut exponential_value = log_ratio as f32;
+                    let mut current_time = device.time_frame;
 
-                    if dial_widget(
+                    if exponential_dial_widget(
                         ui,
-                        &mut exponential_value,
-                        0.0..=1.0,
+                        &mut current_time,
+                        MIN_TIME_FRAME,
+                        MAX_TIME_FRAME,
                         45.0,
                         Some("TIME"),
-                        None,
+                        Some("s"),
                     )
                     .changed()
                     {
-                        let new_time =
-                            min_time * ((max_time / min_time).powf(exponential_value as f64));
-                        device.set_time_frame(new_time);
+                        device.set_time_frame(current_time);
                     }
 
                     ui.end_row();
