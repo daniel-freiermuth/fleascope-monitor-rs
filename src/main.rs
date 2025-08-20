@@ -23,6 +23,7 @@ pub struct FleaScopeApp {
     plot_area: PlotArea,
     control_panel: ControlPanel,
     notification_manager: NotificationManager,
+    #[cfg(feature = "puffin")]
     show_profiler: bool,
 }
 
