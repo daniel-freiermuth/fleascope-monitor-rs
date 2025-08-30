@@ -2,9 +2,6 @@ use eframe::egui;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[cfg(feature = "puffin")]
-use puffin_egui;
-
 mod control_panel;
 mod device;
 mod device_worker;

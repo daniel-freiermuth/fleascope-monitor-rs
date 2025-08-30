@@ -234,7 +234,15 @@ impl FleaWorker {
             }
 
             tracing::debug!("Device is running, starting data generation");
-            fleascope = self.handle_triggered_capture(update_rate, capture_config.probe_multiplier, capture_config.time_frame, capture_config.trigger_config, fleascope).await;
+            fleascope = self
+                .handle_triggered_capture(
+                    update_rate,
+                    capture_config.probe_multiplier,
+                    capture_config.time_frame,
+                    capture_config.trigger_config,
+                    fleascope,
+                )
+                .await;
 
             if last_rate_update.elapsed() >= Duration::from_secs(1) {
                 update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
@@ -256,7 +264,14 @@ impl FleaWorker {
         Err(Error::msg("FleaWorker exited"))
     }
 
-    async fn handle_triggered_capture(&mut self, update_rate: f64, probe: ProbeType, time_frame: f64, trigger_config: TriggerConfig, idle_scope: IdleFleaScope) -> IdleFleaScope {
+    async fn handle_triggered_capture(
+        &mut self,
+        update_rate: f64,
+        probe: ProbeType,
+        time_frame: f64,
+        trigger_config: TriggerConfig,
+        idle_scope: IdleFleaScope,
+    ) -> IdleFleaScope {
         let probe = match probe {
             ProbeType::X1 => &self.x1,
             ProbeType::X10 => &self.x10,
@@ -300,11 +315,7 @@ impl FleaWorker {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("hardware_read_async");
 
-            idle_scope.read_async(
-                Duration::from_secs_f64(time_frame),
-                trigger_str,
-                None,
-            )
+            idle_scope.read_async(Duration::from_secs_f64(time_frame), trigger_str, None)
         };
         let mut fleascope_for_read = match star_res {
             Ok(fleascope_for_read) => fleascope_for_read,
@@ -362,7 +373,6 @@ impl FleaWorker {
                 }
                 Ok(Err(scope)) => {
                     fleascope_for_read = scope;
-                    
                 }
                 Err(_) => {
                     tracing::error!("Error during hardware read: Connection lost");
