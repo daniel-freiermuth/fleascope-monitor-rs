@@ -43,7 +43,7 @@ impl DeviceManager {
             running: true,
         })));
 
-        let worker = FleaWorker {
+        let mut worker = FleaWorker {
             data: data.clone(),
             config_change_rx: capture_config_rx,
             control_rx: calibration_rx,
@@ -64,7 +64,11 @@ impl DeviceManager {
             waveform_tx,
             initial_waveform,
         );
-        let _handle = worker.run(scope); // Store handle for proper lifecycle management
+        let _handle = tokio::spawn(async move {
+            if let Err(e) = worker.run(scope).await {
+                tracing::error!("Worker error: {}", e);
+            };
+        });
 
         self.devices.push(device);
         Ok(())
