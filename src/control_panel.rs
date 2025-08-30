@@ -4,7 +4,9 @@ use crate::device::{
 use crate::notifications::NotificationManager;
 use crate::worker_interface::FleaScopeDevice;
 use egui::{Color32, RichText};
-use fleascope_rs::{AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, FleaConnector, Waveform};
+use fleascope_rs::{
+    AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, FleaConnector, Waveform,
+};
 
 #[derive(Default)]
 pub struct ControlPanel {
@@ -204,20 +206,27 @@ fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize
     if value == 0.0 {
         return format!("0{}", unit.unwrap_or(""));
     }
-    
+
     let abs_value = value.abs();
     const MAGNITUDES: &[(f64, &str)] = &[
-        (1e9, "G"), (1e6, "M"), (1e3, "k"), (1.0, ""), (1e-3, "m"), (1e-6, "μ"), (1e-9, "n"),
+        (1e9, "G"),
+        (1e6, "M"),
+        (1e3, "k"),
+        (1.0, ""),
+        (1e-3, "m"),
+        (1e-6, "μ"),
+        (1e-9, "n"),
     ];
-    
-    let (factor, prefix) = MAGNITUDES.iter()
+
+    let (factor, prefix) = MAGNITUDES
+        .iter()
         .find(|&&(f, _)| abs_value >= f)
         .copied()
         .unwrap_or((1.0, ""));
-    
+
     let scaled = value / factor;
     let abs_scaled = scaled.abs();
-    
+
     // Calculate decimal places needed to show the requested significant digits
     let decimal_places = if abs_scaled >= 100.0 {
         // For 100+ : show as integer (e.g., "123k" not "123.k")
@@ -229,8 +238,14 @@ fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize
         // For 1-9.99: show full decimal places (e.g., "1.23k" for 3 sig digits)
         (significant_digits.saturating_sub(1)).max(0)
     };
-    
-    format!("{:.*}{}{}", decimal_places, scaled, prefix, unit.unwrap_or(""))
+
+    format!(
+        "{:.*}{}{}",
+        decimal_places,
+        scaled,
+        prefix,
+        unit.unwrap_or("")
+    )
 }
 
 impl ControlPanel {
@@ -242,7 +257,7 @@ impl ControlPanel {
     ) {
         #[cfg(feature = "puffin")]
         puffin::profile_function!();
-        
+
         ui.heading("🎛️ Control Panel");
 
         ui.separator();
@@ -261,7 +276,12 @@ impl ControlPanel {
             }
             ui.horizontal_wrapped(|ui| {
                 for hostname in &self.available_devices {
-                    if device_manager.get_devices().iter().find(|d| d.name == *hostname).is_some() {
+                    if device_manager
+                        .get_devices()
+                        .iter()
+                        .find(|d| d.name == *hostname)
+                        .is_some()
+                    {
                         continue;
                     }
                     if ui.small_button(hostname).clicked() {
@@ -271,10 +291,8 @@ impl ControlPanel {
                                     .add_success(format!("Connected to device: {}", hostname));
                             }
                             Err(e) => {
-                                notifications.add_error(format!(
-                                    "Failed to connect to {}: {}",
-                                    hostname, e
-                                ));
+                                notifications
+                                    .add_error(format!("Failed to connect to {}: {}", hostname, e));
                                 tracing::error!("Failed to add device: {}", e);
                             }
                         }

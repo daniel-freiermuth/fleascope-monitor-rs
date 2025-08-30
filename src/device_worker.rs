@@ -242,10 +242,10 @@ impl FleaWorker {
                 let trigger_str = {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("trigger_string_conversion");
-                    
+
                     probe.trigger_to_string(capture_config.trigger_config.into())
                 };
-                
+
                 let trigger_str = match trigger_str {
                     Ok(str) => str,
                     Err(e) => {
@@ -272,9 +272,7 @@ impl FleaWorker {
                     )
                 };
                 let mut fleascope_for_read = match star_res {
-                    Ok(fleascope_for_read) => {
-                        fleascope_for_read
-                    }
+                    Ok(fleascope_for_read) => fleascope_for_read,
                     Err((s, e)) => {
                         tracing::error!("Failed to start read operation: {}", e);
                         fleascope = s; // Restore idle scope on error
@@ -286,7 +284,7 @@ impl FleaWorker {
                 while !fleascope_for_read.is_done() {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("hardware_wait_polling_loop");
-                    
+
                     if self
                         .config_change_rx
                         .has_changed()
@@ -294,7 +292,7 @@ impl FleaWorker {
                     {
                         #[cfg(feature = "puffin")]
                         puffin::profile_scope!("config_change_detected");
-                        
+
                         tracing::info!(
                             "Configuration changed during hardware read, calling unblock()"
                         );
@@ -308,30 +306,27 @@ impl FleaWorker {
                     {
                         #[cfg(feature = "puffin")]
                         puffin::profile_scope!("waveform_change_detected");
-                        
-                        tracing::info!(
-                            "Waveform changed during hardware read, calling unblock()"
-                        );
+
+                        tracing::info!("Waveform changed during hardware read, calling unblock()");
                         fleascope_for_read.cancel();
                         break;
                     }
                     if !self.control_rx.is_empty() {
                         #[cfg(feature = "puffin")]
                         puffin::profile_scope!("control_command_detected");
-                        
+
                         tracing::info!("Received control command during hardware read");
                         fleascope_for_read.cancel();
                         break;
                     };
                 }
-                
+
                 {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("update_rate_calculation");
-                    
+
                     if last_rate_update.elapsed() >= Duration::from_secs(1) {
-                        update_rate =
-                            read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                        update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
                         read_count = 0;
                         last_rate_update = Instant::now();
                     }
@@ -341,7 +336,7 @@ impl FleaWorker {
                 let (idle_scope, res) = {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("hardware_wait_completion");
-                    
+
                     fleascope_for_read.wait()
                 };
                 fleascope = idle_scope;
@@ -357,7 +352,7 @@ impl FleaWorker {
                 tokio::spawn(async move {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("data_processing_pipeline");
-                    
+
                     let _parse_csv_scope = {
                         #[cfg(feature = "puffin")]
                         puffin::profile_scope!("parse_csv");
@@ -373,11 +368,12 @@ impl FleaWorker {
                                 FleaWorker::convert_polars_to_data_points(df)
                             })
                     };
-                    
-                    _parse_csv_scope.map(|data_points| {
+
+                    _parse_csv_scope
+                        .map(|data_points| {
                             #[cfg(feature = "puffin")]
                             puffin::profile_scope!("update_shared_data");
-                            
+
                             let new_data = DeviceData {
                                 x_values: data_points.0,
                                 data_points: data_points.1,
@@ -407,7 +403,7 @@ impl FleaWorker {
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
         #[cfg(feature = "puffin")]
         puffin::profile_function!();
-        
+
         tracing::debug!(
             "Converting DataFrame with columns: {:?}",
             df.get_column_names()
@@ -421,7 +417,7 @@ impl FleaWorker {
         // Extract columns from the DataFrame
         #[cfg(feature = "puffin")]
         puffin::profile_scope!("extract_dataframe_columns");
-        
+
         let time_col = match df.column("time") {
             Ok(col) => col,
             Err(e) => {
@@ -467,7 +463,7 @@ impl FleaWorker {
         {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("parse_bitmap_strings");
-            
+
             // Handle string bitmap data (e.g., "0x1ff", "0101010101", or "255")
             // TODO maybe use the fleascope-rs function
             match bitmap_col.str() {
@@ -520,7 +516,7 @@ impl FleaWorker {
 
         #[cfg(feature = "puffin")]
         puffin::profile_scope!("create_data_points_from_vectors");
-        
+
         let mut x_values = Vec::new();
         let mut data_points = Vec::new();
 
