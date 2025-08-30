@@ -327,7 +327,7 @@ impl FleaWorker {
         tracing::debug!("Successfully started read operation on FleaScope");
 
         loop {
-            match fleascope_for_read.is_done() {
+            match fleascope_for_read.try_get_result() {
                 Ok(Ok((scope, reading))) => {
                     let data_copy = self.data.clone();
                     let running = self.running;
