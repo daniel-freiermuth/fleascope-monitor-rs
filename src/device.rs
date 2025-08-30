@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use fleascope_rs::{
-    AnalogTrigger, BitState, DigitalTrigger, FleaConnectorError, IdleFleaScope, ProbeType, Trigger,
-    Waveform,
+    AnalogTrigger, AnalogTriggerBuilder, BitState, DigitalTrigger, FleaConnectorError,
+    IdleFleaScope, ProbeType, Waveform,
 };
 use std::{sync::Arc, time::Instant};
 use tokio::sync::watch;
@@ -168,24 +168,15 @@ pub enum TriggerSource {
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub source: TriggerSource,
-    pub analog: AnalogTrigger,
+    pub analog: AnalogTriggerBuilder,
     pub digital: DigitalTrigger,
-}
-
-impl From<TriggerConfig> for Trigger {
-    fn from(tc: TriggerConfig) -> Self {
-        match tc.source {
-            TriggerSource::Analog => tc.analog.into(),
-            TriggerSource::Digital => tc.digital.into(),
-        }
-    }
 }
 
 impl Default for TriggerConfig {
     fn default() -> Self {
         Self {
             source: TriggerSource::Digital,
-            analog: AnalogTrigger::start_capturing_when().auto(0.0),
+            analog: AnalogTrigger::start_capturing_when(0.0).auto(),
             digital: DigitalTrigger::start_capturing_when().is_matching(),
         }
     }

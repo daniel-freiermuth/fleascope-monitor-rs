@@ -934,12 +934,12 @@ impl ControlPanel {
                     if is_analog {
                         ui.label(RichText::new("LEVEL").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mut level = device.trigger_config.analog.level as f32;
+                        let mut level = device.trigger_config.analog.volts as f32;
                         if dial_widget(ui, &mut level, -6.6..=6.6, 40.0, Some("LVL"), Some("V"))
                             .changed()
                         {
                             let mut new_config = device.trigger_config.clone();
-                            new_config.analog.level = level as f64;
+                            new_config.analog.volts = level as f64;
                             device.set_trigger_config(new_config);
                         }
 

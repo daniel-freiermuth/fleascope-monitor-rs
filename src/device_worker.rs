@@ -1,15 +1,16 @@
 use anyhow::{Error, Result};
 use arc_swap::ArcSwap;
+use fleascope_rs::trigger_config::TriggerConfig as _;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
 use polars::prelude::*;
-use std::panic;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::device::{
-    CaptureConfig, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig, WaveformConfig
+    CaptureConfig, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig,
+    TriggerSource, WaveformConfig,
 };
 
 pub struct FleaWorker {
@@ -269,7 +270,19 @@ impl FleaWorker {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("trigger_string_conversion");
 
-            probe.trigger_to_string(trigger_config.into())
+            match trigger_config.source {
+                TriggerSource::Analog => {
+                    tracing::debug!("Converting analog trigger to string");
+                    trigger_config
+                        .analog
+                        .into_trigger(probe)
+                        .map(|trigger| trigger.into_trigger_fields())
+                }
+                TriggerSource::Digital => {
+                    tracing::debug!("Converting digital trigger to string");
+                    Ok(trigger_config.digital.into_trigger_fields())
+                }
+            }
         };
 
         let trigger_str = match trigger_str {
@@ -306,71 +319,69 @@ impl FleaWorker {
         };
         tracing::debug!("Successfully started read operation on FleaScope");
 
-        while !fleascope_for_read.is_done() {
+        loop {
+            match fleascope_for_read.is_done() {
+                Ok(Ok((scope, reading))) => {
+                    let data_copy = self.data.clone();
+                    let running = self.running;
+                    tokio::spawn(async move {
+                        #[cfg(feature = "puffin")]
+                        puffin::profile_scope!("data_processing_pipeline");
+
+                        let _parse_csv_scope = {
+                            #[cfg(feature = "puffin")]
+                            puffin::profile_scope!("parse_csv");
+                            reading
+                                .parse_csv()
+                                .map(|df| {
+                                    #[cfg(feature = "puffin")]
+                                    puffin::profile_scope!("apply_calibration");
+                                    probe_clone.apply_calibration(df).collect().unwrap()
+                                })
+                                .map(|df| {
+                                    #[cfg(feature = "puffin")]
+                                    puffin::profile_scope!("convert_to_data_points");
+                                    FleaWorker::convert_polars_to_data_points(df)
+                                })
+                        };
+
+                        _parse_csv_scope
+                            .map(|data_points| {
+                                #[cfg(feature = "puffin")]
+                                puffin::profile_scope!("update_shared_data");
+
+                                let new_data = DeviceData {
+                                    x_values: data_points.0,
+                                    data_points: data_points.1,
+                                    last_update: Instant::now(),
+                                    update_rate,
+                                    connected: true,
+                                    running,
+                                };
+                                data_copy.store(Arc::new(new_data));
+                            })
+                            .ok();
+                    });
+                    return scope;
+                }
+                Ok(Err(scope)) => {
+                    fleascope_for_read = scope;
+                    
+                }
+                Err(_) => {
+                    tracing::error!("Error during hardware read: Connection lost");
+                    self.set_lost_connection().await;
+                    panic!("Connection lost during hardware read");
+                }
+            }
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("hardware_wait_polling_loop");
 
             if self.check_settings_changed() {
                 tracing::info!("Settings changed during hardware wait, calling unblock()");
-                fleascope_for_read.cancel();
-                break;
+                return fleascope_for_read.cancel();
             }
         }
-
-        let (idle_scope, res) = {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("hardware_wait_completion");
-
-            fleascope_for_read.wait()
-        };
-        let (f, data_s) = match res {
-            Ok((data_s, f)) => (data_s, f),
-            Err(_e) => {
-                self.set_lost_connection().await;
-                return idle_scope;
-            }
-        };
-
-        let data_copy = self.data.clone();
-        let running = self.running;
-        tokio::spawn(async move {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("data_processing_pipeline");
-
-            let _parse_csv_scope = {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("parse_csv");
-                IdleFleaScope::parse_csv(&data_s, f)
-                    .map(|df| {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("apply_calibration");
-                        probe_clone.apply_calibration(df).collect().unwrap()
-                    })
-                    .map(|df| {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("convert_to_data_points");
-                        FleaWorker::convert_polars_to_data_points(df)
-                    })
-            };
-
-            _parse_csv_scope
-                .map(|data_points| {
-                    #[cfg(feature = "puffin")]
-                    puffin::profile_scope!("update_shared_data");
-
-                    let new_data = DeviceData {
-                        x_values: data_points.0,
-                        data_points: data_points.1,
-                        last_update: Instant::now(),
-                        update_rate,
-                        connected: true,
-                        running,
-                    };
-                    data_copy.store(Arc::new(new_data));
-                })
-                .ok();
-        });
-        idle_scope
     }
 
     fn check_settings_changed(&self) -> bool {
