@@ -32,68 +32,76 @@ impl FleaWorker {
         tracing::info!("Handling control command: {:?}", command);
 
         match command {
-            ControlCommand::Calibrate0V(probe_multiplier) => {
-                match probe_multiplier {
-                    ProbeType::X1 => match self.x1.calibrate_0(fleascope) {
-                        Ok(_) => {}
-                        Err(e) => self
-                            .notification_tx
-                            .send(Notification::Error(format!("Calibration failed: {}", e)))
+            ControlCommand::Calibrate0V(probe_multiplier) => match probe_multiplier {
+                ProbeType::X1 => match self.x1.calibrate_0(fleascope) {
+                    Ok(_) => {
+                        self.notification_tx
+                            .send(Notification::Success(
+                                "X1 probe calibrated at 0V".to_string(),
+                            ))
                             .await
-                            .expect("Failed to send calibration result"),
-                    },
-                    ProbeType::X10 => match self.x10.calibrate_0(fleascope) {
-                        Ok(_) => {}
-                        Err(e) => self
-                            .notification_tx
-                            .send(Notification::Error(format!("Calibration failed: {}", e)))
+                            .expect("Failed to send calibration result");
+                    }
+                    Err(e) => self
+                        .notification_tx
+                        .send(Notification::Error(format!("X1 calibration failed: {}", e)))
+                        .await
+                        .expect("Failed to send calibration result"),
+                },
+                ProbeType::X10 => match self.x10.calibrate_0(fleascope) {
+                    Ok(_) => {
+                        self.notification_tx
+                            .send(Notification::Success(
+                                "X10 probe calibrated at 0V".to_string(),
+                            ))
                             .await
-                            .expect("Failed to send calibration result"),
-                    },
-                };
-                if let Err(e) = self
-                    .notification_tx
-                    .send(Notification::Success(
-                        "Calibration completed successfully".to_string(),
-                    ))
-                    .await
-                {
-                    tracing::error!("Failed to send calibration result: {}", e);
-                }
-            }
-            ControlCommand::Calibrate3V(probe_multiplier) => {
-                match probe_multiplier {
-                    ProbeType::X1 => {
-                        if let Err(e) = self.x1.calibrate_3v3(fleascope) {
-                            self.notification_tx
-                                .blocking_send(Notification::Error(format!(
-                                    "Calibration failed: {}",
-                                    e
-                                )))
-                                .expect("Failed to send calibration error")
-                        }
+                            .expect("Failed to send calibration result");
                     }
-                    ProbeType::X10 => {
-                        if let Err(e) = self.x10.calibrate_3v3(fleascope) {
-                            self.notification_tx
-                                .blocking_send(Notification::Error(format!(
-                                    "Calibration failed: {}",
-                                    e
-                                )))
-                                .expect("Failed to send calibration error")
-                        }
+                    Err(e) => self
+                        .notification_tx
+                        .send(Notification::Error(format!(
+                            "X10 calibration failed: {}",
+                            e
+                        )))
+                        .await
+                        .expect("Failed to send calibration result"),
+                },
+            },
+            ControlCommand::Calibrate3V(probe_multiplier) => match probe_multiplier {
+                ProbeType::X1 => match self.x1.calibrate_3v3(fleascope) {
+                    Ok(_) => {
+                        self.notification_tx
+                            .send(Notification::Success(
+                                "X1 probe calibrated at 3.3V".to_string(),
+                            ))
+                            .await
+                            .expect("Failed to send calibration result");
                     }
-                };
-                if let Err(e) = self
-                    .notification_tx
-                    .send(Notification::Success(
-                        "Calibration completed successfully".to_string(),
-                    ))
-                    .await
-                {
-                    tracing::error!("Failed to send calibration result: {}", e);
-                }
-            }
+                    Err(e) => self
+                        .notification_tx
+                        .send(Notification::Error(format!("X1 calibration failed: {}", e)))
+                        .await
+                        .expect("Failed to send calibration result"),
+                },
+                ProbeType::X10 => match self.x10.calibrate_3v3(fleascope) {
+                    Ok(_) => {
+                        self.notification_tx
+                            .send(Notification::Success(
+                                "X10 probe calibrated at 3.3V".to_string(),
+                            ))
+                            .await
+                            .expect("Failed to send calibration result");
+                    }
+                    Err(e) => self
+                        .notification_tx
+                        .send(Notification::Error(format!(
+                            "X10 calibration failed: {}",
+                            e
+                        )))
+                        .await
+                        .expect("Failed to send calibration result"),
+                },
+            },
             ControlCommand::StoreCalibration() => {
                 match Ok(())
                     .and(self.x1.write_calibration_to_flash(fleascope))
