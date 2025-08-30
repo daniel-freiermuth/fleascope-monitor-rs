@@ -235,17 +235,13 @@ impl FleaWorker {
 
             tracing::debug!("Device is running, starting data generation");
             fleascope = self.handle_triggered_capture(update_rate, capture_config.probe_multiplier, capture_config.time_frame, capture_config.trigger_config, fleascope).await;
-            {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("update_rate_calculation");
 
-                if last_rate_update.elapsed() >= Duration::from_secs(1) {
-                    update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
-                    read_count = 0;
-                    last_rate_update = Instant::now();
-                }
-                read_count += 1;
+            if last_rate_update.elapsed() >= Duration::from_secs(1) {
+                update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                read_count = 0;
+                last_rate_update = Instant::now();
             }
+            read_count += 1;
         }
         fleascope.teardown();
         let data = self.data.load();
