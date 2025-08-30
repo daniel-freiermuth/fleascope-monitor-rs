@@ -13,7 +13,6 @@ use crate::device::{
 };
 
 pub struct FleaWorker {
-    pub fleascope: IdleFleaScope,
     pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
     pub config_change_rx: watch::Receiver<CaptureConfig>, // Channel for configuration changes
     pub control_rx: tokio::sync::mpsc::Receiver<ControlCommand>, // Channel for calibration commands
@@ -25,14 +24,17 @@ pub struct FleaWorker {
 }
 
 impl FleaWorker {
-    /// Handle calibration commands received from the UI
-    async fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
-        tracing::info!("Handling calibration command: {:?}", command);
+    async fn handle_control_command(
+        &mut self,
+        command: ControlCommand,
+        mut fleascope: &mut IdleFleaScope,
+    ) -> Result<()> {
+        tracing::info!("Handling control command: {:?}", command);
 
         match command {
             ControlCommand::Calibrate0V(probe_multiplier) => {
                 match probe_multiplier {
-                    ProbeType::X1 => match self.x1.calibrate_0(&mut self.fleascope) {
+                    ProbeType::X1 => match self.x1.calibrate_0(&mut fleascope) {
                         Ok(_) => {}
                         Err(e) => self
                             .notification_tx
@@ -40,7 +42,7 @@ impl FleaWorker {
                             .await
                             .expect("Failed to send calibration result"),
                     },
-                    ProbeType::X10 => match self.x10.calibrate_0(&mut self.fleascope) {
+                    ProbeType::X10 => match self.x10.calibrate_0(&mut fleascope) {
                         Ok(_) => {}
                         Err(e) => self
                             .notification_tx
@@ -62,7 +64,7 @@ impl FleaWorker {
             ControlCommand::Calibrate3V(probe_multiplier) => {
                 match probe_multiplier {
                     ProbeType::X1 => {
-                        if let Err(e) = self.x1.calibrate_3v3(&mut self.fleascope) {
+                        if let Err(e) = self.x1.calibrate_3v3(&mut fleascope) {
                             self.notification_tx
                                 .blocking_send(Notification::Error(format!(
                                     "Calibration failed: {}",
@@ -72,7 +74,7 @@ impl FleaWorker {
                         }
                     }
                     ProbeType::X10 => {
-                        if let Err(e) = self.x10.calibrate_3v3(&mut self.fleascope) {
+                        if let Err(e) = self.x10.calibrate_3v3(&mut fleascope) {
                             self.notification_tx
                                 .blocking_send(Notification::Error(format!(
                                     "Calibration failed: {}",
@@ -94,8 +96,8 @@ impl FleaWorker {
             }
             ControlCommand::StoreCalibration() => {
                 match Ok(())
-                    .and(self.x1.write_calibration_to_flash(&mut self.fleascope))
-                    .and(self.x10.write_calibration_to_flash(&mut self.fleascope))
+                    .and(self.x1.write_calibration_to_flash(&mut fleascope))
+                    .and(self.x10.write_calibration_to_flash(&mut fleascope))
                 {
                     Ok(_) => self
                         .notification_tx
@@ -172,7 +174,10 @@ impl FleaWorker {
         self.running = true;
     }
 
-    pub fn start_data_generation(mut self) -> tokio::task::JoinHandle<()> {
+    pub fn start_data_generation(
+        mut self,
+        mut fleascope: IdleFleaScope,
+    ) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes
         let mut update_rate = 0.0;
         let mut last_rate_update = Instant::now();
@@ -188,7 +193,7 @@ impl FleaWorker {
 
                 if let Ok(command) = self.control_rx.try_recv() {
                     tracing::info!("Received control command: {:?}", command);
-                    if (self.handle_control_command(command).await).is_err() {
+                    if (self.handle_control_command(command, &mut fleascope).await).is_err() {
                         break;
                     }
                 }
@@ -199,7 +204,7 @@ impl FleaWorker {
                 {
                     tracing::info!("Waveform configuration changed, updating waveform");
                     let waveform_config = self.waveform_rx.borrow_and_update().clone();
-                    self.fleascope
+                    fleascope
                         .set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
                 }
 
@@ -218,7 +223,7 @@ impl FleaWorker {
                         }
                         Some(command) = self.control_rx.recv() => {
                             tracing::info!("Received calibration command while paused: {:?}", command);
-                            if (self.handle_control_command(command).await).is_err() {
+                            if (self.handle_control_command(command, &mut fleascope).await).is_err() {
                                 break;
                             }
                         }
@@ -259,8 +264,8 @@ impl FleaWorker {
                 let star_res = {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("hardware_read_async");
-                    
-                    self.fleascope.read_async(
+
+                    fleascope.read_async(
                         Duration::from_secs_f64(capture_config.time_frame),
                         trigger_str,
                         None,
@@ -272,7 +277,7 @@ impl FleaWorker {
                     }
                     Err((s, e)) => {
                         tracing::error!("Failed to start read operation: {}", e);
-                        self.fleascope = s; // Restore idle scope on error
+                        fleascope = s; // Restore idle scope on error
                         continue;
                     }
                 };
@@ -339,7 +344,7 @@ impl FleaWorker {
                     
                     fleascope_for_read.wait()
                 };
-                self.fleascope = idle_scope;
+                fleascope = idle_scope;
                 let (f, data_s) = match res {
                     Ok((data_s, f)) => (data_s, f),
                     Err(_e) => {
@@ -386,7 +391,7 @@ impl FleaWorker {
                         .ok();
                 });
             }
-            self.fleascope.teardown();
+            fleascope.teardown();
             let data = self.data.load();
             self.data.store(Arc::new(DeviceData {
                 x_values: data.x_values.clone(),

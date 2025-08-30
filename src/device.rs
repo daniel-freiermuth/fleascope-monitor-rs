@@ -44,7 +44,6 @@ impl DeviceManager {
         })));
 
         let worker = FleaWorker {
-            fleascope: scope, // Wrap in Some for handling during calibration
             data: data.clone(),
             config_change_rx: capture_config_rx,
             control_rx: calibration_rx,
@@ -65,7 +64,7 @@ impl DeviceManager {
             waveform_tx,
             initial_waveform,
         );
-        let _handle = worker.start_data_generation(); // Store handle for proper lifecycle management
+        let _handle = worker.start_data_generation(scope); // Store handle for proper lifecycle management
 
         self.devices.push(device);
         Ok(())
