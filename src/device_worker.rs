@@ -27,14 +27,14 @@ impl FleaWorker {
     async fn handle_control_command(
         &mut self,
         command: ControlCommand,
-        mut fleascope: &mut IdleFleaScope,
+        fleascope: &mut IdleFleaScope,
     ) -> Result<()> {
         tracing::info!("Handling control command: {:?}", command);
 
         match command {
             ControlCommand::Calibrate0V(probe_multiplier) => {
                 match probe_multiplier {
-                    ProbeType::X1 => match self.x1.calibrate_0(&mut fleascope) {
+                    ProbeType::X1 => match self.x1.calibrate_0(fleascope) {
                         Ok(_) => {}
                         Err(e) => self
                             .notification_tx
@@ -42,7 +42,7 @@ impl FleaWorker {
                             .await
                             .expect("Failed to send calibration result"),
                     },
-                    ProbeType::X10 => match self.x10.calibrate_0(&mut fleascope) {
+                    ProbeType::X10 => match self.x10.calibrate_0(fleascope) {
                         Ok(_) => {}
                         Err(e) => self
                             .notification_tx
@@ -64,7 +64,7 @@ impl FleaWorker {
             ControlCommand::Calibrate3V(probe_multiplier) => {
                 match probe_multiplier {
                     ProbeType::X1 => {
-                        if let Err(e) = self.x1.calibrate_3v3(&mut fleascope) {
+                        if let Err(e) = self.x1.calibrate_3v3(fleascope) {
                             self.notification_tx
                                 .blocking_send(Notification::Error(format!(
                                     "Calibration failed: {}",
@@ -74,7 +74,7 @@ impl FleaWorker {
                         }
                     }
                     ProbeType::X10 => {
-                        if let Err(e) = self.x10.calibrate_3v3(&mut fleascope) {
+                        if let Err(e) = self.x10.calibrate_3v3(fleascope) {
                             self.notification_tx
                                 .blocking_send(Notification::Error(format!(
                                     "Calibration failed: {}",
@@ -96,8 +96,8 @@ impl FleaWorker {
             }
             ControlCommand::StoreCalibration() => {
                 match Ok(())
-                    .and(self.x1.write_calibration_to_flash(&mut fleascope))
-                    .and(self.x10.write_calibration_to_flash(&mut fleascope))
+                    .and(self.x1.write_calibration_to_flash(fleascope))
+                    .and(self.x10.write_calibration_to_flash(fleascope))
                 {
                     Ok(_) => self
                         .notification_tx

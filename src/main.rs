@@ -37,9 +37,7 @@ impl FleaScopeApp {
 
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
-        let app = Self::default();
-
-        app
+        Self::default()
     }
 }
 

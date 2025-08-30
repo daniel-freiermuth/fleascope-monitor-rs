@@ -279,8 +279,7 @@ impl ControlPanel {
                     if device_manager
                         .get_devices()
                         .iter()
-                        .find(|d| d.name == *hostname)
-                        .is_some()
+                        .any(|d| d.name == *hostname)
                     {
                         continue;
                     }
