@@ -182,10 +182,7 @@ impl FleaWorker {
         self.running = true;
     }
 
-    pub fn start_data_generation(
-        mut self,
-        mut fleascope: IdleFleaScope,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn run(mut self, mut fleascope: IdleFleaScope) -> tokio::task::JoinHandle<()> {
         // Create a new receiver for configuration changes
         let mut update_rate = 0.0;
         let mut last_rate_update = Instant::now();

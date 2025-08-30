@@ -64,7 +64,7 @@ impl DeviceManager {
             waveform_tx,
             initial_waveform,
         );
-        let _handle = worker.start_data_generation(scope); // Store handle for proper lifecycle management
+        let _handle = worker.run(scope); // Store handle for proper lifecycle management
 
         self.devices.push(device);
         Ok(())
