@@ -310,38 +310,11 @@ impl FleaWorker {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("hardware_wait_polling_loop");
 
-            if self
-                .config_change_rx
-                .has_changed()
-                .expect("Failed to check for config change")
-            {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("config_change_detected");
-
-                tracing::info!("Configuration changed during hardware read, calling unblock()");
+            if self.check_settings_changed() {
+                tracing::info!("Settings changed during hardware wait, calling unblock()");
                 fleascope_for_read.cancel();
                 break;
             }
-            if self
-                .waveform_rx
-                .has_changed()
-                .expect("Failed to check for waveform change")
-            {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("waveform_change_detected");
-
-                tracing::info!("Waveform changed during hardware read, calling unblock()");
-                fleascope_for_read.cancel();
-                break;
-            }
-            if !self.control_rx.is_empty() {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("control_command_detected");
-
-                tracing::info!("Received control command during hardware read");
-                fleascope_for_read.cancel();
-                break;
-            };
         }
 
         let (idle_scope, res) = {
@@ -398,6 +371,39 @@ impl FleaWorker {
                 .ok();
         });
         idle_scope
+    }
+
+    fn check_settings_changed(&self) -> bool {
+        if self
+            .config_change_rx
+            .has_changed()
+            .expect("Failed to check for config change")
+        {
+            #[cfg(feature = "puffin")]
+            puffin::profile_scope!("config_change_detected");
+
+            tracing::info!("Configuration changed during hardware read, calling unblock()");
+            return true;
+        }
+        if self
+            .waveform_rx
+            .has_changed()
+            .expect("Failed to check for waveform change")
+        {
+            #[cfg(feature = "puffin")]
+            puffin::profile_scope!("waveform_change_detected");
+
+            tracing::info!("Waveform changed during hardware read, calling unblock()");
+            return true;
+        }
+        if !self.control_rx.is_empty() {
+            #[cfg(feature = "puffin")]
+            puffin::profile_scope!("control_command_detected");
+
+            tracing::info!("Received control command during hardware read");
+            return true;
+        }
+        false
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
