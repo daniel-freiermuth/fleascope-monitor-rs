@@ -116,7 +116,16 @@ impl ContinuousBuffer {
                     col("bnc").median().alias("bnc_median"),
                     col("bnc").mean().alias("bnc_mean"),
                     col("bnc").max().alias("bnc_max"),
-                ]);
+                ])
+                .sort(
+                    ["time_min"],
+                    polars::prelude::SortMultipleOptions::default(),
+                )
+                .with_row_index("idx", None)
+                .filter(
+                    col("idx").gt(lit(0))
+                    .and(col("idx").lt(col("idx").max()))
+                );
             if wrap {df = df.with_column(col("time_min") % lit(window_duration))}
             df.sort(
                     ["time_min"],
