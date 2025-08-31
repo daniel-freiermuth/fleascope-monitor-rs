@@ -200,6 +200,7 @@ impl FleaWorker {
                 if (self.handle_control_command(command, &mut fleascope).await).is_err() {
                     break;
                 }
+                continue;
             }
             if self
                 .waveform_rx
