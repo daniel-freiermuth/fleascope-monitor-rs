@@ -14,11 +14,11 @@ use crate::device::{
 };
 
 pub struct FleaWorker {
-    pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
-    pub config_change_rx: watch::Receiver<CaptureConfig>, // Channel for configuration changes
-    pub control_rx: tokio::sync::mpsc::Receiver<ControlCommand>, // Channel for calibration commands
-    pub notification_tx: tokio::sync::mpsc::Sender<Notification>, // Channel for calibration results
-    pub waveform_rx: tokio::sync::watch::Receiver<WaveformConfig>, // Channel for waveform configuration
+    pub data: Arc<ArcSwap<DeviceData>>,
+    pub config_change_rx: watch::Receiver<CaptureConfig>,
+    pub control_rx: tokio::sync::mpsc::Receiver<ControlCommand>,
+    pub notification_tx: tokio::sync::mpsc::Sender<Notification>,
+    pub waveform_rx: tokio::sync::watch::Receiver<WaveformConfig>,
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub running: bool,

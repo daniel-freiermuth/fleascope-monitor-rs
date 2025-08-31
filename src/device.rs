@@ -24,7 +24,7 @@ impl DeviceManager {
             probe_multiplier: ProbeType::X1,
             mode: CaptureMode::Triggered {
                 trigger_config: TriggerConfig::default(),
-                time_frame: 0.1, // Default 2 seconds
+                time_frame: 0.1,
             },
         };
         let initial_waveform = WaveformConfig::default();

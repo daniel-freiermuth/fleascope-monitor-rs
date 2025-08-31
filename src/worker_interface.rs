@@ -77,8 +77,8 @@ impl FleaScopeDevice {
             triggered_config,
             continuous_config,
             capture_mode: mode,
-            probe_multiplier: initial_config.probe_multiplier, // Default x1 probe
-            waveform_config: initial_waveform,                 // Default waveform config
+            probe_multiplier: initial_config.probe_multiplier,
+            waveform_config: initial_waveform,
             config_change_tx,
             control_signal_tx: calibration_tx,
             notification_rx,
