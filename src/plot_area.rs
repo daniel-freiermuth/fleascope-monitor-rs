@@ -99,7 +99,8 @@ impl ContinuousBuffer {
         let filtered_df = {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("polars_filter_and_resample");
-            let mut df = self.data
+            let mut df = self
+                .data
                 .clone()
                 .lazy()
                 .filter(col("time").gt_eq(lit(window_start)))
@@ -122,21 +123,20 @@ impl ContinuousBuffer {
                     polars::prelude::SortMultipleOptions::default(),
                 )
                 .with_row_index("idx", None)
-                .filter(
-                    col("idx").gt(lit(0))
-                    .and(col("idx").lt(col("idx").max()))
-                );
-            if wrap {df = df.with_column(col("time_min") % lit(window_duration))}
+                .filter(col("idx").gt(lit(0)).and(col("idx").lt(col("idx").max())));
+            if wrap {
+                df = df.with_column(col("time_min") % lit(window_duration))
+            }
             df.sort(
-                    ["time_min"],
-                    polars::prelude::SortMultipleOptions::default(),
-                )
-                .select([
-                    polars::prelude::col("time_min").alias("time"),
-                    polars::prelude::col("bnc_median").alias("bnc"),
-                ])
-                .collect()
-                .expect("Failed to filter and resample DataFrame")
+                ["time_min"],
+                polars::prelude::SortMultipleOptions::default(),
+            )
+            .select([
+                polars::prelude::col("time_min").alias("time"),
+                polars::prelude::col("bnc_median").alias("bnc"),
+            ])
+            .collect()
+            .expect("Failed to filter and resample DataFrame")
         };
 
         // Extract vectors efficiently - handle both resampled and non-resampled data
@@ -309,7 +309,11 @@ impl PlotArea {
                 if let Some(buffer) = self.continuous_buffers.get(device_name) {
                     #[cfg(feature = "puffin")]
                     puffin::profile_scope!("buffer_windowed_data");
-                    buffer.get_data_in_window(device.get_continuous_config().buffer_time, device.wrap, self.width)
+                    buffer.get_data_in_window(
+                        device.get_continuous_config().buffer_time,
+                        device.wrap,
+                        self.width,
+                    )
                 } else {
                     (vec![], vec![])
                 }

@@ -950,11 +950,13 @@ impl ControlPanel {
                     if is_analog {
                         ui.label(RichText::new("LEVEL").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mut level = device.get_triggered_config().trigger_config.analog.volts as f32;
+                        let mut level =
+                            device.get_triggered_config().trigger_config.analog.volts as f32;
                         if dial_widget(ui, &mut level, -6.6..=6.6, 40.0, Some("LVL"), Some("V"))
                             .changed()
                         {
-                            let mut new_config = device.get_triggered_config().trigger_config.clone();
+                            let mut new_config =
+                                device.get_triggered_config().trigger_config.clone();
                             new_config.analog.volts = level as f64;
                             device.set_trigger_config(new_config);
                         }
@@ -984,7 +986,8 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.get_triggered_config().trigger_config.clone();
+                                let mut new_config =
+                                    device.get_triggered_config().trigger_config.clone();
                                 new_config.analog.behavior = behavior;
                                 device.set_trigger_config(new_config);
                             }
@@ -996,7 +999,11 @@ impl ControlPanel {
                     if is_digital {
                         ui.label(RichText::new("MODE").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mode = device.get_triggered_config().trigger_config.digital.behavior;
+                        let mode = device
+                            .get_triggered_config()
+                            .trigger_config
+                            .digital
+                            .behavior;
                         let modes = [
                             (DigitalTriggerBehavior::Start, "START"),
                             (DigitalTriggerBehavior::Stop, "STOP"),
@@ -1019,7 +1026,8 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.get_triggered_config().trigger_config.clone();
+                                let mut new_config =
+                                    device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.behavior = behavior;
                                 device.set_trigger_config(new_config);
                             }
@@ -1035,8 +1043,11 @@ impl ControlPanel {
 
                         // D0-D4 buttons
                         for ch in 0..5 {
-                            let bit_state =
-                                device.get_triggered_config().trigger_config.digital.bit_states[ch];
+                            let bit_state = device
+                                .get_triggered_config()
+                                .trigger_config
+                                .digital
+                                .bit_states[ch];
                             let (text, color) = match bit_state {
                                 BitState::DontCare => ("X", Color32::GRAY),
                                 BitState::Low => ("0", Color32::RED),
@@ -1050,7 +1061,8 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.get_triggered_config().trigger_config.clone();
+                                let mut new_config =
+                                    device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
                                 device.set_trigger_config(new_config);
                             }
@@ -1060,8 +1072,11 @@ impl ControlPanel {
                         // Second row for D5-D8 + Clear
                         ui.label(""); // Empty label instead of add_space
                         for ch in 5..9 {
-                            let bit_state =
-                                device.get_triggered_config().trigger_config.digital.bit_states[ch];
+                            let bit_state = device
+                                .get_triggered_config()
+                                .trigger_config
+                                .digital
+                                .bit_states[ch];
                             let (text, color) = match bit_state {
                                 BitState::DontCare => ("X", Color32::GRAY),
                                 BitState::Low => ("0", Color32::RED),
@@ -1075,7 +1090,8 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.get_triggered_config().trigger_config.clone();
+                                let mut new_config =
+                                    device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
                                 device.set_trigger_config(new_config);
                             }
@@ -1090,7 +1106,8 @@ impl ControlPanel {
                             )
                             .clicked()
                         {
-                            let mut new_config = device.get_triggered_config().trigger_config.clone();
+                            let mut new_config =
+                                device.get_triggered_config().trigger_config.clone();
                             new_config.digital.bit_states = [BitState::DontCare; 9];
                             device.set_trigger_config(new_config);
                         }
@@ -1120,9 +1137,7 @@ impl ControlPanel {
                             .add_sized(
                                 [30.0, 22.0],
                                 egui::Button::new(
-                                    RichText::new("ON")
-                                        .size(8.0)
-                                        .color(Color32::RED),
+                                    RichText::new("ON").size(8.0).color(Color32::RED),
                                 ),
                             )
                             .clicked()
@@ -1298,18 +1313,21 @@ impl ControlPanel {
                     ui.add_space(10.0);
 
                     let time_response = ui.add(
-                        egui::Slider::new(&mut *device.get_mut_trigger_time_handle(), MIN_TIME_FRAME..=MAX_TIME_FRAME)
-                            .logarithmic(true)
-                            .suffix(" s")
-                            .custom_formatter(|n, _| {
-                                if n >= 1.0 {
-                                    format!("{:.2}s", n)
-                                } else if n >= 0.001 {
-                                    format!("{:.0}ms", n * 1000.0)
-                                } else {
-                                    format!("{:.0}μs", n * 1_000_000.0)
-                                }
-                            }),
+                        egui::Slider::new(
+                            &mut *device.get_mut_trigger_time_handle(),
+                            MIN_TIME_FRAME..=MAX_TIME_FRAME,
+                        )
+                        .logarithmic(true)
+                        .suffix(" s")
+                        .custom_formatter(|n, _| {
+                            if n >= 1.0 {
+                                format!("{:.2}s", n)
+                            } else if n >= 0.001 {
+                                format!("{:.0}ms", n * 1000.0)
+                            } else {
+                                format!("{:.0}μs", n * 1_000_000.0)
+                            }
+                        }),
                     );
 
                     if time_response.changed() {
@@ -1332,15 +1350,13 @@ impl ControlPanel {
                     if ui
                         .add_sized(
                             [30.0, 22.0],
-                            egui::Button::new(
-                                RichText::new("Loop")
-                                    .size(8.0)
-                                    .color(if device.wrap {
-                                        Color32::GREEN
-                                    } else {
-                                        Color32::RED
-                                    }),
-                            ),
+                            egui::Button::new(RichText::new("Loop").size(8.0).color(
+                                if device.wrap {
+                                    Color32::GREEN
+                                } else {
+                                    Color32::RED
+                                },
+                            )),
                         )
                         .clicked()
                     {
@@ -1352,7 +1368,7 @@ impl ControlPanel {
                             .logarithmic(true)
                             .custom_formatter(|n, _| {
                                 if n >= 1.0 {
-                                    format!("{:.2}s", n )
+                                    format!("{:.2}s", n)
                                 } else {
                                     format!("{:.0}ms", n * 1000.0)
                                 }

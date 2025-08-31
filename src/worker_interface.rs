@@ -29,8 +29,8 @@ pub struct FleaScopeDevice {
     pub name: String,
     pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
     pub enabled_channels: [bool; 10],   // 1 analog + 9 digital
-    probe_multiplier: ProbeType,    // Probe selection
-    waveform_config: WaveformConfig, // Waveform generator configuration
+    probe_multiplier: ProbeType,        // Probe selection
+    waveform_config: WaveformConfig,    // Waveform generator configuration
     config_change_tx: watch::Sender<CaptureConfig>, // Channel for configuration changes
     control_signal_tx: tokio::sync::mpsc::Sender<ControlCommand>, // Channel for calibration commands
     pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results

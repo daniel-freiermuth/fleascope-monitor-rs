@@ -1,6 +1,8 @@
 use anyhow::{Error, Result};
 use arc_swap::ArcSwap;
-use fleascope_rs::flea_scope::{BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME};
+use fleascope_rs::flea_scope::{
+    BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME,
+};
 use fleascope_rs::trigger_config::TriggerConfig as _;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
 use polars::frame::DataFrame;
@@ -13,7 +15,8 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::device::{
-    CaptureConfig, CaptureMode, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig, TriggerSource, WaveformConfig
+    CaptureConfig, CaptureMode, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig,
+    TriggerSource, WaveformConfig,
 };
 
 pub struct FleaWorker {
