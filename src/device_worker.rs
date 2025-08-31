@@ -191,10 +191,6 @@ impl FleaWorker {
         let mut read_count = 0;
 
         loop {
-            // Global profiler frame marker
-            #[cfg(feature = "puffin")]
-            puffin::GlobalProfiler::lock().new_frame();
-
             if let Ok(command) = self.control_rx.try_recv() {
                 tracing::info!("Received control command: {:?}", command);
                 if (self.handle_control_command(command, &mut fleascope).await).is_err() {

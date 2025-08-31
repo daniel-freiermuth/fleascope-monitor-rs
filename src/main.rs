@@ -40,6 +40,10 @@ impl FleaScopeApp {
 
 impl eframe::App for FleaScopeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Start a new profiling frame
+        #[cfg(feature = "puffin")]
+        puffin::GlobalProfiler::lock().new_frame();
+
         // Profile the entire update function
         #[cfg(feature = "puffin")]
         puffin::profile_function!();
