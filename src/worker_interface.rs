@@ -5,22 +5,41 @@ use std::sync::Arc;
 use tokio::sync::watch::{self, Sender};
 
 use crate::device::{
-    CaptureConfig, ControlCommand, DeviceData, Notification, TriggerConfig, WaveformConfig,
-    MAX_TIME_FRAME, MIN_TIME_FRAME,
+    CaptureConfig, CaptureMode, ControlCommand, DeviceData, Notification, TriggerConfig,
+    WaveformConfig, MAX_TIME_FRAME, MIN_TIME_FRAME,
 };
+
+#[derive(Clone)]
+pub struct TriggeredCaptureConfig {
+    pub time_frame: f64,
+    pub trigger_config: TriggerConfig,
+}
+#[derive(Clone)]
+pub struct ContinuousCaptureConfig {
+    pub buffer_time: f64,
+}
+
+#[derive(Copy, Clone)]
+pub enum CaptureModeFlat {
+    Triggered,
+    Continuous,
+}
 
 pub struct FleaScopeDevice {
     pub name: String,
     pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
     pub enabled_channels: [bool; 10],   // 1 analog + 9 digital
-    pub time_frame: f64,                // Time window in seconds
     pub probe_multiplier: ProbeType,    // Probe selection
-    pub trigger_config: TriggerConfig,  // Trigger configuration
     pub waveform_config: WaveformConfig, // Waveform generator configuration
     config_change_tx: watch::Sender<CaptureConfig>, // Channel for configuration changes
     control_signal_tx: tokio::sync::mpsc::Sender<ControlCommand>, // Channel for calibration commands
     pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results
     waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
+    pub batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f64>>, // Channel for continuous batches
+    triggered_config: TriggeredCaptureConfig,
+    continuous_config: ContinuousCaptureConfig,
+    capture_mode: CaptureModeFlat,
+    pub wrap: bool,
 }
 
 impl FleaScopeDevice {
@@ -33,29 +52,55 @@ impl FleaScopeDevice {
         initial_config: CaptureConfig,
         waveform_tx: Sender<WaveformConfig>,
         initial_waveform: WaveformConfig,
+        batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f64>>,
     ) -> Self {
+        let mut triggered_config = TriggeredCaptureConfig {
+            time_frame: 0.1,
+            trigger_config: TriggerConfig::default(),
+        };
+        let continuous_config = ContinuousCaptureConfig { buffer_time: 1.0 };
+        let mode = match initial_config.mode {
+            CaptureMode::Triggered {
+                time_frame,
+                trigger_config,
+            } => {
+                triggered_config.time_frame = time_frame;
+                triggered_config.trigger_config = trigger_config;
+                CaptureModeFlat::Triggered
+            }
+            CaptureMode::Continuous {} => CaptureModeFlat::Continuous,
+        };
         Self {
             name,
             data,
             enabled_channels: [true; 10], // All channels enabled by default
-            time_frame: initial_config.time_frame, // Default 2 seconds
+            triggered_config,
+            continuous_config,
+            capture_mode: mode,
             probe_multiplier: initial_config.probe_multiplier, // Default x1 probe
-            trigger_config: initial_config.trigger_config, // Default trigger config
-            waveform_config: initial_waveform, // Default waveform config
+            waveform_config: initial_waveform,                 // Default waveform config
             config_change_tx,
             control_signal_tx: calibration_tx,
             notification_rx,
             waveform_tx,
+            batch_rx,
+            wrap: true,
         }
     }
 
     /// Signal that configuration has changed and data generation should restart
     fn signal_config_change(&self) {
+        let cm = match self.capture_mode {
+            CaptureModeFlat::Triggered => CaptureMode::Triggered {
+                trigger_config: self.triggered_config.trigger_config.clone(),
+                time_frame: self.triggered_config.time_frame,
+            },
+            CaptureModeFlat::Continuous => CaptureMode::Continuous {},
+        };
         self.config_change_tx
             .send(CaptureConfig {
                 probe_multiplier: self.probe_multiplier,
-                trigger_config: self.trigger_config.clone(),
-                time_frame: self.time_frame,
+                mode: cm,
             })
             .expect("Failed to send config change signal");
     }
@@ -94,7 +139,40 @@ impl FleaScopeDevice {
 
     pub fn set_trigger_config(&mut self, trigger_config: TriggerConfig) {
         tracing::debug!("Setting trigger config: {:?}", trigger_config);
-        self.trigger_config = trigger_config;
+        self.triggered_config.trigger_config = trigger_config;
+        self.signal_config_change();
+    }
+
+    pub fn get_capture_mode(&self) -> CaptureModeFlat {
+        self.capture_mode
+    }
+
+    pub fn get_continuous_config(&self) -> ContinuousCaptureConfig {
+        self.continuous_config.clone()
+    }
+
+    pub fn get_triggered_config(&self) -> TriggeredCaptureConfig {
+        self.triggered_config.clone()
+    }
+
+    pub fn get_waveform_config(&self) -> WaveformConfig {
+        self.waveform_config.clone()
+    }
+
+    pub fn get_probe_multiplier(&self) -> ProbeType {
+        self.probe_multiplier
+    }
+
+    pub fn get_mut_trigger_time_handle(&mut self) -> &mut f64 {
+        &mut self.triggered_config.time_frame
+    }
+
+    pub fn get_mut_buffer_time_handle(&mut self) -> &mut f64 {
+        &mut self.continuous_config.buffer_time
+    }
+
+    pub fn set_capture_mode(&mut self, mode: CaptureModeFlat) {
+        self.capture_mode = mode;
         self.signal_config_change();
     }
 
@@ -104,7 +182,7 @@ impl FleaScopeDevice {
 
     pub fn set_time_frame(&mut self, time_frame: f64) {
         // Clamp time frame to valid range: 122μs to 3.49s
-        self.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
+        self.triggered_config.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
         self.signal_config_change();
     }
 

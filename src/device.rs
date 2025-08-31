@@ -22,8 +22,10 @@ impl DeviceManager {
         let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true)?;
         let initial_config = CaptureConfig {
             probe_multiplier: ProbeType::X1,
-            trigger_config: TriggerConfig::default(),
-            time_frame: 0.1, // Default 2 seconds
+            mode: CaptureMode::Triggered {
+                trigger_config: TriggerConfig::default(),
+                time_frame: 0.1, // Default 2 seconds
+            },
         };
         let initial_waveform = WaveformConfig::default();
 
@@ -33,6 +35,9 @@ impl DeviceManager {
         // Create calibration channels
         let (calibration_tx, calibration_rx) = tokio::sync::mpsc::channel::<ControlCommand>(32);
         let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<Notification>(32);
+
+        // Create continuous batch streaming channel
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f64>>();
 
         let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
             x_values: Vec::new(),
@@ -52,6 +57,7 @@ impl DeviceManager {
             x10,
             waveform_rx, // Channel for waveform configuration
             running: true,
+            batch_tx,
         };
 
         let device = FleaScopeDevice::new(
@@ -63,6 +69,7 @@ impl DeviceManager {
             initial_config,
             waveform_tx,
             initial_waveform,
+            batch_rx,
         );
         let _handle = tokio::spawn(async move {
             if let Err(e) = worker.run(scope).await {
@@ -93,10 +100,18 @@ impl DeviceManager {
 }
 
 #[derive(Debug, Clone)]
+pub enum CaptureMode {
+    Triggered {
+        trigger_config: TriggerConfig,
+        time_frame: f64,
+    },
+    Continuous {},
+}
+
+#[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub probe_multiplier: ProbeType,
-    pub trigger_config: TriggerConfig,
-    pub time_frame: f64,
+    pub mode: CaptureMode,
 }
 
 pub enum Notification {

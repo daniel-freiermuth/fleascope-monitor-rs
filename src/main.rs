@@ -155,8 +155,8 @@ impl eframe::App for FleaScopeApp {
                         ui.set_min_height(available_rect.height());
 
                         // Access device manager safely for plotting
-                        if let Ok(manager) = self.device_manager.try_lock() {
-                            self.plot_area.ui(ui, &manager);
+                        if let Ok(mut manager) = self.device_manager.try_lock() {
+                            self.plot_area.ui(ui, &mut manager);
                         } else {
                             ui.label("Loading devices...");
                         }

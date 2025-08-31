@@ -9,8 +9,7 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::device::{
-    CaptureConfig, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig,
-    TriggerSource, WaveformConfig,
+    CaptureConfig, CaptureMode, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig, TriggerSource, WaveformConfig
 };
 
 pub struct FleaWorker {
@@ -22,6 +21,7 @@ pub struct FleaWorker {
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub running: bool,
+    pub batch_tx: tokio::sync::mpsc::UnboundedSender<Vec<f64>>,
 }
 
 impl FleaWorker {
@@ -234,15 +234,27 @@ impl FleaWorker {
             }
 
             tracing::debug!("Device is running, starting data generation");
-            fleascope = self
-                .handle_triggered_capture(
-                    update_rate,
-                    capture_config.probe_multiplier,
-                    capture_config.time_frame,
-                    capture_config.trigger_config,
-                    fleascope,
-                )
-                .await;
+            match capture_config.mode {
+                CaptureMode::Triggered {
+                    trigger_config,
+                    time_frame,
+                } => {
+                    fleascope = self
+                        .handle_triggered_capture(
+                            update_rate,
+                            capture_config.probe_multiplier,
+                            time_frame,
+                            trigger_config,
+                            fleascope,
+                        )
+                        .await;
+                }
+                CaptureMode::Continuous {} => {
+                    fleascope = self
+                        .handle_continuous_capture(capture_config.probe_multiplier, fleascope)
+                        .await;
+                }
+            }
 
             if last_rate_update.elapsed() >= Duration::from_secs(1) {
                 update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
@@ -421,6 +433,74 @@ impl FleaWorker {
             return true;
         }
         false
+    }
+
+    async fn handle_continuous_capture(
+        &mut self,
+        probe: ProbeType,
+        fleascope: IdleFleaScope,
+    ) -> IdleFleaScope {
+        const BUFF_SIZE: usize = 512;
+        let probe = match probe {
+            ProbeType::X1 => &self.x1,
+            ProbeType::X10 => &self.x10,
+        };
+
+        let mut streaming_scope = fleascope.stream();
+        let mut start_time = Instant::now();
+        let mut total_samples = 0u32;
+        loop {
+            let batch_result = {
+                #[cfg(feature = "puffin")]
+                puffin::profile_scope!("read_batch_data");
+
+                streaming_scope.read(BUFF_SIZE).map(|buffer| {
+                    // Process the buffer data here
+                    let ca = UInt16Chunked::from_vec(RAW_COLUMN_NAME.into(), buffer);
+                    let column = ca.into_series().into();
+                    let df = DataFrame::new(vec![column]).unwrap();
+                    probe
+                        .apply_calibration(df.lazy())
+                        .collect()
+                        .unwrap()
+                        .column(CALIBRATED_COLUMN_NAME)
+                        .unwrap()
+                        .f64()
+                        .unwrap()
+                        .into_no_null_iter()
+                        .collect()
+                })
+            };
+
+            match batch_result {
+                Ok(batch) => {
+                    {
+                        #[cfg(feature = "puffin")]
+                        puffin::profile_scope!("send_batch_channel");
+
+                        if let Err(_) = self.batch_tx.send(batch) {
+                            tracing::warn!("Failed to send batch - receiver may have been dropped");
+                        }
+                    }
+                    if self.check_settings_changed() {
+                        return streaming_scope.stop();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error reading from continuous stream: {}", e);
+                    self.set_lost_connection().await;
+                    return streaming_scope.stop();
+                }
+            }
+            let now = Instant::now();
+            total_samples += BUFF_SIZE as u32;
+            tracing::info!(
+                "Read {} samples in {}ms = {}Hz from continuous stream",
+                total_samples,
+                (now - start_time).as_millis(),
+                total_samples as f64 / (now - start_time).as_secs_f64()
+            );
+        }
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {

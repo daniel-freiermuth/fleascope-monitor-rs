@@ -2,7 +2,7 @@ use crate::device::{
     cycle_bitstate, waveform_to_icon, DeviceManager, Notification, MAX_TIME_FRAME, MIN_TIME_FRAME,
 };
 use crate::notifications::NotificationManager;
-use crate::worker_interface::FleaScopeDevice;
+use crate::worker_interface::{CaptureModeFlat, FleaScopeDevice};
 use egui::{Color32, RichText};
 use fleascope_rs::{
     AnalogTriggerBehavior, BitState, DigitalTriggerBehavior, FleaConnector, Waveform,
@@ -627,7 +627,7 @@ impl ControlPanel {
                     );
 
                     // Convert actual time to exponential scale for the dial
-                    let mut current_time = device.time_frame;
+                    let mut current_time = device.get_triggered_config().time_frame;
 
                     if exponential_dial_widget(
                         ui,
@@ -758,19 +758,35 @@ impl ControlPanel {
                 });
         });
 
-        // Retro Trigger Control Panel
+        // Retro Capture Mode Panel
         ui.add_space(3.0);
         egui::CollapsingHeader::new(
-            RichText::new("⚡ TRIGGER CONTROLS")
+            RichText::new("📊 CAPTURE MODE")
                 .size(10.0)
                 .strong()
                 .color(Color32::YELLOW),
         )
-        .id_source(format!("trigger_device_{}", idx))
+        .id_source(format!("capture_mode_device_{}", idx))
         .default_open(true)
         .show(ui, |ui| {
-            self.render_retro_trigger_config(ui, device, idx, notifications);
+            self.render_retro_capture_mode_config(ui, device, idx, notifications);
         });
+
+        // Retro Trigger Control Panel - Only show in triggered mode
+        if matches!(device.get_capture_mode(), CaptureModeFlat::Triggered) {
+            ui.add_space(3.0);
+            egui::CollapsingHeader::new(
+                RichText::new("⚡ TRIGGER CONTROLS")
+                    .size(10.0)
+                    .strong()
+                    .color(Color32::YELLOW),
+            )
+            .id_source(format!("trigger_device_{}", idx))
+            .default_open(true)
+            .show(ui, |ui| {
+                self.render_retro_trigger_config(ui, device, idx, notifications);
+            });
+        }
 
         // Retro Waveform Generator Panel
         ui.add_space(3.0);
@@ -886,8 +902,8 @@ impl ControlPanel {
                     // Row 1: Source selection with LED-style indicators
                     ui.label(RichText::new("SOURCE").size(8.0).color(Color32::LIGHT_GRAY));
 
-                    let is_analog =
-                        device.trigger_config.source == crate::device::TriggerSource::Analog;
+                    let is_analog = device.get_triggered_config().trigger_config.source
+                        == crate::device::TriggerSource::Analog;
                     if ui
                         .add_sized(
                             [30.0, 22.0],
@@ -901,13 +917,13 @@ impl ControlPanel {
                         )
                         .clicked()
                     {
-                        let mut new_config = device.trigger_config.clone();
+                        let mut new_config = device.get_triggered_config().trigger_config.clone();
                         new_config.source = crate::device::TriggerSource::Analog;
                         device.set_trigger_config(new_config);
                     }
 
-                    let is_digital =
-                        device.trigger_config.source == crate::device::TriggerSource::Digital;
+                    let is_digital = device.get_triggered_config().trigger_config.source
+                        == crate::device::TriggerSource::Digital;
                     if ui
                         .add_sized(
                             [35.0, 22.0],
@@ -921,7 +937,7 @@ impl ControlPanel {
                         )
                         .clicked()
                     {
-                        let mut new_config = device.trigger_config.clone();
+                        let mut new_config = device.get_triggered_config().trigger_config.clone();
                         new_config.source = crate::device::TriggerSource::Digital;
                         device.set_trigger_config(new_config);
                     }
@@ -934,18 +950,18 @@ impl ControlPanel {
                     if is_analog {
                         ui.label(RichText::new("LEVEL").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mut level = device.trigger_config.analog.volts as f32;
+                        let mut level = device.get_triggered_config().trigger_config.analog.volts as f32;
                         if dial_widget(ui, &mut level, -6.6..=6.6, 40.0, Some("LVL"), Some("V"))
                             .changed()
                         {
-                            let mut new_config = device.trigger_config.clone();
+                            let mut new_config = device.get_triggered_config().trigger_config.clone();
                             new_config.analog.volts = level as f64;
                             device.set_trigger_config(new_config);
                         }
 
                         ui.label(RichText::new("SLOPE").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let pattern = device.trigger_config.analog.behavior;
+                        let pattern = device.get_triggered_config().trigger_config.analog.behavior;
                         let behaviors = [
                             (AnalogTriggerBehavior::Rising, "↗", "RISE"),
                             (AnalogTriggerBehavior::Falling, "↘", "FALL"),
@@ -968,7 +984,7 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.trigger_config.clone();
+                                let mut new_config = device.get_triggered_config().trigger_config.clone();
                                 new_config.analog.behavior = behavior;
                                 device.set_trigger_config(new_config);
                             }
@@ -980,7 +996,7 @@ impl ControlPanel {
                     if is_digital {
                         ui.label(RichText::new("MODE").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mode = device.trigger_config.digital.behavior;
+                        let mode = device.get_triggered_config().trigger_config.digital.behavior;
                         let modes = [
                             (DigitalTriggerBehavior::Start, "START"),
                             (DigitalTriggerBehavior::Stop, "STOP"),
@@ -1003,7 +1019,7 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.trigger_config.clone();
+                                let mut new_config = device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.behavior = behavior;
                                 device.set_trigger_config(new_config);
                             }
@@ -1019,7 +1035,8 @@ impl ControlPanel {
 
                         // D0-D4 buttons
                         for ch in 0..5 {
-                            let bit_state = device.trigger_config.digital.bit_states[ch];
+                            let bit_state =
+                                device.get_triggered_config().trigger_config.digital.bit_states[ch];
                             let (text, color) = match bit_state {
                                 BitState::DontCare => ("X", Color32::GRAY),
                                 BitState::Low => ("0", Color32::RED),
@@ -1033,7 +1050,7 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.trigger_config.clone();
+                                let mut new_config = device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
                                 device.set_trigger_config(new_config);
                             }
@@ -1043,7 +1060,8 @@ impl ControlPanel {
                         // Second row for D5-D8 + Clear
                         ui.label(""); // Empty label instead of add_space
                         for ch in 5..9 {
-                            let bit_state = device.trigger_config.digital.bit_states[ch];
+                            let bit_state =
+                                device.get_triggered_config().trigger_config.digital.bit_states[ch];
                             let (text, color) = match bit_state {
                                 BitState::DontCare => ("X", Color32::GRAY),
                                 BitState::Low => ("0", Color32::RED),
@@ -1057,7 +1075,7 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                let mut new_config = device.trigger_config.clone();
+                                let mut new_config = device.get_triggered_config().trigger_config.clone();
                                 new_config.digital.bit_states[ch] = cycle_bitstate(bit_state);
                                 device.set_trigger_config(new_config);
                             }
@@ -1072,7 +1090,7 @@ impl ControlPanel {
                             )
                             .clicked()
                         {
-                            let mut new_config = device.trigger_config.clone();
+                            let mut new_config = device.get_triggered_config().trigger_config.clone();
                             new_config.digital.bit_states = [BitState::DontCare; 9];
                             device.set_trigger_config(new_config);
                         }
@@ -1216,5 +1234,146 @@ impl ControlPanel {
                     }
                 });
         });
+    }
+
+    fn render_retro_capture_mode_config(
+        &self,
+        ui: &mut egui::Ui,
+        device: &mut FleaScopeDevice,
+        _idx: usize,
+        _notifications: &mut NotificationManager,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("MODE:")
+                    .size(8.0)
+                    .strong()
+                    .color(Color32::LIGHT_BLUE),
+            );
+
+            // Get current mode for radio buttons
+            let is_triggered = matches!(device.get_capture_mode(), CaptureModeFlat::Triggered);
+
+            ui.add_space(10.0);
+
+            // Triggered mode radio button
+            let triggered_response = ui.selectable_label(
+                is_triggered,
+                RichText::new("⚡ TRIGGERED")
+                    .size(7.0)
+                    .color(if is_triggered {
+                        Color32::YELLOW
+                    } else {
+                        Color32::GRAY
+                    }),
+            );
+
+            ui.add_space(5.0);
+
+            // Continuous mode radio button
+            let continuous_response = ui.selectable_label(
+                !is_triggered,
+                RichText::new("🌊 CONTINUOUS")
+                    .size(7.0)
+                    .color(if !is_triggered {
+                        Color32::YELLOW
+                    } else {
+                        Color32::GRAY
+                    }),
+            );
+
+            // Handle mode changes
+            if triggered_response.clicked() && !is_triggered {
+                device.set_capture_mode(CaptureModeFlat::Triggered);
+            }
+
+            if continuous_response.clicked() && is_triggered {
+                device.set_capture_mode(CaptureModeFlat::Continuous);
+            }
+        });
+
+        ui.add_space(2.0);
+
+        match &device.get_capture_mode() {
+            CaptureModeFlat::Triggered => {
+                // Time frame control for triggered mode
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("TIME:")
+                            .size(8.0)
+                            .strong()
+                            .color(Color32::LIGHT_BLUE),
+                    );
+
+                    ui.add_space(10.0);
+
+                    let time_response = ui.add(
+                        egui::Slider::new(&mut *device.get_mut_trigger_time_handle(), MIN_TIME_FRAME..=MAX_TIME_FRAME)
+                            .logarithmic(true)
+                            .suffix(" s")
+                            .custom_formatter(|n, _| {
+                                if n >= 1.0 {
+                                    format!("{:.2}s", n)
+                                } else if n >= 0.001 {
+                                    format!("{:.0}ms", n * 1000.0)
+                                } else {
+                                    format!("{:.0}μs", n * 1_000_000.0)
+                                }
+                            }),
+                    );
+
+                    if time_response.changed() {
+                        device.set_capture_mode(CaptureModeFlat::Triggered);
+                    }
+                });
+            }
+            CaptureModeFlat::Continuous => {
+                // Buffer duration control for continuous mode
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("BUFFER:")
+                            .size(8.0)
+                            .strong()
+                            .color(Color32::LIGHT_BLUE),
+                    );
+
+                    ui.add_space(5.0);
+
+                    if ui
+                        .add_sized(
+                            [30.0, 22.0],
+                            egui::Button::new(
+                                RichText::new("Loop")
+                                    .size(8.0)
+                                    .color(if device.wrap {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::RED
+                                    }),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        device.wrap = !device.wrap;
+                    }
+
+                    let buffer_response = ui.add(
+                        egui::Slider::new(&mut *device.get_mut_buffer_time_handle(), 0.01..=10.0)
+                            .logarithmic(true)
+                            .custom_formatter(|n, _| {
+                                if n >= 1.0 {
+                                    format!("{:.2}s", n )
+                                } else {
+                                    format!("{:.0}ms", n * 1000.0)
+                                }
+                            }),
+                    );
+
+                    if buffer_response.changed() {
+                        device.set_capture_mode(CaptureModeFlat::Continuous);
+                    }
+                });
+            }
+        }
     }
 }
