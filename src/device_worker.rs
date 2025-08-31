@@ -3,7 +3,10 @@ use arc_swap::ArcSwap;
 use fleascope_rs::flea_scope::{BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME};
 use fleascope_rs::trigger_config::TriggerConfig as _;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
-use polars::prelude::*;
+use polars::frame::DataFrame;
+use polars::prelude::{IntoLazy, UInt16Chunked};
+use polars::series::IntoSeries;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
