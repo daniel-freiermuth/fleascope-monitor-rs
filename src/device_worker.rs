@@ -212,9 +212,6 @@ impl FleaWorker {
                 fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
             }
 
-            tracing::debug!("Starting new data generation iteration");
-            // Check if device is paused first
-            let capture_config = self.config_change_rx.borrow_and_update().clone();
             if !self.running {
                 tracing::debug!("Device is paused, skipping data generation");
 
@@ -236,6 +233,7 @@ impl FleaWorker {
             }
 
             tracing::debug!("Device is running, starting data generation");
+            let capture_config = self.config_change_rx.borrow_and_update().clone();
             match capture_config.mode {
                 CaptureMode::Triggered {
                     trigger_config,
