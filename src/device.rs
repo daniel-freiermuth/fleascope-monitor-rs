@@ -230,9 +230,3 @@ impl Default for WaveformConfig {
         }
     }
 }
-
-impl WaveformConfig {
-    pub fn clamp_frequency(&mut self) {
-        self.frequency_hz = self.frequency_hz.clamp(10, 4000);
-    }
-}

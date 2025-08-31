@@ -379,7 +379,6 @@ impl PlotArea {
         match device.get_capture_mode() {
             CaptureModeFlat::Continuous => {
                 ui.label("Digital plotting not supported in Continuous mode");
-                return;
             }
             CaptureModeFlat::Triggered => {
                 let data = device.data.load();

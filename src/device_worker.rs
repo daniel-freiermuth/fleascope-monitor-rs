@@ -481,7 +481,7 @@ impl FleaWorker {
                         #[cfg(feature = "puffin")]
                         puffin::profile_scope!("send_batch_channel");
 
-                        if let Err(_) = self.batch_tx.send(batch) {
+                        if self.batch_tx.send(batch).is_err() {
                             tracing::warn!("Failed to send batch - receiver may have been dropped");
                         }
                     }
