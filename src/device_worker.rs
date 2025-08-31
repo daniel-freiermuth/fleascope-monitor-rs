@@ -151,6 +151,7 @@ impl FleaWorker {
         self.running = false;
         sleep(Duration::from_millis(20)).await;
         let data = self.data.load();
+        // TODO Introduce device state channel
         self.data.store(Arc::new(DeviceData {
             x_values: data.x_values.clone(),
             data_points: data.data_points.clone(),
