@@ -394,12 +394,12 @@ impl ControlPanel {
             );
 
             // Active waveform indicator with classic scope styling
-            if device.waveform_config.enabled {
+            if device.get_waveform_config().enabled {
                 ui.add_space(5.0);
                 ui.colored_label(Color32::from_rgb(0, 255, 100), "●");
                 ui.label(RichText::new("GEN").size(8.0).color(Color32::LIGHT_GRAY));
                 ui.label(
-                    RichText::new(waveform_to_icon(device.waveform_config.waveform_type))
+                    RichText::new(waveform_to_icon(device.get_waveform_config().waveform_type))
                         .size(12.0)
                         .color(Color32::LIGHT_BLUE),
                 );
@@ -465,7 +465,7 @@ impl ControlPanel {
                     // Add probe multiplier controls
                     ui.label(RichText::new("PROBE").size(8.0).color(Color32::LIGHT_GRAY));
                     let is_x10 =
-                        device.probe_multiplier == fleascope_rs::flea_scope::ProbeType::X10;
+                        device.get_probe_multiplier() == fleascope_rs::flea_scope::ProbeType::X10;
                     if ui
                         .add_sized(
                             [25.0, 20.0],
@@ -866,14 +866,14 @@ impl ControlPanel {
                 ui.add_space(5.0);
 
                 // Active waveform frequency display
-                if device.waveform_config.enabled {
-                    let freq_str = if device.waveform_config.frequency_hz >= 1000 {
+                if device.get_waveform_config().enabled {
+                    let freq_str = if device.get_waveform_config().frequency_hz >= 1000 {
                         format!(
                             "{:.1}kHz",
-                            device.waveform_config.frequency_hz as f32 / 1000.0
+                            device.get_waveform_config().frequency_hz as f32 / 1000.0
                         )
                     } else {
-                        format!("{}Hz", device.waveform_config.frequency_hz)
+                        format!("{}Hz", device.get_waveform_config().frequency_hz)
                     };
                     ui.label(RichText::new("GEN:").size(7.0).color(Color32::LIGHT_GRAY));
                     ui.label(
@@ -1112,42 +1112,36 @@ impl ControlPanel {
                 .num_columns(5)
                 .spacing([4.0, 4.0])
                 .show(ui, |ui| {
-                    // Row 1: Enable/Power switch
-                    ui.label(RichText::new("POWER").size(8.0).color(Color32::LIGHT_GRAY));
+                    if !device.get_waveform_config().enabled {
+                        // Row 1: Enable/Power switch
+                        ui.label(RichText::new("POWER").size(8.0).color(Color32::LIGHT_GRAY));
 
-                    let enabled = device.waveform_config.enabled;
-                    if ui
-                        .add_sized(
-                            [30.0, 22.0],
-                            egui::Button::new(
-                                RichText::new(if enabled { "ON" } else { "OFF" })
-                                    .size(8.0)
-                                    .color(if enabled {
-                                        Color32::GREEN
-                                    } else {
-                                        Color32::RED
-                                    }),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        device.waveform_config.enabled = !enabled;
-                        device.set_waveform(
-                            device.waveform_config.waveform_type,
-                            device.waveform_config.frequency_hz,
-                        );
-                    }
+                        if ui
+                            .add_sized(
+                                [30.0, 22.0],
+                                egui::Button::new(
+                                    RichText::new("ON")
+                                        .size(8.0)
+                                        .color(Color32::RED),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            device.set_waveform(
+                                device.get_waveform_config().waveform_type,
+                                device.get_waveform_config().frequency_hz,
+                            );
+                        }
 
-                    ui.label(""); // Empty labels instead of add_space
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-
-                    if enabled {
+                        ui.label(""); // Empty labels instead of add_space
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    } else {
                         // Row 2: Waveform type selection with retro styling
                         ui.label(RichText::new("WAVE").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let current_type = device.waveform_config.waveform_type;
+                        let current_type = device.get_waveform_config().waveform_type;
                         let waveforms = [
                             (Waveform::Sine, "～", "SINE"),
                             (Waveform::Square, "⊓", "SQR"),
@@ -1170,10 +1164,9 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                device.waveform_config.waveform_type = wave_type;
                                 device.set_waveform(
-                                    device.waveform_config.waveform_type,
-                                    device.waveform_config.frequency_hz,
+                                    wave_type,
+                                    device.get_waveform_config().frequency_hz,
                                 );
                             }
                         }
@@ -1182,15 +1175,13 @@ impl ControlPanel {
                         // Row 3: Frequency control with dial
                         ui.label(RichText::new("FREQ").size(8.0).color(Color32::LIGHT_GRAY));
 
-                        let mut freq = device.waveform_config.frequency_hz as f32;
+                        let mut freq = device.get_waveform_config().frequency_hz as f32;
                         if dial_widget(ui, &mut freq, 10.0..=4000.0, 45.0, Some("FREQ"), Some("Hz"))
                             .changed()
                         {
-                            device.waveform_config.frequency_hz = freq as i32;
-                            device.waveform_config.clamp_frequency();
                             device.set_waveform(
-                                device.waveform_config.waveform_type,
-                                device.waveform_config.frequency_hz,
+                                device.get_waveform_config().waveform_type,
+                                freq as i32,
                             );
                         }
 
@@ -1217,10 +1208,9 @@ impl ControlPanel {
                                 )
                                 .clicked()
                             {
-                                device.waveform_config.frequency_hz = freq_val as i32;
                                 device.set_waveform(
-                                    device.waveform_config.waveform_type,
-                                    device.waveform_config.frequency_hz,
+                                    device.get_waveform_config().waveform_type,
+                                    freq_val as i32,
                                 );
                                 // let freq_str = if freq_val >= 1000.0 {
                                 //     format!("{:.1}kHz", freq_val / 1000.0)
