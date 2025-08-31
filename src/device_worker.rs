@@ -1,5 +1,6 @@
 use anyhow::{Error, Result};
 use arc_swap::ArcSwap;
+use fleascope_rs::flea_scope::{BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME};
 use fleascope_rs::trigger_config::TriggerConfig as _;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
 use polars::prelude::*;
@@ -521,7 +522,7 @@ impl FleaWorker {
         #[cfg(feature = "puffin")]
         puffin::profile_scope!("extract_dataframe_columns");
 
-        let time_col = match df.column("time") {
+        let time_col = match df.column(TIME_COLUMN_NAME) {
             Ok(col) => col,
             Err(e) => {
                 tracing::error!("Failed to get time column: {}", e);
@@ -529,7 +530,7 @@ impl FleaWorker {
             }
         };
 
-        let bnc_col = match df.column("bnc") {
+        let bnc_col = match df.column(CALIBRATED_COLUMN_NAME) {
             Ok(col) => col,
             Err(e) => {
                 tracing::error!("Failed to get bnc column: {}", e);
@@ -537,7 +538,7 @@ impl FleaWorker {
             }
         };
 
-        let bitmap_col = match df.column("bitmap") {
+        let bitmap_col = match df.column(BITMAP_COLUMN_NAME) {
             Ok(col) => col,
             Err(e) => {
                 tracing::error!("Failed to get bitmap column: {}", e);
