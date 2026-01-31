@@ -146,10 +146,37 @@ pub struct DeviceData {
     pub running: bool,
 }
 
+fn mean(data: &[f64]) -> Option<f64> {
+    let sum = data.iter().sum::<f64>();
+    let count = data.len();
+
+    match count {
+        positive if positive > 0 => Some(sum / count as f64),
+        _ => None,
+    }
+}
+
+fn std_deviation(data: &[f64]) -> Option<f64> {
+    match (mean(data), data.len()) {
+        (Some(data_mean), count) if count > 0 => {
+            let variance = data.iter().map(|value| {
+                let diff = data_mean - (*value as f64);
+
+                diff * diff
+            }).sum::<f64>() / count as f64;
+
+            Some(variance.sqrt())
+        },
+        _ => None
+    }
+}
+
 impl DeviceData {
     pub fn get_analog_data(&self) -> (Vec<f64>, Vec<f64>) {
         let x = self.x_values.clone();
-        let y = self.data_points.iter().map(|p| p.analog_channel).collect();
+        let y: Vec<f64> = self.data_points.iter().map(|p| p.analog_channel).collect();
+        let rmse = std_deviation(y.as_slice());
+        tracing::debug!("RMS Error in window: {:?}", rmse);
         (x, y)
     }
 

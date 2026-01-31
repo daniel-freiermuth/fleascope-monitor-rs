@@ -99,6 +99,23 @@ impl ContinuousBuffer {
         let filtered_df = {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("polars_filter_and_resample");
+            let rmse = self
+                .data
+                .clone()
+                .lazy()
+                .filter(col("time").gt_eq(lit(window_start)))
+                .select([
+                    polars::prelude::col("bnc").std(1),
+                ])
+                .collect()
+                .expect("Failed to filter and resample DataFrame")
+                .column("bnc")
+                .expect("time column not found")
+                .f64()
+                .expect("time should be f64")
+                .into_no_null_iter()
+                .collect::<Vec<_>>();
+            tracing::debug!("RMS Error in window: {:?}", rmse);
             let mut df = self
                 .data
                 .clone()
