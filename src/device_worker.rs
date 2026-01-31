@@ -451,7 +451,7 @@ impl FleaWorker {
 
         let mut streaming_scope = fleascope.stream();
         let mut start_time = Instant::now();
-        let mut total_samples = 0u32;
+        // let mut total_samples = 0u32;
         loop {
             let batch_result = {
                 #[cfg(feature = "puffin")]
@@ -496,13 +496,14 @@ impl FleaWorker {
                 }
             }
             let now = Instant::now();
-            total_samples += BUFF_SIZE as u32;
+            //total_samples += BUFF_SIZE as u32;
             tracing::info!(
                 "Read {} samples in {}ms = {}Hz from continuous stream",
-                total_samples,
+                BUFF_SIZE,
                 (now - start_time).as_millis(),
-                total_samples as f64 / (now - start_time).as_secs_f64()
+                BUFF_SIZE as f64 / (now - start_time).as_secs_f64()
             );
+            start_time = now;
         }
     }
 
