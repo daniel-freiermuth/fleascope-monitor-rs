@@ -22,8 +22,7 @@ fn dial_widget(
     label: Option<&str>,
     unit: Option<&str>,
 ) -> egui::Response {
-    #[cfg(feature = "puffin")]
-    puffin::profile_function!();
+    profiling::scope!("dial_widget");
     let desired_size = egui::vec2(size, size);
     let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
 
@@ -118,8 +117,7 @@ fn exponential_dial_widget(
     label: Option<&str>,
     unit: Option<&str>,
 ) -> egui::Response {
-    #[cfg(feature = "puffin")]
-    puffin::profile_function!();
+    profiling::scope!("exponential_dial_widget");
     // Convert current value to 0.0-1.0 exponential scale
     let clamped_value = value.clamp(min_value, max_value);
     let log_ratio = (clamped_value / min_value).ln() / (max_value / min_value).ln();
@@ -255,8 +253,7 @@ impl ControlPanel {
         device_manager: &mut DeviceManager,
         notifications: &mut NotificationManager,
     ) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ControlPanel::ui");
 
         ui.heading("🎛️ Control Panel");
 
@@ -361,8 +358,7 @@ impl ControlPanel {
         to_remove: &mut Option<usize>,
         notifications: &mut NotificationManager,
     ) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ControlPanel::render_device_rack");
         // Check for calibration results at the beginning of each frame
         device
             .notification_rx

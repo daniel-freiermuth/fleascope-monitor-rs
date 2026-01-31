@@ -18,8 +18,7 @@ pub struct ContinuousBuffer {
 
 impl ContinuousBuffer {
     pub fn new(sample_rate_hz: u32) -> Self {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ContinuousBuffer::new");
 
         let bnc_column = Column::new("bnc".into(), [0.0].as_ref());
         let time_index = Column::new("time".into(), [0.0].as_ref());
@@ -34,8 +33,7 @@ impl ContinuousBuffer {
     }
 
     pub fn add_batch(&mut self, batch: Vec<f64>) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ContinuousBuffer::add_batch");
 
         let time_step = 1.0 / self.sample_rate_hz as f64;
 
@@ -64,8 +62,7 @@ impl ContinuousBuffer {
     }
 
     fn cleanup_old_batches(&mut self, keep_time: f64) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ContinuousBuffer::cleanup_old_batches");
 
         let keep_samples = (keep_time * self.sample_rate_hz as f64) as usize;
         let current_height = self.data.height();
@@ -83,8 +80,7 @@ impl ContinuousBuffer {
         wrap: bool,
         plot_width: u32,
     ) -> (Vec<f64>, Vec<f64>) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("ContinuousBuffer::get_data_in_window");
 
         if self.data.height() == 0 {
             return (Vec::new(), Vec::new());
@@ -97,8 +93,7 @@ impl ContinuousBuffer {
 
         // Use Polars lazy evaluation for efficient filtering and resampling
         let filtered_df = {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("polars_filter_and_resample");
+            profiling::scope!("polars_filter_and_resample");
             let rmse = self
                 .data
                 .clone()
@@ -158,8 +153,7 @@ impl ContinuousBuffer {
 
         // Extract vectors efficiently - handle both resampled and non-resampled data
         // Resampled data - interleave min/max points
-        #[cfg(feature = "puffin")]
-        puffin::profile_scope!("extract_resampled_data");
+        profiling::scope!("extract_resampled_data");
 
         let time = filtered_df
             .column("time")
@@ -213,8 +207,7 @@ impl Default for PlotArea {
 
 impl PlotArea {
     pub fn ui(&mut self, ui: &mut egui::Ui, device_manager: &mut DeviceManager) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("PlotArea::ui");
 
         ui.heading("📈 Oscilloscope Display");
 
@@ -288,28 +281,24 @@ impl PlotArea {
     }
 
     fn get_analog_data(&mut self, device: &mut FleaScopeDevice) -> (Vec<f64>, Vec<f64>) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_scope!("get_plot_data");
+        profiling::scope!("get_plot_data");
 
         match &device.get_capture_mode() {
             CaptureModeFlat::Continuous => {
                 // Process any new batches from the channel
                 {
-                    #[cfg(feature = "puffin")]
-                    puffin::profile_scope!("process_channel_batches");
+                    profiling::scope!("process_channel_batches");
                     let device_name = &device.name;
                     let buffer = self
                         .continuous_buffers
                         .entry(device_name.clone())
                         .or_insert_with(|| {
-                            #[cfg(feature = "puffin")]
-                            puffin::profile_scope!("create_new_buffer");
+                            profiling::scope!("create_new_buffer");
                             ContinuousBuffer::new(51_436)
                         }); // 1 second max buffer
 
                     while let Ok(batch) = device.batch_rx.try_recv() {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("add_single_batch");
+                        profiling::scope!("add_single_batch");
                         tracing::debug!("Received batch with {} points", batch.len());
                         // Get or create buffer for this device
                         buffer.add_batch(batch);
@@ -317,15 +306,13 @@ impl PlotArea {
                     tracing::debug!("Cleaning up old batches");
                     buffer.cleanup_old_batches(device.get_continuous_config().buffer_time);
                 }
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("continuous_mode_data");
+                profiling::scope!("continuous_mode_data");
 
                 let device_name = &device.name;
 
                 // Get windowed data from our channel-fed buffer
                 if let Some(buffer) = self.continuous_buffers.get(device_name) {
-                    #[cfg(feature = "puffin")]
-                    puffin::profile_scope!("buffer_windowed_data");
+                    profiling::scope!("buffer_windowed_data");
                     buffer.get_data_in_window(
                         device.get_continuous_config().buffer_time,
                         device.wrap,
@@ -337,8 +324,7 @@ impl PlotArea {
             }
             CaptureModeFlat::Triggered => {
                 let data = device.data.load();
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("triggered_mode_data");
+                profiling::scope!("triggered_mode_data");
                 data.get_analog_data()
             }
         }
@@ -350,8 +336,7 @@ impl PlotArea {
         device: &mut FleaScopeDevice,
         device_idx: usize,
     ) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("PlotArea::render_analog_plot");
 
         let (x_data, y_data) = self.get_analog_data(device);
 

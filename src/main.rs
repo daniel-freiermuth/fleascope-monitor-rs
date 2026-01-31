@@ -20,17 +20,10 @@ pub struct FleaScopeApp {
     plot_area: PlotArea,
     control_panel: ControlPanel,
     notification_manager: NotificationManager,
-    #[cfg(feature = "puffin")]
-    show_profiler: bool,
 }
 
 impl FleaScopeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Initialize puffin profiling
-        #[cfg(feature = "puffin")]
-        {
-            puffin::set_scopes_on(true); // Enable profiling
-        }
 
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
@@ -40,21 +33,10 @@ impl FleaScopeApp {
 
 impl eframe::App for FleaScopeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Start a new profiling frame
-        #[cfg(feature = "puffin")]
-        puffin::GlobalProfiler::lock().new_frame();
-
-        // Profile the entire update function
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::finish_frame!();
 
         // Update notifications (remove expired ones)
-        #[cfg(feature = "puffin")]
-        {
-            puffin::profile_scope!("notification_update");
-            self.notification_manager.update();
-        }
-        #[cfg(not(feature = "puffin"))]
+        profiling::scope!("notification_update");
         self.notification_manager.update();
 
         // Request repaint for real-time updates
@@ -62,8 +44,7 @@ impl eframe::App for FleaScopeApp {
 
         // Top menu bar
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("top_menu_bar");
+            profiling::scope!("top_menu_bar");
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
@@ -74,17 +55,6 @@ impl eframe::App for FleaScopeApp {
                 ui.menu_button("View", |ui| {
                     if ui.button("Reset Layout").clicked() {
                         // Reset to default layout
-                    }
-                    ui.separator();
-                    #[cfg(feature = "puffin")]
-                    {
-                        ui.checkbox(&mut self.show_profiler, "Enable Profiling");
-                        if self.show_profiler {
-                            puffin::set_scopes_on(true);
-                            ui.label("Profiling enabled - use puffin_viewer to connect");
-                        } else {
-                            puffin::set_scopes_on(false);
-                        }
                     }
                 });
 
@@ -113,8 +83,7 @@ impl eframe::App for FleaScopeApp {
 
         // Status bar
         egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("status_bar");
+            profiling::scope!("status_bar");
             ui.horizontal(|ui| {
                 ui.label("Status: Ready");
                 ui.separator();
@@ -140,8 +109,7 @@ impl eframe::App for FleaScopeApp {
 
         // Main content area
         egui::CentralPanel::default().show(ctx, |ui| {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("main_content");
+            profiling::scope!("main_content");
             // Use available space more efficiently
             let available_rect = ui.available_rect_before_wrap();
             let control_width = 300.0;
@@ -153,8 +121,7 @@ impl eframe::App for FleaScopeApp {
                     [plot_width, available_rect.height()].into(),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("plot_area");
+                        profiling::scope!("plot_area");
                         // Use full available height for plots
                         ui.set_min_height(available_rect.height());
 
@@ -174,8 +141,7 @@ impl eframe::App for FleaScopeApp {
                     [control_width, available_rect.height()].into(),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("control_panel");
+                        profiling::scope!("control_panel");
                         // Use full available height for control panel
                         ui.set_min_height(available_rect.height());
 
@@ -191,21 +157,8 @@ impl eframe::App for FleaScopeApp {
             });
         });
 
-        // Show profiler window if enabled
-        #[cfg(feature = "puffin")]
-        {
-            if self.show_profiler {
-                puffin_egui::profiler_window(ctx);
-            }
-        }
-
         // Render notifications (always last, so they appear on top)
-        #[cfg(feature = "puffin")]
-        {
-            puffin::profile_scope!("notifications_render");
-            self.notification_manager.ui(ctx);
-        }
-        #[cfg(not(feature = "puffin"))]
+        profiling::scope!("notifications_render");
         self.notification_manager.ui(ctx);
     }
 }
@@ -215,11 +168,8 @@ async fn main() -> eframe::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Start puffin server for remote profiling (optional)
-    #[cfg(feature = "puffin")]
-    {
-        puffin::set_scopes_on(true);
-    }
+    // Register main thread for profiling
+    profiling::register_thread!("Main Thread");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

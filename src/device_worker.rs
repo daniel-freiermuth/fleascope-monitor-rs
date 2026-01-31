@@ -293,8 +293,7 @@ impl FleaWorker {
         };
         let probe_clone = probe.clone(); // Clone early to avoid borrowing issues
         let trigger_str = {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("trigger_string_conversion");
+            profiling::scope!("trigger_string_conversion");
 
             match trigger_config.source {
                 TriggerSource::Analog => {
@@ -327,8 +326,7 @@ impl FleaWorker {
         };
 
         let star_res = {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("hardware_read_async");
+            profiling::scope!("hardware_read_async");
 
             idle_scope.read_async(Duration::from_secs_f64(time_frame), trigger_str, None)
         };
@@ -347,30 +345,25 @@ impl FleaWorker {
                     let data_copy = self.data.clone();
                     let running = self.running;
                     tokio::spawn(async move {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("data_processing_pipeline");
+                        profiling::scope!("data_processing_pipeline");
 
                         let _parse_csv_scope = {
-                            #[cfg(feature = "puffin")]
-                            puffin::profile_scope!("parse_csv");
+                            profiling::scope!("parse_csv");
                             reading
                                 .parse_csv()
                                 .map(|df| {
-                                    #[cfg(feature = "puffin")]
-                                    puffin::profile_scope!("apply_calibration");
+                                    profiling::scope!("apply_calibration");
                                     probe_clone.apply_calibration(df).collect().unwrap()
                                 })
                                 .map(|df| {
-                                    #[cfg(feature = "puffin")]
-                                    puffin::profile_scope!("convert_to_data_points");
+                                    profiling::scope!("convert_to_data_points");
                                     FleaWorker::convert_polars_to_data_points(df)
                                 })
                         };
 
                         _parse_csv_scope
                             .map(|data_points| {
-                                #[cfg(feature = "puffin")]
-                                puffin::profile_scope!("update_shared_data");
+                                profiling::scope!("update_shared_data");
 
                                 let new_data = DeviceData {
                                     x_values: data_points.0,
@@ -395,8 +388,7 @@ impl FleaWorker {
                     panic!("Connection lost during hardware read");
                 }
             }
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("hardware_wait_polling_loop");
+            profiling::scope!("hardware_wait_polling_loop");
 
             if self.check_settings_changed() {
                 tracing::info!("Settings changed during hardware wait, calling unblock()");
@@ -411,8 +403,7 @@ impl FleaWorker {
             .has_changed()
             .expect("Failed to check for config change")
         {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("config_change_detected");
+            profiling::scope!("config_change_detected");
 
             tracing::info!("Configuration changed during hardware read, calling unblock()");
             return true;
@@ -422,15 +413,13 @@ impl FleaWorker {
             .has_changed()
             .expect("Failed to check for waveform change")
         {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("waveform_change_detected");
+            profiling::scope!("waveform_change_detected");
 
             tracing::info!("Waveform changed during hardware read, calling unblock()");
             return true;
         }
         if !self.control_rx.is_empty() {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("control_command_detected");
+            profiling::scope!("control_command_detected");
 
             tracing::info!("Received control command during hardware read");
             return true;
@@ -454,8 +443,7 @@ impl FleaWorker {
         // let mut total_samples = 0u32;
         loop {
             let batch_result = {
-                #[cfg(feature = "puffin")]
-                puffin::profile_scope!("read_batch_data");
+                profiling::scope!("read_batch_data");
 
                 streaming_scope.read(BUFF_SIZE).map(|buffer| {
                     // Process the buffer data here
@@ -478,8 +466,7 @@ impl FleaWorker {
             match batch_result {
                 Ok(batch) => {
                     {
-                        #[cfg(feature = "puffin")]
-                        puffin::profile_scope!("send_batch_channel");
+                        profiling::scope!("send_batch_channel");
 
                         if self.batch_tx.send(batch).is_err() {
                             tracing::warn!("Failed to send batch - receiver may have been dropped");
@@ -508,8 +495,7 @@ impl FleaWorker {
     }
 
     fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
-        #[cfg(feature = "puffin")]
-        puffin::profile_function!();
+        profiling::scope!("FleaWorker::convert_polars_to_data_points");
 
         tracing::debug!(
             "Converting DataFrame with columns: {:?}",
@@ -522,8 +508,7 @@ impl FleaWorker {
         );
 
         // Extract columns from the DataFrame
-        #[cfg(feature = "puffin")]
-        puffin::profile_scope!("extract_dataframe_columns");
+        profiling::scope!("extract_dataframe_columns");
 
         let time_col = match df.column(TIME_COLUMN_NAME) {
             Ok(col) => col,
@@ -568,8 +553,7 @@ impl FleaWorker {
         // Convert bitmap column - handle both string and numeric formats
         let bitmap_values: Vec<u16> = if bitmap_col.dtype() == &polars::datatypes::DataType::String
         {
-            #[cfg(feature = "puffin")]
-            puffin::profile_scope!("parse_bitmap_strings");
+            profiling::scope!("parse_bitmap_strings");
 
             // Handle string bitmap data (e.g., "0x1ff", "0101010101", or "255")
             // TODO maybe use the fleascope-rs function
@@ -621,8 +605,7 @@ impl FleaWorker {
             time_values.len()
         );
 
-        #[cfg(feature = "puffin")]
-        puffin::profile_scope!("create_data_points_from_vectors");
+        profiling::scope!("create_data_points_from_vectors");
 
         let mut x_values = Vec::new();
         let mut data_points = Vec::new();
