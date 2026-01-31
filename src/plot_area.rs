@@ -133,7 +133,7 @@ impl ContinuousBuffer {
             )
             .select([
                 polars::prelude::col("time_min").alias("time"),
-                polars::prelude::col("bnc_median").alias("bnc"),
+                polars::prelude::col("bnc_mean").alias("bnc"),
             ])
             .collect()
             .expect("Failed to filter and resample DataFrame")
