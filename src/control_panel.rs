@@ -1364,7 +1364,7 @@ impl ControlPanel {
                     }
 
                     let buffer_response = ui.add(
-                        egui::Slider::new(&mut *device.get_mut_buffer_time_handle(), 0.01..=10.0)
+                        egui::Slider::new(&mut *device.get_mut_buffer_time_handle(), 0.001..=10.0)
                             .logarithmic(true)
                             .custom_formatter(|n, _| {
                                 if n >= 1.0 {
