@@ -1374,10 +1374,6 @@ impl ControlPanel {
                                 }
                             }),
                     );
-
-                    if buffer_response.changed() {
-                        device.set_capture_mode(CaptureModeFlat::Continuous);
-                    }
                 });
             }
         }
