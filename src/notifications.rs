@@ -158,12 +158,12 @@ impl NotificationManager {
         let frame = egui::Frame::default()
             .fill(color.gamma_multiply(0.1))
             .stroke(egui::Stroke::new(1.0, color))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(12.0))
+            .corner_radius(8.0)
+            .inner_margin(12.0)
             .shadow(egui::epaint::Shadow {
-                offset: egui::vec2(2.0, 4.0),
-                blur: 8.0,
-                spread: 0.0,
+                offset: [2, 4],
+                blur: 8,
+                spread: 0,
                 color: Color32::from_black_alpha(50),
             });
 

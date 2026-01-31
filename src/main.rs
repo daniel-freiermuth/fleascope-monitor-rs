@@ -64,7 +64,7 @@ impl eframe::App for FleaScopeApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             #[cfg(feature = "puffin")]
             puffin::profile_scope!("top_menu_bar");
-            egui::menu::bar(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);

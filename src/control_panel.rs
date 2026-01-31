@@ -766,7 +766,7 @@ impl ControlPanel {
                 .strong()
                 .color(Color32::YELLOW),
         )
-        .id_source(format!("capture_mode_device_{}", idx))
+        .id_salt(format!("capture_mode_device_{}", idx))
         .default_open(true)
         .show(ui, |ui| {
             self.render_retro_capture_mode_config(ui, device, idx, notifications);
@@ -781,7 +781,7 @@ impl ControlPanel {
                     .strong()
                     .color(Color32::YELLOW),
             )
-            .id_source(format!("trigger_device_{}", idx))
+            .id_salt(format!("trigger_device_{}", idx))
             .default_open(true)
             .show(ui, |ui| {
                 self.render_retro_trigger_config(ui, device, idx, notifications);
@@ -796,7 +796,7 @@ impl ControlPanel {
                 .strong()
                 .color(Color32::YELLOW),
         )
-        .id_source(format!("waveform_device_{}", idx))
+        .id_salt(format!("waveform_device_{}", idx))
         .default_open(true)
         .show(ui, |ui| {
             self.render_retro_waveform_config(ui, device, idx, notifications);

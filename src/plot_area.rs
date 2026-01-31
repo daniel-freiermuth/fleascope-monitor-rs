@@ -363,7 +363,7 @@ impl PlotArea {
         let plot = Plot::new(format!("analog_plot_{}", device_idx))
             .height(self.plot_height)
             .show_grid(self.show_grid)
-            .auto_bounds([true, true].into())
+            .auto_bounds([true, true])
             .allow_zoom(true)
             .allow_drag(true)
             .allow_scroll(false);
@@ -377,10 +377,9 @@ impl PlotArea {
 
             if !filtered_data.is_empty() {
                 let filtered_points = PlotPoints::from(filtered_data);
-                let line = Line::new(filtered_points)
+                let line = Line::new("Analog", filtered_points)
                     .color(self.colors[0])
-                    .width(2.0)
-                    .name("Analog");
+                    .width(2.0);
                 plot_ui.line(line);
             }
         });
@@ -409,7 +408,7 @@ impl PlotArea {
                 let plot = Plot::new(format!("digital_plot_{}", device_idx))
                     .height(self.plot_height * 1.5) // Taller for multiple digital channels
                     .show_grid(self.show_grid)
-                    .auto_bounds([true, true].into())
+                    .auto_bounds([true, true])
                     .allow_zoom(true)
                     .allow_drag(true)
                     .allow_scroll(false)
@@ -432,10 +431,9 @@ impl PlotArea {
                         if !filtered_data.is_empty() {
                             let filtered_points = PlotPoints::from(filtered_data);
                             let color_idx = (ch + 1) % self.colors.len();
-                            let line = Line::new(filtered_points)
+                            let line = Line::new(format!("D{}", ch), filtered_points)
                                 .color(self.colors[color_idx])
-                                .width(1.5)
-                                .name(format!("D{}", ch));
+                                .width(1.5);
                             plot_ui.line(line);
                         }
                     }
