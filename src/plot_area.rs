@@ -5,6 +5,7 @@ use crate::{
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct ContinuousBuffer {
@@ -103,11 +104,173 @@ impl ContinuousBuffer {
     }
 }
 
+/// Bitmask summary of consecutive digital samples.
+#[derive(Clone, Copy)]
+struct DigitalBin {
+    t: f64,
+    /// Channels high in every sample of the bin.
+    all_high: u16,
+    /// Channels high in at least one sample; differs from `all_high` where a channel toggled.
+    any_high: u16,
+    count: usize,
+}
+
+/// Rolling buffer for digital-stream samples, decimated into bins that keep every
+/// edge: a channel that toggled inside a bin is drawn as a vertical line.
+/// Sample rate is estimated using a 0.5 s windowed counter so that draining
+/// multiple batches in the same render frame does not produce a near-zero
+/// elapsed time and a false Msps reading.
+pub struct DigitalStreamBuffer {
+    bins: VecDeque<DigitalBin>,
+    /// Bin still collecting samples; carries over between packets.
+    pending: Option<DigitalBin>,
+    last_t: f64,
+    /// Estimated samples / second (from windowed counter); 0 until measured.
+    pub sample_rate_hz: f64,
+    /// Exact rate from the FW config; `None` for free-run (us_per_sample == 0).
+    configured_rate_hz: Option<f64>,
+    /// Display window in seconds; kept in sync from the plot arm each frame.
+    window_s: f64,
+    /// Accumulated sample count since the rate window opened.
+    rate_samples: u64,
+    /// When the current rate-measurement window opened.
+    rate_window_start: Option<Instant>,
+    last_batch: Option<Instant>,
+}
+
+impl DigitalStreamBuffer {
+    const RATE_WINDOW_SECS: f64 = 0.5;
+    /// Target display density: MAX_POINTS bins per `window_s`.
+    const MAX_POINTS: usize = 2048;
+    /// Memory safety cap: 65 536 bins × 32 bytes ≈ 2 MB.
+    const MEMORY_CAP: usize = 65_536;
+
+    pub fn new() -> Self {
+        Self {
+            bins: VecDeque::new(),
+            pending: None,
+            last_t: 0.0,
+            sample_rate_hz: 0.0,
+            configured_rate_hz: None,
+            window_s: 1.0,
+            rate_samples: 0,
+            rate_window_start: None,
+            last_batch: None,
+        }
+    }
+
+    pub fn set_configured_us_per_sample(&mut self, us: u32) {
+        let configured = (us > 0).then(|| 1_000_000.0 / f64::from(us));
+        if configured != self.configured_rate_hz {
+            // The stream restarts at the new rate; the old estimate no longer applies.
+            self.reset_rate();
+        }
+        self.configured_rate_hz = configured;
+    }
+
+    pub fn set_window_s(&mut self, window_s: f64) {
+        self.window_s = window_s.max(0.001);
+    }
+
+    /// Forget the rate estimate once batches stop arriving (paused, stopped or
+    /// failed stream), so it neither shows a stale value nor spans the gap.
+    pub fn expire_idle_rate(&mut self) {
+        if self
+            .last_batch
+            .is_some_and(|t| t.elapsed().as_secs_f64() >= Self::RATE_WINDOW_SECS)
+        {
+            self.reset_rate();
+        }
+    }
+
+    fn reset_rate(&mut self) {
+        self.sample_rate_hz = 0.0;
+        self.rate_samples = 0;
+        self.rate_window_start = None;
+        self.last_batch = None;
+    }
+
+    pub fn add_batch(&mut self, batch: &[u16]) {
+        if batch.is_empty() {
+            return;
+        }
+        self.expire_idle_rate();
+        self.last_batch = Some(Instant::now());
+        self.rate_samples += batch.len() as u64;
+        let window_start = self.rate_window_start.get_or_insert_with(Instant::now);
+        let elapsed = window_start.elapsed().as_secs_f64();
+        if elapsed >= Self::RATE_WINDOW_SECS {
+            self.sample_rate_hz = self.rate_samples as f64 / elapsed;
+            self.rate_samples = 0;
+            self.rate_window_start = Some(Instant::now());
+        }
+
+        // Free-run samples can't be placed on the time axis until the rate is measured.
+        let rate = match self.configured_rate_hz {
+            Some(rate) => rate,
+            None if self.sample_rate_hz > 0.0 => self.sample_rate_hz,
+            None => return,
+        };
+        let dt = 1.0 / rate;
+        let step = ((rate * self.window_s / Self::MAX_POINTS as f64) as usize).max(1);
+
+        for &sample in batch {
+            let bin = self.pending.get_or_insert(DigitalBin {
+                t: self.last_t,
+                all_high: u16::MAX,
+                any_high: 0,
+                count: 0,
+            });
+            bin.all_high &= sample;
+            bin.any_high |= sample;
+            bin.count += 1;
+            if bin.count >= step {
+                self.bins.push_back(*bin);
+                self.pending = None;
+            }
+            self.last_t += dt;
+        }
+    }
+
+    pub fn cleanup(&mut self, keep_seconds: f64) {
+        let cutoff = self.last_t - keep_seconds;
+        while self.bins.front().is_some_and(|bin| bin.t < cutoff) {
+            self.bins.pop_front();
+        }
+        let excess = self.bins.len().saturating_sub(Self::MEMORY_CAP);
+        self.bins.drain(..excess);
+    }
+
+    /// Return (x_times, y_values) for `channel` (0-8) over the last `window_s` seconds.
+    /// At most 2 × MAX_POINTS entries: a bin where the channel toggled yields both levels.
+    pub fn get_channel_data(&self, channel: usize, window_s: f64) -> (Vec<f64>, Vec<f64>) {
+        let cutoff = self.last_t - window_s;
+        let level = |mask: u16| f64::from((mask >> channel) & 1);
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for bin in self.bins.iter().filter(|bin| bin.t >= cutoff) {
+            let t = bin.t - cutoff;
+            let (low, high) = (level(bin.all_high), level(bin.any_high));
+            if low == high {
+                x.push(t);
+                y.push(low);
+            } else {
+                // Draw the edge starting from the level the line is already at.
+                let from = y.last().copied().unwrap_or(low);
+                x.extend([t, t]);
+                y.extend([from, 1.0 - from]);
+            }
+        }
+        (x, y)
+    }
+}
+
 pub struct PlotArea {
     plot_height: f32,
     colors: Vec<Color32>,
     show_grid: bool,
-    continuous_buffers: std::collections::HashMap<String, ContinuousBuffer>, // Per-device buffers
+    continuous_buffers: std::collections::HashMap<String, ContinuousBuffer>,
+    digital_stream_buffers: std::collections::HashMap<String, DigitalStreamBuffer>,
     width: u32,
 }
 
@@ -129,6 +292,7 @@ impl Default for PlotArea {
             ],
             show_grid: true,
             continuous_buffers: std::collections::HashMap::new(),
+            digital_stream_buffers: std::collections::HashMap::new(),
             width: 1500,
         }
     }
@@ -181,8 +345,10 @@ impl PlotArea {
                             );
                         });
 
-                        // Analog Channel Plot
-                        if device.enabled_channels[0] {
+                        // Analog Channel Plot (not available in Digital Stream mode)
+                        if device.enabled_channels[0]
+                            && device.get_capture_mode() != CaptureModeFlat::DigitalStream
+                        {
                             ui.label(RichText::new("Analog Channel (12-bit)").strong());
                             self.render_analog_plot(ui, device, device_idx);
                         }
@@ -190,8 +356,16 @@ impl PlotArea {
                         // Digital Channels Plot
                         let enabled_digital =
                             device.enabled_channels[1..].iter().any(|&enabled| enabled);
-                        if enabled_digital {
-                            ui.label(RichText::new("Digital Channels").strong());
+                        if enabled_digital
+                            || device.get_capture_mode() == CaptureModeFlat::DigitalStream
+                        {
+                            let label =
+                                if device.get_capture_mode() == CaptureModeFlat::DigitalStream {
+                                    "Digital Stream"
+                                } else {
+                                    "Digital Channels"
+                                };
+                            ui.label(RichText::new(label).strong());
                             self.render_digital_plot(ui, device, device_idx);
                         }
                     });
@@ -256,6 +430,10 @@ impl PlotArea {
                 profiling::scope!("triggered_mode_data");
                 data.get_analog_data()
             }
+            CaptureModeFlat::DigitalStream => {
+                // No analog channel in digital stream mode
+                (vec![], vec![])
+            }
         }
     }
 
@@ -303,7 +481,7 @@ impl PlotArea {
     fn render_digital_plot(
         &mut self,
         ui: &mut egui::Ui,
-        device: &FleaScopeDevice,
+        device: &mut FleaScopeDevice,
         device_idx: usize,
     ) {
         match device.get_capture_mode() {
@@ -320,7 +498,7 @@ impl PlotArea {
                 }
 
                 let plot = Plot::new(format!("digital_plot_{}", device_idx))
-                    .height(self.plot_height * 1.5) // Taller for multiple digital channels
+                    .height(self.plot_height * 1.5)
                     .show_grid(self.show_grid)
                     .auto_bounds([true, true])
                     .allow_zoom(true)
@@ -333,15 +511,12 @@ impl PlotArea {
                         if !device.enabled_channels[ch + 1] {
                             continue;
                         }
-
                         let (x_data, y_data) = data.get_digital_channel_data(ch);
-
                         let filtered_data: Vec<[f64; 2]> = x_data
                             .iter()
                             .zip(y_data.iter())
-                            .map(|(x, y)| [*x, *y + ch as f64 * 1.2]) // Offset each channel vertically
+                            .map(|(x, y)| [*x, *y + ch as f64 * 1.2])
                             .collect();
-
                         if !filtered_data.is_empty() {
                             let filtered_points = PlotPoints::from(filtered_data);
                             let color_idx = (ch + 1) % self.colors.len();
@@ -349,6 +524,76 @@ impl PlotArea {
                                 .color(self.colors[color_idx])
                                 .width(1.5);
                             plot_ui.line(line);
+                        }
+                    }
+                });
+            }
+            CaptureModeFlat::DigitalStream => {
+                let buffer = self
+                    .digital_stream_buffers
+                    .entry(device.name.clone())
+                    .or_insert_with(DigitalStreamBuffer::new);
+
+                let window_s = device.get_digital_stream_buffer_window_s();
+                // Sync rate and window before draining so step is correct for
+                // this frame's batches.
+                buffer.set_configured_us_per_sample(device.get_digital_stream_sample_interval_us());
+                buffer.set_window_s(window_s);
+
+                while let Ok(batch) = device.digital_batch_rx.try_recv() {
+                    buffer.add_batch(&batch);
+                }
+                buffer.cleanup(window_s * 2.0);
+                buffer.expire_idle_rate();
+
+                // Propagate the live rate estimate so the control panel can display it.
+                device.measured_digital_sample_rate_hz = buffer.sample_rate_hz;
+
+                let mask = device.get_digital_stream_channel_mask();
+                let has_data =
+                    (0..9).any(|ch| (mask >> ch) & 1 != 0 && device.enabled_channels[ch + 1]);
+
+                if !has_data {
+                    ui.label("No active channels");
+                    return;
+                }
+
+                let plot = Plot::new(format!("digital_stream_plot_{}", device_idx))
+                    .height(self.plot_height * 1.5)
+                    .show_grid(self.show_grid)
+                    .auto_bounds([true, true])
+                    .allow_zoom(true)
+                    .allow_drag(true)
+                    .allow_scroll(false)
+                    .y_axis_min_width(40.0);
+
+                // Snapshot data outside the closure to avoid borrow conflict
+                let channel_data: Vec<Option<(Vec<f64>, Vec<f64>)>> = (0..9)
+                    .map(|ch| {
+                        if (mask >> ch) & 1 == 0 || !device.enabled_channels[ch + 1] {
+                            return None;
+                        }
+                        Some(buffer.get_channel_data(ch, window_s))
+                    })
+                    .collect();
+
+                let colors = self.colors.clone();
+                plot.show(ui, |plot_ui| {
+                    for (ch, data_opt) in channel_data.into_iter().enumerate() {
+                        if let Some((x_data, y_data)) = data_opt {
+                            let filtered_data: Vec<[f64; 2]> = x_data
+                                .iter()
+                                .zip(y_data.iter())
+                                .map(|(x, y)| [*x, *y + ch as f64 * 1.2])
+                                .collect();
+                            if !filtered_data.is_empty() {
+                                let filtered_points = PlotPoints::from(filtered_data);
+                                let color_idx = (ch + 1) % colors.len();
+                                let line = Line::new(format!("D{}", ch), filtered_points)
+                                    .color(colors[color_idx])
+                                    .width(1.5);
+                                plot_ui.line(line);
+                            }
                         }
                     }
                 });
@@ -389,5 +634,36 @@ mod tests {
         assert_eq!(times.len(), 98);
         assert!(times.windows(2).all(|w| w[0] < w[1]));
         assert!(values.iter().all(|&v| (v - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn digital_decimation_keeps_single_sample_pulse() {
+        // 100 kHz over 1 s: 48 samples per bin, fed in 56-sample packets.
+        let mut buf = DigitalStreamBuffer::new();
+        buf.set_configured_us_per_sample(10);
+        let mut samples = vec![0u16; 560];
+        samples[200] = 0b1; // one-sample pulse on D0, inside the 5th bin
+        for packet in samples.chunks(56) {
+            buf.add_batch(packet);
+        }
+
+        let (times, d0) = buf.get_channel_data(0, 1.0);
+        let (_, d1) = buf.get_channel_data(1, 1.0);
+
+        // Bins span packets evenly: 560 / 48 = 11 full bins, the pulse bin drawn as an edge.
+        assert_eq!(times.len(), 12);
+        assert_eq!(d0.iter().filter(|&&v| v > 0.5).count(), 1);
+        assert_eq!(d1.len(), 11);
+        assert!(d1.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn free_run_digital_samples_wait_for_a_measured_rate() {
+        let mut buf = DigitalStreamBuffer::new();
+        buf.set_configured_us_per_sample(0);
+        buf.add_batch(&[0b1; 56]);
+
+        assert!(buf.sample_rate_hz == 0.0, "no rate is known yet");
+        assert!(buf.get_channel_data(0, 1.0).0.is_empty());
     }
 }

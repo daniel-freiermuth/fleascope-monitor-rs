@@ -14,6 +14,9 @@ use crate::{
 // Time frame constants for consistent validation
 pub const MIN_TIME_FRAME: f64 = 0.000122; // 122μs
 pub const MAX_TIME_FRAME: f64 = 3.49; // 3.49s
+/// Longest digital-stream sample interval the firmware honours: its timer clamps
+/// anything slower to ~114 Hz (see `IdleFleaScope::compute_n_samples_per_packet`).
+pub const MAX_DIGITAL_US_PER_SAMPLE: u32 = 8738;
 
 #[derive(Default)]
 pub struct DeviceManager {
@@ -50,6 +53,8 @@ impl DeviceManager {
         // Create continuous batch streaming channel (bounded to prevent unbounded memory growth
         // when UI rendering falls behind the capture rate)
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<f64>>(128);
+        // Digital packets hold only a few dozen samples, so allow many more in flight.
+        let (digital_batch_tx, digital_batch_rx) = tokio::sync::mpsc::channel::<Vec<u16>>(1024);
 
         let (status_tx, status_rx) = watch::channel(WorkerStatus {
             running: true,
@@ -73,6 +78,7 @@ impl DeviceManager {
             x10,
             waveform_rx, // Channel for waveform configuration
             batch_tx,
+            digital_batch_tx,
             device_present: Box::new(move || port_attached(&port)),
         };
 
@@ -87,6 +93,7 @@ impl DeviceManager {
             waveform_tx,
             initial_waveform,
             batch_rx,
+            digital_batch_rx,
         );
         let _handle = tokio::spawn(async move { worker.run(scope).await });
 
@@ -123,6 +130,10 @@ pub enum CaptureMode {
         time_frame: f64,
     },
     Continuous {},
+    DigitalStream {
+        channel_mask: u16,
+        us_per_sample: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
