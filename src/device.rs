@@ -38,6 +38,7 @@ impl DeviceManager {
 
         // Create continuous batch streaming channel
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f64>>();
+        let (digital_batch_tx, digital_batch_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u16>>();
 
         let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
             x_values: Vec::new(),
@@ -58,6 +59,7 @@ impl DeviceManager {
             waveform_rx, // Channel for waveform configuration
             running: true,
             batch_tx,
+            digital_batch_tx,
         };
 
         let device = FleaScopeDevice::new(
@@ -70,6 +72,7 @@ impl DeviceManager {
             waveform_tx,
             initial_waveform,
             batch_rx,
+            digital_batch_rx,
         );
         let _handle = tokio::spawn(async move {
             if let Err(e) = worker.run(scope).await {
@@ -106,6 +109,10 @@ pub enum CaptureMode {
         time_frame: f64,
     },
     Continuous {},
+    DigitalStream {
+        channel_mask: u16,
+        us_per_sample: u32,
+    },
 }
 
 #[derive(Debug, Clone)]

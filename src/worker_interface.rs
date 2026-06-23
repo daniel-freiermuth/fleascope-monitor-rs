@@ -19,10 +19,11 @@ pub struct ContinuousCaptureConfig {
     pub buffer_time: f64,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum CaptureModeFlat {
     Triggered,
     Continuous,
+    DigitalStream,
 }
 
 pub struct FleaScopeDevice {
@@ -36,9 +37,15 @@ pub struct FleaScopeDevice {
     pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results
     waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
     pub batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f64>>, // Channel for continuous batches
+    pub digital_batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u16>>, // Channel for digital-stream batches
     triggered_config: TriggeredCaptureConfig,
     continuous_config: ContinuousCaptureConfig,
     capture_mode: CaptureModeFlat,
+    digital_stream_channel_mask: u16,
+    digital_stream_sample_interval_us: u32,
+    digital_stream_buffer_window_s: f64,
+    /// Live sample rate measured from batch arrival timing; updated by the plot area.
+    pub measured_digital_sample_rate_hz: f64,
     pub wrap: bool,
 }
 
@@ -53,6 +60,7 @@ impl FleaScopeDevice {
         waveform_tx: Sender<WaveformConfig>,
         initial_waveform: WaveformConfig,
         batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f64>>,
+        digital_batch_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u16>>,
     ) -> Self {
         let mut triggered_config = TriggeredCaptureConfig {
             time_frame: 0.1,
@@ -69,6 +77,7 @@ impl FleaScopeDevice {
                 CaptureModeFlat::Triggered
             }
             CaptureMode::Continuous {} => CaptureModeFlat::Continuous,
+            CaptureMode::DigitalStream { .. } => CaptureModeFlat::DigitalStream,
         };
         Self {
             name,
@@ -77,6 +86,10 @@ impl FleaScopeDevice {
             triggered_config,
             continuous_config,
             capture_mode: mode,
+            digital_stream_channel_mask: 0x1ff, // all channels by default
+            digital_stream_sample_interval_us: 10, // 100 ksps default
+            digital_stream_buffer_window_s: 1.0,   // 1 s window default
+            measured_digital_sample_rate_hz: 0.0,
             probe_multiplier: initial_config.probe_multiplier,
             waveform_config: initial_waveform,
             config_change_tx,
@@ -84,6 +97,7 @@ impl FleaScopeDevice {
             notification_rx,
             waveform_tx,
             batch_rx,
+            digital_batch_rx,
             wrap: true,
         }
     }
@@ -96,6 +110,10 @@ impl FleaScopeDevice {
                 time_frame: self.triggered_config.time_frame,
             },
             CaptureModeFlat::Continuous => CaptureMode::Continuous {},
+            CaptureModeFlat::DigitalStream => CaptureMode::DigitalStream {
+                channel_mask: self.digital_stream_channel_mask,
+                us_per_sample: self.digital_stream_sample_interval_us,
+            },
         };
         self.config_change_tx
             .send(CaptureConfig {
@@ -184,6 +202,36 @@ impl FleaScopeDevice {
         // Clamp time frame to valid range: 122μs to 3.49s
         self.triggered_config.time_frame = time_frame.clamp(MIN_TIME_FRAME, MAX_TIME_FRAME);
         self.signal_config_change();
+    }
+
+    pub fn get_digital_stream_channel_mask(&self) -> u16 {
+        self.digital_stream_channel_mask
+    }
+
+    pub fn set_digital_stream_channel_mask(&mut self, mask: u16) {
+        self.digital_stream_channel_mask = mask & 0x1ff;
+        if self.capture_mode == CaptureModeFlat::DigitalStream {
+            self.signal_config_change();
+        }
+    }
+
+    pub fn get_digital_stream_sample_interval_us(&self) -> u32 {
+        self.digital_stream_sample_interval_us
+    }
+
+    pub fn set_digital_stream_sample_interval_us(&mut self, us: u32) {
+        self.digital_stream_sample_interval_us = us;
+        if self.capture_mode == CaptureModeFlat::DigitalStream {
+            self.signal_config_change();
+        }
+    }
+
+    pub fn get_digital_stream_buffer_window_s(&self) -> f64 {
+        self.digital_stream_buffer_window_s
+    }
+
+    pub fn get_mut_digital_stream_buffer_window_s(&mut self) -> &mut f64 {
+        &mut self.digital_stream_buffer_window_s
     }
 
     /// Send 0V calibration command (non-blocking)

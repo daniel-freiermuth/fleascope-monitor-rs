@@ -29,6 +29,7 @@ pub struct FleaWorker {
     pub x10: FleaProbe,
     pub running: bool,
     pub batch_tx: tokio::sync::mpsc::UnboundedSender<Vec<f64>>,
+    pub digital_batch_tx: tokio::sync::mpsc::UnboundedSender<Vec<u16>>,
 }
 
 impl FleaWorker {
@@ -257,6 +258,11 @@ impl FleaWorker {
                 CaptureMode::Continuous {} => {
                     fleascope = self
                         .handle_continuous_capture(capture_config.probe_multiplier, fleascope)
+                        .await;
+                }
+                CaptureMode::DigitalStream { channel_mask, us_per_sample } => {
+                    fleascope = self
+                        .handle_digital_stream_capture(channel_mask, us_per_sample, fleascope)
                         .await;
                 }
             }
@@ -493,6 +499,44 @@ impl FleaWorker {
                 BUFF_SIZE as f64 / (now - start_time).as_secs_f64()
             );
             start_time = now;
+        }
+    }
+
+    async fn handle_digital_stream_capture(
+        &mut self,
+        channel_mask: u16,
+        us_per_sample: u32,
+        fleascope: IdleFleaScope,
+    ) -> IdleFleaScope {
+        let n_samples = IdleFleaScope::compute_n_samples_per_packet(channel_mask, us_per_sample);
+        let mut streaming_scope = fleascope.digital_stream(channel_mask, us_per_sample, n_samples);
+        loop {
+            let batch_result = {
+                profiling::scope!("read_digital_packet");
+                streaming_scope.read_packet()
+            };
+
+            // Yield so the egui render task can run between reads.
+            tokio::task::yield_now().await;
+
+            match batch_result {
+                Ok(bitmasks) => {
+                    {
+                        profiling::scope!("send_digital_batch_channel");
+                        if self.digital_batch_tx.send(bitmasks).is_err() {
+                            tracing::warn!("Failed to send digital batch - receiver dropped");
+                        }
+                    }
+                    if self.check_settings_changed() {
+                        return streaming_scope.stop();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error reading from digital stream: {}", e);
+                    self.set_lost_connection().await;
+                    return streaming_scope.stop();
+                }
+            }
         }
     }
 

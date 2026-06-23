@@ -1253,43 +1253,42 @@ impl ControlPanel {
             );
 
             // Get current mode for radio buttons
-            let is_triggered = matches!(device.get_capture_mode(), CaptureModeFlat::Triggered);
+            let current_mode = device.get_capture_mode();
+            let is_triggered = current_mode == CaptureModeFlat::Triggered;
+            let is_continuous = current_mode == CaptureModeFlat::Continuous;
+            let is_digital_stream = current_mode == CaptureModeFlat::DigitalStream;
 
             ui.add_space(10.0);
 
-            // Triggered mode radio button
             let triggered_response = ui.selectable_label(
                 is_triggered,
-                RichText::new("⚡ TRIGGERED")
-                    .size(7.0)
-                    .color(if is_triggered {
-                        Color32::YELLOW
-                    } else {
-                        Color32::GRAY
-                    }),
+                RichText::new("⚡ TRIGGERED").size(7.0).color(
+                    if is_triggered { Color32::YELLOW } else { Color32::GRAY },
+                ),
             );
-
             ui.add_space(5.0);
-
-            // Continuous mode radio button
             let continuous_response = ui.selectable_label(
-                !is_triggered,
-                RichText::new("🌊 CONTINUOUS")
-                    .size(7.0)
-                    .color(if !is_triggered {
-                        Color32::YELLOW
-                    } else {
-                        Color32::GRAY
-                    }),
+                is_continuous,
+                RichText::new("🌊 CONTINUOUS").size(7.0).color(
+                    if is_continuous { Color32::YELLOW } else { Color32::GRAY },
+                ),
+            );
+            ui.add_space(5.0);
+            let digi_response = ui.selectable_label(
+                is_digital_stream,
+                RichText::new("🔢 DIGI STREAM").size(7.0).color(
+                    if is_digital_stream { Color32::YELLOW } else { Color32::GRAY },
+                ),
             );
 
-            // Handle mode changes
             if triggered_response.clicked() && !is_triggered {
                 device.set_capture_mode(CaptureModeFlat::Triggered);
             }
-
-            if continuous_response.clicked() && is_triggered {
+            if continuous_response.clicked() && !is_continuous {
                 device.set_capture_mode(CaptureModeFlat::Continuous);
+            }
+            if digi_response.clicked() && !is_digital_stream {
+                device.set_capture_mode(CaptureModeFlat::DigitalStream);
             }
         });
 
@@ -1340,26 +1339,19 @@ impl ControlPanel {
                             .strong()
                             .color(Color32::LIGHT_BLUE),
                     );
-
                     ui.add_space(5.0);
-
                     if ui
                         .add_sized(
                             [30.0, 22.0],
                             egui::Button::new(RichText::new("Loop").size(8.0).color(
-                                if device.wrap {
-                                    Color32::GREEN
-                                } else {
-                                    Color32::RED
-                                },
+                                if device.wrap { Color32::GREEN } else { Color32::RED },
                             )),
                         )
                         .clicked()
                     {
                         device.wrap = !device.wrap;
                     }
-
-                    let buffer_response = ui.add(
+                    ui.add(
                         egui::Slider::new(&mut *device.get_mut_buffer_time_handle(), 0.001..=10.0)
                             .logarithmic(true)
                             .custom_formatter(|n, _| {
@@ -1371,6 +1363,119 @@ impl ControlPanel {
                             }),
                     );
                 });
+            }
+            CaptureModeFlat::DigitalStream => {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("CHANNEL MASK")
+                        .size(8.0)
+                        .strong()
+                        .color(Color32::LIGHT_BLUE),
+                );
+                ui.add_space(2.0);
+                // Per-channel checkboxes that build the bitmask
+                let mut mask = device.get_digital_stream_channel_mask();
+                let mut changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    for ch in 0..9 {
+                        let bit = 1u16 << ch;
+                        let mut on = (mask & bit) != 0;
+                        let resp = ui.add_sized(
+                            [30.0, 18.0],
+                            egui::Button::new(
+                                RichText::new(format!("b{}", ch)).size(7.0).color(
+                                    if on { Color32::GREEN } else { Color32::DARK_GRAY },
+                                ),
+                            ),
+                        );
+                        if resp.clicked() {
+                            on = !on;
+                            if on { mask |= bit; } else { mask &= !bit; }
+                            changed = true;
+                        }
+                    }
+                });
+                if changed && mask != 0 {
+                    device.set_digital_stream_channel_mask(mask);
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("mask: 0x{:03x}  ({} ch)", mask, mask.count_ones()))
+                            .size(7.0)
+                            .color(Color32::LIGHT_GRAY)
+                            .family(egui::FontFamily::Monospace),
+                    );
+                });
+
+                // Sample rate slider (us per sample; 0 = maximum rate)
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("SAMPLE RATE")
+                        .size(8.0)
+                        .strong()
+                        .color(Color32::LIGHT_BLUE),
+                );
+                let mut us = device.get_digital_stream_sample_interval_us();
+                let rate_response = ui.add(
+                    egui::Slider::new(&mut us, 0u32..=100_000u32)
+                        .logarithmic(true)
+                        .custom_formatter(|n, _| {
+                            let n = n as u32;
+                            if n == 0 {
+                                "MAX".to_string()
+                            } else if n < 1000 {
+                                format!("{:.0}μs  ({:.0}ksps)", n, 1000.0 / n as f64)
+                            } else {
+                                format!("{:.1}ms  ({:.0}sps)", n as f64 / 1000.0, 1_000_000.0 / n as f64)
+                            }
+                        }),
+                );
+                if rate_response.changed() {
+                    device.set_digital_stream_sample_interval_us(us);
+                }
+
+                // Live measured rate (updated from batch timing in the plot area).
+                let hz = device.measured_digital_sample_rate_hz;
+                let rate_str = if hz <= 0.0 {
+                    "—".to_string()
+                } else if hz >= 1_000_000.0 {
+                    format!("{:.2} Msps", hz / 1_000_000.0)
+                } else if hz >= 1_000.0 {
+                    format!("{:.1} ksps", hz / 1_000.0)
+                } else {
+                    format!("{:.0} sps", hz)
+                };
+                ui.label(
+                    RichText::new(format!("measured: {}", rate_str))
+                        .size(7.0)
+                        .color(Color32::LIGHT_GREEN)
+                        .family(egui::FontFamily::Monospace),
+                );
+
+                // Buffer window slider (how much history to show in the plot).
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("WINDOW")
+                        .size(8.0)
+                        .strong()
+                        .color(Color32::LIGHT_BLUE),
+                );
+                let window_response = ui.add(
+                    egui::Slider::new(
+                        device.get_mut_digital_stream_buffer_window_s(),
+                        0.01_f64..=30.0_f64,
+                    )
+                    .logarithmic(true)
+                    .custom_formatter(|n, _| {
+                        if n >= 1.0 {
+                            format!("{:.2} s", n)
+                        } else {
+                            format!("{:.0} ms", n * 1000.0)
+                        }
+                    }),
+                );
+                let _ = window_response; // slider edits the handle directly
             }
         }
     }
