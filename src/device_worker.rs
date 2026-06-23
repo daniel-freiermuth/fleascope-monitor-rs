@@ -117,16 +117,18 @@ impl FleaWorker {
                 {
                     Ok(_) => self
                         .notification_tx
-                        .blocking_send(Notification::Success(
+                        .send(Notification::Success(
                             "Calibration saved successfully".to_string(),
                         ))
+                        .await
                         .expect("Failed to send calibration save success"),
                     Err(e) => self
                         .notification_tx
-                        .blocking_send(Notification::Error(format!(
+                        .send(Notification::Error(format!(
                             "Failed to save calibration: {}",
                             e
                         )))
+                        .await
                         .expect("Failed to send calibration save error"),
                 }
             }
