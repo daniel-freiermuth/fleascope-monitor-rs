@@ -49,6 +49,7 @@ pub struct FleaWorker {
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub batch_tx: tokio::sync::mpsc::Sender<Vec<f64>>,
+    pub digital_batch_tx: tokio::sync::mpsc::Sender<Vec<u16>>,
     /// Whether the device is still attached. Nothing touches the port while paused, and
     /// every fleascope-rs call on an unplugged port panics, so the pause polls this.
     pub device_present: Box<dyn Fn() -> bool + Send + Sync>,
@@ -272,6 +273,13 @@ impl FleaWorker {
                 }
                 CaptureMode::Continuous {} => {
                     self.handle_continuous_capture(capture_config.probe_multiplier, fleascope)
+                        .await
+                }
+                CaptureMode::DigitalStream {
+                    channel_mask,
+                    us_per_sample,
+                } => {
+                    self.handle_digital_stream_capture(channel_mask, us_per_sample, fleascope)
                         .await
                 }
             };
@@ -588,6 +596,72 @@ impl FleaWorker {
         }
     }
 
+    /// Returns `Err` only when the connection is lost; the scope is dropped then.
+    async fn handle_digital_stream_capture(
+        &mut self,
+        channel_mask: u16,
+        us_per_sample: u32,
+        fleascope: IdleFleaScope,
+    ) -> Result<IdleFleaScope> {
+        let n_samples = IdleFleaScope::compute_n_samples_per_packet(channel_mask, us_per_sample);
+        let mut streaming_scope =
+            match fleascope.digital_stream(channel_mask, us_per_sample, n_samples) {
+                Ok(streaming_scope) => streaming_scope,
+                Err((scope, CaptureConfigError::SerialTerminal(e))) => {
+                    return self
+                        .start_failed("digital stream", scope, e.into(), true)
+                        .await;
+                }
+                // E.g. firmware too old.
+                Err((scope, e)) => {
+                    return self
+                        .start_failed("digital stream", scope, e.into(), false)
+                        .await;
+                }
+            };
+        loop {
+            let batch_result = {
+                profiling::scope!("read_digital_packet");
+                streaming_scope.read_packet()
+            };
+
+            // Yield so the egui render task can run between reads.
+            tokio::task::yield_now().await;
+
+            match batch_result {
+                Ok(bitmasks) => {
+                    self.mark_connected();
+                    {
+                        profiling::scope!("send_digital_batch_channel");
+                        match self.digital_batch_tx.try_send(bitmasks) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!("Digital batch channel full - dropping batch (UI not draining fast enough)");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!("Failed to send digital batch - receiver dropped");
+                            }
+                        }
+                    }
+                    if self.check_settings_changed() {
+                        return self.stopped(streaming_scope.stop()).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error reading from digital stream: {}", e);
+                    self.set_lost_connection().await;
+                    // A timeout leaves the port usable, so hand the stopped scope back.
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        if let Ok(scope) = streaming_scope.stop() {
+                            return Ok(scope);
+                        }
+                    }
+                    return Err(Error::new(e).context("Connection lost during digital stream"));
+                }
+            }
+        }
+    }
+
     fn reading_to_data_points(
         reading: &ScopeReading,
         probe: &FleaProbe,
@@ -624,6 +698,7 @@ mod tests {
         let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
         let (_waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
         let (batch_tx, _batch_rx) = tokio::sync::mpsc::channel(1);
+        let (digital_batch_tx, _digital_batch_rx) = tokio::sync::mpsc::channel(1);
         let (status_tx, status_rx) = watch::channel(WorkerStatus {
             running: true,
             connected: true,
@@ -643,6 +718,7 @@ mod tests {
             x1: FleaProbe::new(ProbeType::X1),
             x10: FleaProbe::new(ProbeType::X10),
             batch_tx,
+            digital_batch_tx,
             device_present: Box::new(|| true),
         };
         (worker, status_rx)
