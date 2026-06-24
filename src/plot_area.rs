@@ -175,47 +175,54 @@ impl ContinuousBuffer {
         (time, bnc)
     }
 }
-
-/// Rolling buffer for digital-stream samples.  Each entry is a (timestamp, bitmask) pair.
-/// Sample rate is estimated using a 0.5 s windowed counter so that draining
-/// multiple batches in the same render frame does not produce a near-zero
-/// elapsed time and a false Msps reading.
+/// RLE-compressed rolling buffer for digital-stream samples.
+///
+/// Consecutive samples with the same bitmask are merged into a single run
+/// entry (start_time, mask).  For typical digital protocol signals this gives
+/// orders-of-magnitude compression over per-sample storage.
+///
+/// Range queries use binary search on the sorted run timestamps for
+/// O(log n) range-start discovery, then O(k) scan over k visible runs.
+///
+/// `get_step_waveform` performs full OR/AND min-max reduction per pixel column
+/// so transitions are never missed regardless of zoom level.
 pub struct DigitalStreamBuffer {
-    samples: VecDeque<(f64, u16)>,
-    last_t: f64,
-    /// Estimated samples / second (from windowed counter).
+    /// Start time of each run — SoA layout for cache-efficient binary search.
+    run_t: VecDeque<f64>,
+    /// Bitmask constant for each run (ends just before the next run starts).
+    run_mask: VecDeque<u16>,
+    /// Exclusive end of the last run (time after the last sample processed).
+    pub last_t: f64,
+    /// Windowed sample-rate estimate (samples/s, updated every 0.5 s).
     pub sample_rate_hz: f64,
-    /// Exact rate from the FW config; `None` for free-run (us_per_sample == 0).
     configured_rate_hz: Option<f64>,
-    /// Display window in seconds; kept in sync from the plot arm each frame.
-    window_s: f64,
-    /// Accumulated sample count since the rate window opened.
+    /// Maximum number of runs to retain (controls memory usage).
+    max_runs: usize,
     rate_samples: u64,
-    /// When the current rate-measurement window opened.
     rate_window_start: Option<Instant>,
 }
 
+/// 10 bytes per run in SoA layout (8 for f64 + 2 for u16, no padding waste).
+pub const BYTES_PER_RUN: usize = 10;
+
 impl DigitalStreamBuffer {
     const RATE_WINDOW_SECS: f64 = 0.5;
-    /// Target display density: MAX_POINTS stored samples per window_s.
-    /// Step downsampling aims at this; it can't go below 1 sample per batch,
-    /// so at very high rates the actual density may be higher.
-    const MAX_POINTS: usize = 2048;
-    /// Memory safety cap: 65 536 × 10 bytes ≈ 640 KB.
-    /// At 1 Msps (488-sample batches → 2049 batches/s) this gives ~32 s max history.
-    /// At 4.5 Msps (9221 batches/s) → ~7 s.  Always >> 2 × MAX_POINTS.
-    const MEMORY_CAP: usize = 65_536;
 
-    pub fn new() -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
-            samples: VecDeque::new(),
+            run_t: VecDeque::new(),
+            run_mask: VecDeque::new(),
             last_t: 0.0,
             sample_rate_hz: 10_000.0,
             configured_rate_hz: None,
-            window_s: 1.0,
+            max_runs: (max_bytes / BYTES_PER_RUN).max(16),
             rate_samples: 0,
             rate_window_start: None,
         }
+    }
+
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_runs = (max_bytes / BYTES_PER_RUN).max(16);
     }
 
     pub fn set_configured_us_per_sample(&mut self, us: u32) {
@@ -226,15 +233,21 @@ impl DigitalStreamBuffer {
         };
     }
 
-    pub fn set_window_s(&mut self, window_s: f64) {
-        self.window_s = window_s.max(0.001);
+    /// Number of runs currently stored.
+    pub fn run_count(&self) -> usize {
+        self.run_t.len()
+    }
+
+    /// Approximate bytes used by the run storage.
+    pub fn bytes_used(&self) -> usize {
+        self.run_t.len() * BYTES_PER_RUN
     }
 
     pub fn add_batch(&mut self, batch: Vec<u16>) {
         if !batch.is_empty() {
             self.rate_samples += batch.len() as u64;
-            let window_start = self.rate_window_start.get_or_insert_with(Instant::now);
-            let elapsed = window_start.elapsed().as_secs_f64();
+            let ws = self.rate_window_start.get_or_insert_with(Instant::now);
+            let elapsed = ws.elapsed().as_secs_f64();
             if elapsed >= Self::RATE_WINDOW_SECS {
                 self.sample_rate_hz = self.rate_samples as f64 / elapsed;
                 self.rate_samples = 0;
@@ -246,46 +259,150 @@ impl DigitalStreamBuffer {
             .unwrap_or(self.sample_rate_hz)
             .max(1.0);
 
-        // Store at most MAX_POINTS samples per window_s.  Step is derived
-        // from the effective rate so the displayed density is constant
-        // regardless of sample rate — and the hard cap below never fires.
-        let rate = self.configured_rate_hz.unwrap_or(self.sample_rate_hz).max(1.0);
-        let step = ((rate * self.window_s / Self::MAX_POINTS as f64) as usize).max(1);
-
-        for (i, &sample) in batch.iter().enumerate() {
-            if i % step == 0 {
-                self.samples.push_back((self.last_t, sample));
+        for &sample in &batch {
+            // RLE: only start a new run when the mask changes.
+            match self.run_mask.back() {
+                Some(&last) if last == sample => {}
+                _ => {
+                    self.run_t.push_back(self.last_t);
+                    self.run_mask.push_back(sample);
+                }
             }
             self.last_t += dt;
         }
     }
 
+    /// Remove runs that have fully expired and enforce the memory cap.
     pub fn cleanup(&mut self, keep_seconds: f64) {
         let cutoff = self.last_t - keep_seconds;
-        while self.samples.front().map(|&(t, _)| t < cutoff).unwrap_or(false) {
-            self.samples.pop_front();
+        // A run ends at the start of the next run, so remove run[i] when
+        // run_t[i+1] <= cutoff (run[i] is entirely before the cutoff).
+        while self.run_t.len() >= 2 && self.run_t[1] <= cutoff {
+            self.run_t.pop_front();
+            self.run_mask.pop_front();
         }
-        // Memory safety cap — only fires when step can't reduce below 1 sample/batch
-        // (i.e. sample_rate × window / MAX_POINTS > batch_size).
-        // Sized so 1 Msps gives ≥ 32 s and 4.5 Msps gives ≥ 7 s.
-        while self.samples.len() > Self::MEMORY_CAP {
-            self.samples.pop_front();
+        // Memory cap.
+        while self.run_t.len() > self.max_runs {
+            self.run_t.pop_front();
+            self.run_mask.pop_front();
         }
     }
 
-    /// Return (x_times, y_values) for `channel` (0-8) over the last `window_s` seconds.
-    /// At most MAX_POINTS entries → O(MAX_POINTS) regardless of sample rate.
-    pub fn get_channel_data(&self, channel: usize, window_s: f64) -> (Vec<f64>, Vec<f64>) {
-        let cutoff = self.last_t - window_s;
-        let mut x = Vec::new();
-        let mut y = Vec::new();
-        for &(t, mask) in &self.samples {
-            if t >= cutoff {
-                x.push(t - (self.last_t - window_s));
-                y.push(if (mask >> channel) & 1 != 0 { 1.0 } else { 0.0 });
+    /// Binary search: index of the last run whose start ≤ t.
+    fn find_run_at_or_before(&self, t: f64) -> Option<usize> {
+        let n = self.run_t.len();
+        if n == 0 { return None; }
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.run_t[mid] <= t { lo = mid + 1; } else { hi = mid; }
+        }
+        if lo > 0 { Some(lo - 1) } else { None }
+    }
+
+    /// Build a step waveform with full min-max OR/AND reduction per pixel column.
+    ///
+    /// Returns egui_plot points ready for `PlotPoints::from`.  Transitions that
+    /// occur within a single pixel column produce a vertical segment (same x,
+    /// two y values) so no edge is ever silently dropped.
+    ///
+    /// `y_offset` stacks channels vertically (pass `ch as f64 * 1.2`).
+    pub fn get_step_waveform(
+        &self,
+        channel: usize,
+        x_min: f64,
+        x_max: f64,
+        n_pixels: usize,
+        y_offset: f64,
+    ) -> Vec<[f64; 2]> {
+        if n_pixels == 0 || x_max <= x_min || self.run_t.is_empty() {
+            return vec![];
+        }
+
+        let px_w = (x_max - x_min) / n_pixels as f64;
+
+        // Find the run active at x_min (its mask is the initial display state).
+        let start_idx = self.find_run_at_or_before(x_min).unwrap_or(0);
+        let initial_mask = self.run_mask[start_idx];
+
+        // Per-pixel OR/AND accumulators.
+        let mut ever_high = vec![false; n_pixels];
+        let mut ever_low  = vec![false; n_pixels];
+        let mut has_data  = vec![false; n_pixels];
+
+        let n_runs = self.run_t.len();
+        let mut i = start_idx;
+        while i < n_runs {
+            let t_start = self.run_t[i];
+            if t_start > x_max { break; }
+            let t_end = if i + 1 < n_runs { self.run_t[i + 1] } else { self.last_t };
+            let mask  = self.run_mask[i];
+            let bit   = (mask >> channel) & 1 != 0;
+
+            // Clip the run to [x_min, x_max] and map to pixel columns.
+            let t_lo = t_start.max(x_min);
+            let t_hi = t_end.min(x_max);
+            if t_lo < t_hi {
+                let px_lo = ((t_lo - x_min) / px_w).floor() as usize;
+                let px_hi = ((t_hi - x_min) / px_w).ceil()  as usize;
+                let px_lo = px_lo.min(n_pixels - 1);
+                let px_hi = px_hi.min(n_pixels);
+                for px in px_lo..px_hi {
+                    has_data[px] = true;
+                    if bit { ever_high[px] = true; } else { ever_low[px] = true; }
+                }
+            }
+            i += 1;
+        }
+
+        // Build the step-function polyline.
+        // Transition columns emit two points at the same x (vertical segment).
+        let mut points: Vec<[f64; 2]> = Vec::new();
+        let mut cur_y = if (initial_mask >> channel) & 1 != 0 { 1.0f64 } else { 0.0 };
+        let mut active = false;
+
+        for px in 0..n_pixels {
+            if !has_data[px] { continue; }
+            let x = x_min + (px as f64 + 0.5) * px_w;
+
+            match (ever_high[px], ever_low[px]) {
+                (true, false) => {
+                    if !active || cur_y != 1.0 {
+                        if active { points.push([x, cur_y + y_offset]); }
+                        points.push([x, 1.0 + y_offset]);
+                        cur_y = 1.0; active = true;
+                    } else {
+                        points.push([x, 1.0 + y_offset]);
+                    }
+                }
+                (false, true) => {
+                    if !active || cur_y != 0.0 {
+                        if active { points.push([x, cur_y + y_offset]); }
+                        points.push([x, 0.0 + y_offset]);
+                        cur_y = 0.0; active = true;
+                    } else {
+                        points.push([x, 0.0 + y_offset]);
+                    }
+                }
+                (true, true) => {
+                    // Sub-pixel transition: draw vertical segment, toggle state.
+                    let new_y = 1.0 - cur_y;
+                    if active {
+                        points.push([x, cur_y + y_offset]);
+                        points.push([x, new_y + y_offset]);
+                    } else {
+                        // Direction unknown — show full vertical span.
+                        points.push([x, 0.0 + y_offset]);
+                        points.push([x, 1.0 + y_offset]);
+                    }
+                    cur_y = new_y;
+                    active = true;
+                }
+                (false, false) => {}
             }
         }
-        (x, y)
+        points
     }
 }
 
@@ -554,76 +671,98 @@ impl PlotArea {
                 });
             }
             CaptureModeFlat::DigitalStream => {
+                let max_bytes = device.get_digital_stream_memory_bytes();
                 let buffer = self
                     .digital_stream_buffers
                     .entry(device.name.clone())
-                    .or_insert_with(DigitalStreamBuffer::new);
+                    .or_insert_with(|| DigitalStreamBuffer::new(max_bytes));
 
-                let window_s = device.get_digital_stream_buffer_window_s();
-                // Sync rate and window before draining so step is correct for
-                // this frame's batches.
+                // Sync memory cap (user may have changed the slider).
+                buffer.set_max_bytes(max_bytes);
                 buffer.set_configured_us_per_sample(
                     device.get_digital_stream_sample_interval_us(),
                 );
-                buffer.set_window_s(window_s);
 
                 while let Ok(batch) = device.digital_batch_rx.try_recv() {
                     buffer.add_batch(batch);
                 }
+                let window_s = device.get_digital_stream_buffer_window_s();
                 buffer.cleanup(window_s * 2.0);
 
-                // Propagate the live rate estimate so the control panel can display it.
                 device.measured_digital_sample_rate_hz = buffer.sample_rate_hz;
+                device.digital_stream_bytes_used = buffer.bytes_used();
 
-                let mask = device.get_digital_stream_channel_mask();
-                let has_data = (0..9).any(|ch| {
-                    (mask >> ch) & 1 != 0 && device.enabled_channels[ch + 1]
-                });
+                let mask     = device.get_digital_stream_channel_mask();
+                let enabled  = device.enabled_channels;
+                let last_t   = buffer.last_t;
+                let n_active = (0..9usize).filter(|&ch| (mask >> ch) & 1 != 0).count();
 
-                if !has_data {
+                if n_active == 0 {
                     ui.label("No active channels");
                     return;
                 }
 
+                // Number of rendered pixel columns (use last known plot width).
+                let plot_px = self.width as usize;
+                let colors  = self.colors.clone();
+                let follow  = device.digital_stream_follow_mode;
+
                 let plot = Plot::new(format!("digital_stream_plot_{}", device_idx))
                     .height(self.plot_height * 1.5)
                     .show_grid(self.show_grid)
-                    .auto_bounds([true, true])
+                    // No auto_bounds — egui_plot persists zoom/pan state.
+                    // include_x hints keep the initial view sensible.
+                    .include_x(last_t - window_s)
+                    .include_x(last_t)
+                    .include_y(-0.2)
+                    .include_y(n_active as f64 * 1.2)
                     .allow_zoom(true)
                     .allow_drag(true)
                     .allow_scroll(false)
                     .y_axis_min_width(40.0);
 
-                // Snapshot data outside the closure to avoid borrow conflict
-                let channel_data: Vec<Option<(Vec<f64>, Vec<f64>)>> = (0..9)
-                    .map(|ch| {
-                        if (mask >> ch) & 1 == 0 || !device.enabled_channels[ch + 1] {
-                            return None;
-                        }
-                        Some(buffer.get_channel_data(ch, window_s))
-                    })
-                    .collect();
+                let plot_response = plot.show(ui, |plot_ui| {
+                    // Force-follow: override bounds to scroll with new data.
+                    if follow {
+                        let n_ch = n_active as f64;
+                        plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                            [last_t - window_s, -0.2],
+                            [last_t, n_ch * 1.2],
+                        ));
+                    }
 
-                let colors = self.colors.clone();
-                plot.show(ui, |plot_ui| {
-                    for (ch, data_opt) in channel_data.into_iter().enumerate() {
-                        if let Some((x_data, y_data)) = data_opt {
-                            let filtered_data: Vec<[f64; 2]> = x_data
-                                .iter()
-                                .zip(y_data.iter())
-                                .map(|(x, y)| [*x, *y + ch as f64 * 1.2])
-                                .collect();
-                            if !filtered_data.is_empty() {
-                                let filtered_points = PlotPoints::from(filtered_data);
-                                let color_idx = (ch + 1) % colors.len();
-                                let line = Line::new(format!("D{}", ch), filtered_points)
+                    let bounds = plot_ui.plot_bounds();
+                    let x_min  = bounds.min()[0];
+                    let x_max  = bounds.max()[0];
+
+                    for ch in 0..9usize {
+                        if (mask >> ch) & 1 == 0 || !enabled[ch + 1] { continue; }
+                        let pts = buffer.get_step_waveform(
+                            ch, x_min, x_max, plot_px, ch as f64 * 1.2,
+                        );
+                        if !pts.is_empty() {
+                            let color_idx = (ch + 1) % colors.len();
+                            plot_ui.line(
+                                Line::new(format!("D{}", ch), PlotPoints::from(pts))
                                     .color(colors[color_idx])
-                                    .width(1.5);
-                                plot_ui.line(line);
-                            }
+                                    .width(1.5),
+                            );
                         }
                     }
                 });
+
+                self.width = plot_response.response.rect.width() as u32;
+
+                // Unfollow when the user drags or scrolls the plot.
+                if follow && plot_response.response.dragged() {
+                    device.digital_stream_follow_mode = false;
+                }
+                if follow
+                    && plot_response.response.hovered()
+                    && ui.ctx().input(|i| i.zoom_delta() != 1.0 || i.raw_scroll_delta != egui::Vec2::ZERO)
+                {
+                    device.digital_stream_follow_mode = false;
+                }
             }
         }
     }

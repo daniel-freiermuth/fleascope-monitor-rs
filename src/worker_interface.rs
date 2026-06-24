@@ -44,8 +44,13 @@ pub struct FleaScopeDevice {
     digital_stream_channel_mask: u16,
     digital_stream_sample_interval_us: u32,
     digital_stream_buffer_window_s: f64,
+    digital_stream_memory_bytes: usize,
+    /// Whether the plot is following new data (auto-scroll). Unfollowed on user zoom/pan.
+    pub digital_stream_follow_mode: bool,
     /// Live sample rate measured from batch arrival timing; updated by the plot area.
     pub measured_digital_sample_rate_hz: f64,
+    /// Buffer bytes currently used; updated by the plot area.
+    pub digital_stream_bytes_used: usize,
     pub wrap: bool,
 }
 
@@ -88,8 +93,11 @@ impl FleaScopeDevice {
             capture_mode: mode,
             digital_stream_channel_mask: 0x1ff, // all channels by default
             digital_stream_sample_interval_us: 10, // 100 ksps default
-            digital_stream_buffer_window_s: 1.0,   // 1 s window default
+            digital_stream_buffer_window_s: 1.0,
+            digital_stream_memory_bytes: 256 * 1024 * 1024, // 256 MB default
+            digital_stream_follow_mode: true,
             measured_digital_sample_rate_hz: 0.0,
+            digital_stream_bytes_used: 0,
             probe_multiplier: initial_config.probe_multiplier,
             waveform_config: initial_waveform,
             config_change_tx,
@@ -232,6 +240,18 @@ impl FleaScopeDevice {
 
     pub fn get_mut_digital_stream_buffer_window_s(&mut self) -> &mut f64 {
         &mut self.digital_stream_buffer_window_s
+    }
+
+    pub fn get_digital_stream_memory_bytes(&self) -> usize {
+        self.digital_stream_memory_bytes
+    }
+
+    pub fn set_digital_stream_memory_bytes(&mut self, bytes: usize) {
+        self.digital_stream_memory_bytes = bytes;
+    }
+
+    pub fn get_digital_stream_memory_mb(&self) -> f64 {
+        self.digital_stream_memory_bytes as f64 / (1024.0 * 1024.0)
     }
 
     /// Send 0V calibration command (non-blocking)

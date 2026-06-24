@@ -1475,7 +1475,69 @@ impl ControlPanel {
                         }
                     }),
                 );
-                let _ = window_response; // slider edits the handle directly
+                let _ = window_response;
+
+                // Memory cap slider (controls how much history to retain).
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("MEMORY CAP")
+                        .size(8.0)
+                        .strong()
+                        .color(Color32::LIGHT_BLUE),
+                );
+                let mut mem_mb = device.get_digital_stream_memory_mb();
+                let mem_response = ui.add(
+                    egui::Slider::new(&mut mem_mb, 1.0_f64..=30_720.0_f64)
+                        .logarithmic(true)
+                        .custom_formatter(|n, _| {
+                            if n >= 1024.0 {
+                                format!("{:.1} GB", n / 1024.0)
+                            } else {
+                                format!("{:.0} MB", n)
+                            }
+                        }),
+                );
+                if mem_response.changed() {
+                    device.set_digital_stream_memory_bytes(
+                        (mem_mb * 1024.0 * 1024.0) as usize,
+                    );
+                }
+
+                // Buffer usage and estimated history.
+                let used_mb = device.digital_stream_bytes_used as f64 / (1024.0 * 1024.0);
+                let hz = device.measured_digital_sample_rate_hz.max(1.0);
+                let secs_per_run = 1.0 / hz; // worst case: 1 run per sample, no RLE
+                let cap_runs = (mem_mb * 1024.0 * 1024.0 / 10.0) as f64;
+                let cap_secs = cap_runs * secs_per_run;
+                let cap_str = if cap_secs >= 3600.0 {
+                    format!("{:.1} h", cap_secs / 3600.0)
+                } else if cap_secs >= 60.0 {
+                    format!("{:.1} min", cap_secs / 60.0)
+                } else {
+                    format!("{:.1} s", cap_secs)
+                };
+                ui.label(
+                    RichText::new(format!("used {:.1} MB  |  cap ≥ {}", used_mb, cap_str))
+                        .size(7.0)
+                        .color(Color32::LIGHT_GRAY)
+                        .family(egui::FontFamily::Monospace),
+                );
+
+                // Resync / follow button.
+                ui.add_space(4.0);
+                let follow = device.digital_stream_follow_mode;
+                let btn_label = if follow { "● FOLLOWING" } else { "↺ RESYNC" };
+                let btn_color = if follow { Color32::LIGHT_GREEN } else { Color32::YELLOW };
+                if ui
+                    .add_sized(
+                        [80.0, 18.0],
+                        egui::Button::new(RichText::new(btn_label).size(8.0).color(btn_color)),
+                    )
+                    .clicked()
+                    && !follow
+                {
+                    device.digital_stream_follow_mode = true;
+                }
             }
         }
     }
