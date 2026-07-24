@@ -117,7 +117,7 @@ impl ContinuousBuffer {
                 .lazy()
                 .filter(col("time").gt_eq(lit(window_start)))
                 .with_column(
-                    (col("time") / lit(time_bin_size))
+                    ((col("time") - lit(window_start)) / lit(time_bin_size))
                         .cast(DataType::Int32)
                         .alias("time_bin"),
                 )
@@ -439,38 +439,42 @@ mod tests {
     /// At last_t = 2000.0: time / time_bin_size = 2000 / 6.67e-7 = 3e9 > i32::MAX
     #[test]
     fn int32_overflow_in_time_bin_after_24_min() {
-        let sample_rate: u32 = 1000;
+        // Use a high sample rate so that window_duration=0.001s contains
+        // enough samples to survive the first/last-bin filter at line 138.
+        let sample_rate: u32 = 1_000_000; // 1 MHz
         let mut buf = ContinuousBuffer::new(sample_rate);
 
-        // Simulate ~2000 seconds of capture in large batches.
-        // We only need data in the final window, but last_t must reach 2000.0
-        // to trigger the overflow. Fast-forward by inserting a single sample
-        // per large time jump, then a dense batch at the end.
-        let jump_samples = 2_000 * sample_rate as usize; // 2 000 000 samples
-        // Insert a small batch to set last_t near 2000s.
-        // add_batch increments last_t by 1/sample_rate per sample.
-        let batch = vec![0.0; jump_samples];
-        // Process in chunks to avoid huge single allocation issues.
-        for chunk in batch.chunks(100_000) {
-            buf.add_batch(chunk.to_vec());
-        }
-        // Cleanup old data keeping only the last 0.01s (we only need recent window).
-        buf.cleanup_old_batches(0.01);
+        // Fast-forward time to ~2000s by directly setting last_t.
+        // This is equivalent to having captured data for 2000 seconds.
+        buf.last_t = 2000.0;
 
-        assert!(
-            buf.last_t >= 1999.0,
-            "last_t should be >= 1999.0 but was {}",
-            buf.last_t,
-        );
+        // Add a batch of 1000 samples starting at t=2000.0.
+        // At 1 MHz, this covers 0.001s — exactly the window_duration.
+        let batch = vec![1.0_f64; 1000];
+        buf.add_batch(batch);
+        // Trim initial dummy row from ContinuousBuffer::new
+        buf.cleanup_old_batches(0.002);
 
-        let buffer_time = 0.001; // minimum slider value
+        let buffer_time = 0.001; // minimum slider value from control_panel.rs:1363
         let plot_width = 1500u32;
+
+        // Arithmetic proof of overflow:
+        //   time_bin_size = 0.001 / 1500 ≈ 6.667e-7
+        //   time / time_bin_size = 2000.0 / 6.667e-7 ≈ 3.0e9
+        //   i32::MAX = 2_147_483_647 ≈ 2.15e9
+        //   3.0e9 > i32::MAX → overflow → null bins → empty output
+        let time_bin_size = buffer_time / plot_width as f64;
+        let max_bin = buf.last_t / time_bin_size;
+        assert!(
+            max_bin > i32::MAX as f64,
+            "time bin value {max_bin} should exceed i32::MAX to trigger overflow",
+        );
 
         let (times, values) = buf.get_data_in_window(buffer_time, false, plot_width);
 
         // With the bug, the Int32 cast produces nulls and the group_by returns
-        // empty/garbled data. The window has data (we just inserted it), so
-        // a correct implementation must return non-empty results.
+        // empty/garbled data. A correct implementation must return non-empty
+        // results because the window contains 1000 samples.
         assert!(
             !times.is_empty(),
             "get_data_in_window returned empty times — Int32 overflow corrupted binning",
