@@ -315,10 +315,11 @@ impl FleaWorker {
             Err(e) => {
                 tracing::error!("Failed to convert trigger to string: {}", e);
                 self.notification_tx
-                    .blocking_send(Notification::Error(format!(
+                    .send(Notification::Error(format!(
                         "Invalid trigger configuration: {}",
                         e
                     )))
+                    .await
                     .expect("Failed to send error notification");
                 self.set_as_paused().await;
                 return idle_scope;
