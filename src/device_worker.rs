@@ -28,7 +28,7 @@ pub struct FleaWorker {
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub running: bool,
-    pub batch_tx: tokio::sync::mpsc::UnboundedSender<Vec<f64>>,
+    pub batch_tx: tokio::sync::mpsc::Sender<Vec<f64>>,
 }
 
 impl FleaWorker {
@@ -468,8 +468,14 @@ impl FleaWorker {
                     {
                         profiling::scope!("send_batch_channel");
 
-                        if self.batch_tx.send(batch).is_err() {
-                            tracing::warn!("Failed to send batch - receiver may have been dropped");
+                        match self.batch_tx.try_send(batch) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!("Batch channel full - dropping batch (UI not draining fast enough)");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!("Failed to send batch - receiver has been dropped");
+                            }
                         }
                     }
                     if self.check_settings_changed() {

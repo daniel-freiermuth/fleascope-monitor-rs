@@ -36,8 +36,9 @@ impl DeviceManager {
         let (calibration_tx, calibration_rx) = tokio::sync::mpsc::channel::<ControlCommand>(32);
         let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<Notification>(32);
 
-        // Create continuous batch streaming channel
-        let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f64>>();
+        // Create continuous batch streaming channel (bounded to prevent unbounded memory growth
+        // when UI rendering falls behind the capture rate)
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<f64>>(128);
 
         let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
             x_values: Vec::new(),
