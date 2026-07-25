@@ -344,7 +344,6 @@ impl FleaWorker {
             match fleascope_for_read.try_get_result() {
                 Ok(Ok((scope, reading))) => {
                     let data_copy = self.data.clone();
-                    let running = self.running;
                     tokio::spawn(async move {
                         profiling::scope!("data_processing_pipeline");
 
@@ -372,7 +371,7 @@ impl FleaWorker {
                                     last_update: Instant::now(),
                                     update_rate,
                                     connected: true,
-                                    running,
+                                    running: data_copy.load().running,
                                 };
                                 data_copy.store(Arc::new(new_data));
                             })
