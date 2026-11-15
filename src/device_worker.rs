@@ -12,22 +12,22 @@ use polars::series::IntoSeries;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tokio::time::sleep;
 
 use crate::device::{
     CaptureConfig, CaptureMode, ControlCommand, DataPoint, DeviceData, Notification, TriggerConfig,
-    TriggerSource, WaveformConfig,
+    TriggerSource, WaveformConfig, WorkerStatus,
 };
 
 pub struct FleaWorker {
     pub data: Arc<ArcSwap<DeviceData>>,
+    /// Single source of truth for the worker's state; only the worker loop sends.
+    pub status_tx: watch::Sender<WorkerStatus>,
     pub config_change_rx: watch::Receiver<CaptureConfig>,
     pub control_rx: tokio::sync::mpsc::Receiver<ControlCommand>,
     pub notification_tx: tokio::sync::mpsc::Sender<Notification>,
     pub waveform_rx: tokio::sync::watch::Receiver<WaveformConfig>,
     pub x1: FleaProbe,
     pub x10: FleaProbe,
-    pub running: bool,
     pub batch_tx: tokio::sync::mpsc::Sender<Vec<f64>>,
 }
 
@@ -137,7 +137,7 @@ impl FleaWorker {
                 return Err(Error::msg("Exiting FleaWorker")); // Handle exit logic if needed
             }
             ControlCommand::Pause => {
-                self.set_as_paused().await;
+                self.set_as_paused();
             }
             ControlCommand::Resume => {
                 self.set_as_running();
@@ -151,20 +151,16 @@ impl FleaWorker {
         Ok(())
     }
 
-    async fn set_as_paused(&mut self) {
+    fn is_running(&self) -> bool {
+        self.status_tx.borrow().running
+    }
+
+    fn set_as_paused(&mut self) {
         tracing::info!("Setting FleaWorker as paused");
-        self.running = false;
-        sleep(Duration::from_millis(20)).await;
-        let data = self.data.load();
-        // TODO Introduce device state channel
-        self.data.store(Arc::new(DeviceData {
-            x_values: data.x_values.clone(),
-            data_points: data.data_points.clone(),
-            last_update: data.last_update,
-            update_rate: 0.0,
-            connected: true,
-            running: self.running,
-        }));
+        self.status_tx.send_modify(|status| {
+            status.running = false;
+            status.update_rate = 0.0;
+        });
     }
 
     async fn set_lost_connection(&mut self) {
@@ -175,36 +171,29 @@ impl FleaWorker {
             ))
             .await
             .expect("Failed to send read error notification");
-        self.running = false;
-        sleep(Duration::from_millis(20)).await;
-        let data = self.data.load();
-        self.data.store(Arc::new(DeviceData {
-            x_values: data.x_values.clone(),
-            data_points: data.data_points.clone(),
-            last_update: data.last_update,
-            update_rate: 0.0,
+        self.status_tx.send_replace(WorkerStatus {
+            running: false,
             connected: false,
-            running: self.running,
-        }));
+            update_rate: 0.0,
+        });
     }
 
     fn set_as_running(&mut self) {
         tracing::info!("Setting FleaWorker as running");
-        self.running = true;
-        let data = self.data.load();
-        self.data.store(Arc::new(DeviceData {
-            x_values: data.x_values.clone(),
-            data_points: data.data_points.clone(),
-            last_update: data.last_update,
-            update_rate: data.update_rate,
-            connected: data.connected,
-            running: self.running,
-        }));
+        self.status_tx.send_modify(|status| status.running = true);
+    }
+
+    /// A successful read proves the device is reachable.
+    fn mark_connected(&self) {
+        self.status_tx.send_if_modified(|status| {
+            let changed = !status.connected;
+            status.connected = true;
+            changed
+        });
     }
 
     pub async fn run(&mut self, mut fleascope: IdleFleaScope) -> Result<()> {
         tracing::info!("FleaWorker started");
-        let mut update_rate = 0.0;
         let mut last_rate_update = Instant::now();
         let mut read_count = 0;
 
@@ -226,7 +215,7 @@ impl FleaWorker {
                 fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
             }
 
-            if !self.running {
+            if !self.is_running() {
                 tracing::debug!("Device is paused, skipping data generation");
 
                 // During pause, still check for config changes and calibration commands
@@ -255,7 +244,6 @@ impl FleaWorker {
                 } => {
                     fleascope = self
                         .handle_triggered_capture(
-                            update_rate,
                             capture_config.probe_multiplier,
                             time_frame,
                             trigger_config,
@@ -271,28 +259,31 @@ impl FleaWorker {
             }
 
             if last_rate_update.elapsed() >= Duration::from_secs(1) {
-                update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                let update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
+                // A pause during the capture above already reset the rate; don't overwrite it.
+                self.status_tx.send_if_modified(|status| {
+                    let changed = status.running && status.update_rate != update_rate;
+                    if changed {
+                        status.update_rate = update_rate;
+                    }
+                    changed
+                });
                 read_count = 0;
                 last_rate_update = Instant::now();
             }
             read_count += 1;
         }
         fleascope.teardown();
-        let data = self.data.load();
-        self.data.store(Arc::new(DeviceData {
-            x_values: data.x_values.clone(),
-            data_points: data.data_points.clone(),
-            last_update: data.last_update,
-            update_rate: 0.0,
-            connected: false,
+        self.status_tx.send_replace(WorkerStatus {
             running: false,
-        }));
+            connected: false,
+            update_rate: 0.0,
+        });
         Err(Error::msg("FleaWorker exited"))
     }
 
     async fn handle_triggered_capture(
         &mut self,
-        update_rate: f64,
         probe: ProbeType,
         time_frame: f64,
         trigger_config: TriggerConfig,
@@ -332,7 +323,7 @@ impl FleaWorker {
                     )))
                     .await
                     .expect("Failed to send error notification");
-                self.set_as_paused().await;
+                self.set_as_paused();
                 return idle_scope;
             }
         };
@@ -354,6 +345,7 @@ impl FleaWorker {
         loop {
             match fleascope_for_read.try_get_result() {
                 Ok(Ok((scope, reading))) => {
+                    self.mark_connected();
                     let data_copy = self.data.clone();
                     tokio::spawn(async move {
                         profiling::scope!("data_processing_pipeline");
@@ -380,9 +372,6 @@ impl FleaWorker {
                                     x_values: data_points.0,
                                     data_points: data_points.1,
                                     last_update: Instant::now(),
-                                    update_rate,
-                                    connected: true,
-                                    running: data_copy.load().running,
                                 };
                                 data_copy.store(Arc::new(new_data));
                             })
@@ -476,6 +465,7 @@ impl FleaWorker {
 
             match batch_result {
                 Ok(batch) => {
+                    self.mark_connected();
                     {
                         profiling::scope!("send_batch_channel");
 
@@ -655,7 +645,7 @@ impl FleaWorker {
 mod tests {
     use super::*;
 
-    fn test_worker(data: Arc<ArcSwap<DeviceData>>) -> FleaWorker {
+    fn test_worker() -> (FleaWorker, watch::Receiver<WorkerStatus>) {
         let (_config_tx, config_change_rx) = watch::channel(CaptureConfig {
             probe_multiplier: ProbeType::X1,
             mode: CaptureMode::Continuous {},
@@ -664,43 +654,43 @@ mod tests {
         let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
         let (_waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
         let (batch_tx, _batch_rx) = tokio::sync::mpsc::channel(1);
-        FleaWorker {
-            data,
+        let (status_tx, status_rx) = watch::channel(WorkerStatus {
+            running: true,
+            connected: true,
+            update_rate: 0.0,
+        });
+        let worker = FleaWorker {
+            data: Arc::new(ArcSwap::new(Arc::new(DeviceData {
+                x_values: Vec::new(),
+                data_points: Vec::new(),
+                last_update: Instant::now(),
+            }))),
+            status_tx,
             config_change_rx,
             control_rx,
             notification_tx,
             waveform_rx,
             x1: FleaProbe::new(ProbeType::X1),
             x10: FleaProbe::new(ProbeType::X10),
-            running: true,
             batch_tx,
-        }
+        };
+        (worker, status_rx)
     }
 
-    /// The UI derives the RUN/STOP button from `DeviceData.running`
-    /// (control_panel.rs), and the spawned triggered-capture task only copies
-    /// the existing flag forward. So Resume must publish `running = true`
-    /// itself, otherwise the device stays "paused" in the UI forever.
-    #[tokio::test]
-    async fn resume_after_pause_publishes_running_to_shared_data() {
-        let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
-            x_values: Vec::new(),
-            data_points: Vec::new(),
-            last_update: Instant::now(),
-            update_rate: 0.0,
-            connected: true,
-            running: true,
-        })));
-        let mut worker = test_worker(data.clone());
+    /// The UI derives the RUN/STOP button from the worker status channel
+    /// (control_panel.rs). Resume after Pause must publish `running = true`,
+    /// otherwise the device stays "paused" in the UI forever.
+    #[test]
+    fn resume_after_pause_publishes_running_to_status() {
+        let (mut worker, status_rx) = test_worker();
 
-        worker.set_as_paused().await;
-        assert!(!data.load().running);
+        worker.set_as_paused();
+        assert!(!status_rx.borrow().running);
 
         worker.set_as_running();
-        assert!(worker.running);
         assert!(
-            data.load().running,
-            "Resume must publish running=true to the shared DeviceData"
+            status_rx.borrow().running,
+            "Resume must publish running=true to the worker status"
         );
     }
 }
