@@ -40,24 +40,27 @@ impl DeviceManager {
         // when UI rendering falls behind the capture rate)
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<f64>>(128);
 
+        let (status_tx, status_rx) = watch::channel(WorkerStatus {
+            running: true,
+            connected: true,
+            update_rate: 0.0,
+        });
+
         let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
             x_values: Vec::new(),
             data_points: Vec::new(),
             last_update: Instant::now(),
-            update_rate: 0.0,
-            connected: true,
-            running: true,
         })));
 
         let mut worker = FleaWorker {
             data: data.clone(),
+            status_tx,
             config_change_rx: capture_config_rx,
             control_rx: calibration_rx,
             notification_tx,
             x1,
             x10,
             waveform_rx, // Channel for waveform configuration
-            running: true,
             batch_tx,
         };
 
@@ -65,6 +68,7 @@ impl DeviceManager {
             hostname,
             capture_config_tx,
             data,
+            status_rx,
             calibration_tx,
             notification_rx,
             initial_config,
@@ -137,14 +141,20 @@ pub struct DataPoint {
     pub digital_channels: [bool; 9],
 }
 
+/// Latest triggered capture. Written only by the triggered-capture parse task.
 #[derive(Debug, Clone)]
 pub struct DeviceData {
     pub x_values: Vec<f64>,
     pub data_points: Vec<DataPoint>,
     pub last_update: Instant,
-    pub update_rate: f64,
-    pub connected: bool,
+}
+
+/// Worker state as seen by the UI. Published only by the worker loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkerStatus {
     pub running: bool,
+    pub connected: bool,
+    pub update_rate: f64,
 }
 
 fn mean(data: &[f64]) -> Option<f64> {

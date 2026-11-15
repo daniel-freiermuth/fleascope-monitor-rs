@@ -6,7 +6,7 @@ use tokio::sync::watch::{self, Sender};
 
 use crate::device::{
     CaptureConfig, CaptureMode, ControlCommand, DeviceData, Notification, TriggerConfig,
-    WaveformConfig, MAX_TIME_FRAME, MIN_TIME_FRAME,
+    WaveformConfig, WorkerStatus, MAX_TIME_FRAME, MIN_TIME_FRAME,
 };
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub enum CaptureModeFlat {
 pub struct FleaScopeDevice {
     pub name: String,
     pub data: Arc<ArcSwap<DeviceData>>, // Changed to Arc<ArcSwap> for sharing between threads
+    status_rx: watch::Receiver<WorkerStatus>, // Worker state, published by the worker loop only
     pub enabled_channels: [bool; 10],   // 1 analog + 9 digital
     probe_multiplier: ProbeType,        // Probe selection
     waveform_config: WaveformConfig,    // Waveform generator configuration
@@ -47,6 +48,7 @@ impl FleaScopeDevice {
         name: String,
         config_change_tx: Sender<CaptureConfig>,
         data: Arc<ArcSwap<DeviceData>>,
+        status_rx: watch::Receiver<WorkerStatus>,
         calibration_tx: tokio::sync::mpsc::Sender<ControlCommand>,
         notification_rx: tokio::sync::mpsc::Receiver<Notification>,
         initial_config: CaptureConfig,
@@ -73,6 +75,7 @@ impl FleaScopeDevice {
         Self {
             name,
             data,
+            status_rx,
             enabled_channels: [true; 10], // All channels enabled by default
             triggered_config,
             continuous_config,
@@ -86,6 +89,11 @@ impl FleaScopeDevice {
             batch_rx,
             wrap: true,
         }
+    }
+
+    /// Current worker state (running / connected / update rate).
+    pub fn status(&self) -> WorkerStatus {
+        *self.status_rx.borrow()
     }
 
     /// Signal that configuration has changed and data generation should restart

@@ -372,7 +372,7 @@ impl ControlPanel {
         // Device Header - Retro Style with LED Status
         ui.horizontal(|ui| {
             // Large power LED with classic styling
-            let status_color = if device.data.load().connected {
+            let status_color = if device.status().connected {
                 Color32::GREEN
             } else {
                 Color32::RED
@@ -649,7 +649,7 @@ impl ControlPanel {
                     );
 
                     // Pause/Resume button
-                    let is_paused = !device.data.load().running;
+                    let is_paused = !device.status().running;
                     if ui
                         .add_sized(
                             [25.0, 20.0],
@@ -819,7 +819,7 @@ impl ControlPanel {
                     // Row 2: Compact statistics
                     ui.label(RichText::new("STATS").size(7.0).color(Color32::LIGHT_GRAY));
                     ui.label(
-                        RichText::new(format!("{:.1}Hz", data.update_rate))
+                        RichText::new(format!("{:.1}Hz", device.status().update_rate))
                             .size(6.0)
                             .color(Color32::WHITE),
                     );
