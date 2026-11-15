@@ -191,6 +191,15 @@ impl FleaWorker {
     fn set_as_running(&mut self) {
         tracing::info!("Setting FleaWorker as running");
         self.running = true;
+        let data = self.data.load();
+        self.data.store(Arc::new(DeviceData {
+            x_values: data.x_values.clone(),
+            data_points: data.data_points.clone(),
+            last_update: data.last_update,
+            update_rate: data.update_rate,
+            connected: data.connected,
+            running: self.running,
+        }));
     }
 
     pub async fn run(&mut self, mut fleascope: IdleFleaScope) -> Result<()> {
@@ -639,5 +648,59 @@ impl FleaWorker {
 
         tracing::debug!("Converted to {} data points", data_points.len());
         (x_values, data_points)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_worker(data: Arc<ArcSwap<DeviceData>>) -> FleaWorker {
+        let (_config_tx, config_change_rx) = watch::channel(CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::Continuous {},
+        });
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
+        let (_waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
+        let (batch_tx, _batch_rx) = tokio::sync::mpsc::channel(1);
+        FleaWorker {
+            data,
+            config_change_rx,
+            control_rx,
+            notification_tx,
+            waveform_rx,
+            x1: FleaProbe::new(ProbeType::X1),
+            x10: FleaProbe::new(ProbeType::X10),
+            running: true,
+            batch_tx,
+        }
+    }
+
+    /// The UI derives the RUN/STOP button from `DeviceData.running`
+    /// (control_panel.rs), and the spawned triggered-capture task only copies
+    /// the existing flag forward. So Resume must publish `running = true`
+    /// itself, otherwise the device stays "paused" in the UI forever.
+    #[tokio::test]
+    async fn resume_after_pause_publishes_running_to_shared_data() {
+        let data = Arc::new(ArcSwap::new(Arc::new(DeviceData {
+            x_values: Vec::new(),
+            data_points: Vec::new(),
+            last_update: Instant::now(),
+            update_rate: 0.0,
+            connected: true,
+            running: true,
+        })));
+        let mut worker = test_worker(data.clone());
+
+        worker.set_as_paused().await;
+        assert!(!data.load().running);
+
+        worker.set_as_running();
+        assert!(worker.running);
+        assert!(
+            data.load().running,
+            "Resume must publish running=true to the shared DeviceData"
+        );
     }
 }
