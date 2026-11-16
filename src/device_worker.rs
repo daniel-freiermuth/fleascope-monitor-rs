@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
 use arc_swap::ArcSwap;
 use fleascope_rs::flea_scope::{
     BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME,
@@ -32,11 +32,18 @@ pub struct FleaWorker {
 }
 
 impl FleaWorker {
-    async fn notify(&self, notification: Notification) {
+    /// Fails only when the UI side dropped its receiver, i.e. the device was removed.
+    async fn notify(&self, notification: Notification) -> Result<()> {
         self.notification_tx
             .send(notification)
             .await
-            .expect("Failed to send notification");
+            .map_err(|_| anyhow!("notification receiver dropped"))
+    }
+
+    /// `FleaScopeDevice` owns the watch senders; once it is dropped (device removed)
+    /// there is nobody left to serve and the worker must shut down.
+    fn ui_dropped(&self) -> bool {
+        self.config_change_rx.has_changed().is_err() || self.waveform_rx.has_changed().is_err()
     }
 
     fn probe_mut(&mut self, probe_type: ProbeType) -> (&mut FleaProbe, &'static str) {
@@ -60,7 +67,7 @@ impl FleaWorker {
                     Ok(_) => Notification::Success(format!("{name} probe calibrated at 0V")),
                     Err(e) => Notification::Error(format!("{name} calibration failed: {e}")),
                 };
-                self.notify(notification).await;
+                self.notify(notification).await?;
             }
             ControlCommand::Calibrate3V(probe_type) => {
                 let (probe, name) = self.probe_mut(probe_type);
@@ -68,7 +75,7 @@ impl FleaWorker {
                     Ok(_) => Notification::Success(format!("{name} probe calibrated at 3.3V")),
                     Err(e) => Notification::Error(format!("{name} calibration failed: {e}")),
                 };
-                self.notify(notification).await;
+                self.notify(notification).await?;
             }
             ControlCommand::StoreCalibration() => {
                 let notification = match Ok(())
@@ -78,7 +85,7 @@ impl FleaWorker {
                     Ok(_) => Notification::Success("Calibration saved successfully".to_string()),
                     Err(e) => Notification::Error(format!("Failed to save calibration: {e}")),
                 };
-                self.notify(notification).await;
+                self.notify(notification).await?;
             }
             ControlCommand::Exit => {
                 tracing::info!("Exiting FleaWorker");
@@ -108,17 +115,19 @@ impl FleaWorker {
 
     async fn set_lost_connection(&mut self) {
         tracing::info!("Lost connection");
-        self.notification_tx
-            .send(Notification::Error(
-                "Lost connection to the device.".to_string(),
-            ))
-            .await
-            .expect("Failed to send read error notification");
         self.status_tx.send_replace(WorkerStatus {
             running: false,
             connected: false,
             update_rate: 0.0,
         });
+        if let Err(e) = self
+            .notify(Notification::Error(
+                "Lost connection to the device.".to_string(),
+            ))
+            .await
+        {
+            tracing::warn!("Could not report lost connection: {e:#}");
+        }
     }
 
     fn set_as_running(&mut self) {
@@ -135,24 +144,39 @@ impl FleaWorker {
         });
     }
 
-    pub async fn run(&mut self, mut fleascope: IdleFleaScope) -> Result<()> {
+    pub async fn run(&mut self, fleascope: IdleFleaScope) {
         tracing::info!("FleaWorker started");
+        match self.capture_loop(fleascope).await {
+            Some(fleascope) => fleascope.teardown(),
+            None => self.wait_for_removal().await,
+        }
+        self.status_tx.send_replace(WorkerStatus {
+            running: false,
+            connected: false,
+            update_rate: 0.0,
+        });
+        tracing::info!("FleaWorker stopped");
+    }
+
+    /// Returns the scope on a clean stop, `None` once the connection is lost.
+    async fn capture_loop(&mut self, mut fleascope: IdleFleaScope) -> Option<IdleFleaScope> {
         let mut last_rate_update = Instant::now();
         let mut read_count = 0;
 
         loop {
             if let Ok(command) = self.control_rx.try_recv() {
                 tracing::info!("Received control command: {:?}", command);
-                if (self.handle_control_command(command, &mut fleascope).await).is_err() {
+                if let Err(e) = self.handle_control_command(command, &mut fleascope).await {
+                    tracing::info!("FleaWorker stopping: {e:#}");
                     break;
                 }
                 continue;
             }
-            if self
-                .waveform_rx
-                .has_changed()
-                .expect("Failed to check for waveform config change")
-            {
+            if self.ui_dropped() {
+                tracing::info!("Device handle dropped, stopping FleaWorker");
+                break;
+            }
+            if self.waveform_rx.has_changed().unwrap_or(false) {
                 tracing::info!("Waveform configuration changed, updating waveform");
                 let waveform_config = self.waveform_rx.borrow_and_update().clone();
                 fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
@@ -170,7 +194,8 @@ impl FleaWorker {
                     }
                     Some(command) = self.control_rx.recv() => {
                         tracing::info!("Received calibration command while paused: {:?}", command);
-                        if (self.handle_control_command(command, &mut fleascope).await).is_err() {
+                        if let Err(e) = self.handle_control_command(command, &mut fleascope).await {
+                            tracing::info!("FleaWorker stopping: {e:#}");
                             break;
                         }
                     }
@@ -180,26 +205,31 @@ impl FleaWorker {
 
             tracing::debug!("Device is running, starting data generation");
             let capture_config = self.config_change_rx.borrow_and_update().clone();
-            match capture_config.mode {
+            let capture = match capture_config.mode {
                 CaptureMode::Triggered {
                     trigger_config,
                     time_frame,
                 } => {
-                    fleascope = self
-                        .handle_triggered_capture(
-                            capture_config.probe_multiplier,
-                            time_frame,
-                            trigger_config,
-                            fleascope,
-                        )
-                        .await;
+                    self.handle_triggered_capture(
+                        capture_config.probe_multiplier,
+                        time_frame,
+                        trigger_config,
+                        fleascope,
+                    )
+                    .await
                 }
                 CaptureMode::Continuous {} => {
-                    fleascope = self
-                        .handle_continuous_capture(capture_config.probe_multiplier, fleascope)
-                        .await;
+                    self.handle_continuous_capture(capture_config.probe_multiplier, fleascope)
+                        .await
                 }
-            }
+            };
+            fleascope = match capture {
+                Ok(fleascope) => fleascope,
+                Err(e) => {
+                    tracing::error!("Capture failed: {e:#}");
+                    return None;
+                }
+            };
 
             if last_rate_update.elapsed() >= Duration::from_secs(1) {
                 let update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
@@ -216,22 +246,42 @@ impl FleaWorker {
             }
             read_count += 1;
         }
-        fleascope.teardown();
-        self.status_tx.send_replace(WorkerStatus {
-            running: false,
-            connected: false,
-            update_rate: 0.0,
-        });
-        Err(Error::msg("FleaWorker exited"))
+        Some(fleascope)
     }
 
+    /// After a lost connection the scope is gone, but `FleaScopeDevice` still holds the
+    /// senders and `.expect`s on every send. Keep the receivers alive and drain commands
+    /// until the device is removed (`Exit`) or its handle is dropped.
+    async fn wait_for_removal(&mut self) {
+        loop {
+            tokio::select! {
+                command = self.control_rx.recv() => match command {
+                    None | Some(ControlCommand::Exit) => break,
+                    Some(ControlCommand::Pause) => {}
+                    Some(command) => {
+                        tracing::warn!("Ignoring {command:?}: device disconnected");
+                        let notification = Notification::Error(
+                            "Device disconnected. Remove it and add it again.".to_string(),
+                        );
+                        if self.notify(notification).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+                changed = self.config_change_rx.changed() => if changed.is_err() { break },
+                changed = self.waveform_rx.changed() => if changed.is_err() { break },
+            }
+        }
+    }
+
+    /// Returns `Err` only when the connection is lost; the scope is consumed then.
     async fn handle_triggered_capture(
         &mut self,
         probe: ProbeType,
         time_frame: f64,
         trigger_config: TriggerConfig,
         idle_scope: IdleFleaScope,
-    ) -> IdleFleaScope {
+    ) -> Result<IdleFleaScope> {
         let probe = match probe {
             ProbeType::X1 => &self.x1,
             ProbeType::X10 => &self.x10,
@@ -259,15 +309,17 @@ impl FleaWorker {
             Ok(str) => str,
             Err(e) => {
                 tracing::error!("Failed to convert trigger to string: {}", e);
-                self.notification_tx
-                    .send(Notification::Error(format!(
+                if let Err(e) = self
+                    .notify(Notification::Error(format!(
                         "Invalid trigger configuration: {}",
                         e
                     )))
                     .await
-                    .expect("Failed to send error notification");
+                {
+                    tracing::warn!("Could not report invalid trigger: {e:#}");
+                }
                 self.set_as_paused();
-                return idle_scope;
+                return Ok(idle_scope);
             }
         };
 
@@ -280,7 +332,7 @@ impl FleaWorker {
             Ok(fleascope_for_read) => fleascope_for_read,
             Err((s, e)) => {
                 tracing::error!("Failed to start read operation: {}", e);
-                return s;
+                return Ok(s);
             }
         };
         tracing::debug!("Successfully started read operation on FleaScope");
@@ -320,7 +372,7 @@ impl FleaWorker {
                             })
                             .ok();
                     });
-                    return scope;
+                    return Ok(scope);
                 }
                 Ok(Err(scope)) => {
                     fleascope_for_read = scope;
@@ -328,34 +380,27 @@ impl FleaWorker {
                 Err(_) => {
                     tracing::error!("Error during hardware read: Connection lost");
                     self.set_lost_connection().await;
-                    panic!("Connection lost during hardware read");
+                    return Err(Error::msg("Connection lost during hardware read"));
                 }
             }
             profiling::scope!("hardware_wait_polling_loop");
 
             if self.check_settings_changed() {
                 tracing::info!("Settings changed during hardware wait, calling unblock()");
-                return fleascope_for_read.cancel();
+                return Ok(fleascope_for_read.cancel());
             }
         }
     }
 
+    /// A closed channel counts as a change so the capture unblocks and `run` can shut down.
     fn check_settings_changed(&self) -> bool {
-        if self
-            .config_change_rx
-            .has_changed()
-            .expect("Failed to check for config change")
-        {
+        if self.config_change_rx.has_changed().unwrap_or(true) {
             profiling::scope!("config_change_detected");
 
             tracing::info!("Configuration changed during hardware read, calling unblock()");
             return true;
         }
-        if self
-            .waveform_rx
-            .has_changed()
-            .expect("Failed to check for waveform change")
-        {
+        if self.waveform_rx.has_changed().unwrap_or(true) {
             profiling::scope!("waveform_change_detected");
 
             tracing::info!("Waveform changed during hardware read, calling unblock()");
@@ -370,11 +415,12 @@ impl FleaWorker {
         false
     }
 
+    /// Returns `Err` only when the connection is lost; the scope is dropped then.
     async fn handle_continuous_capture(
         &mut self,
         probe: ProbeType,
         fleascope: IdleFleaScope,
-    ) -> IdleFleaScope {
+    ) -> Result<IdleFleaScope> {
         const BUFF_SIZE: usize = 512;
         let probe = match probe {
             ProbeType::X1 => &self.x1,
@@ -423,13 +469,23 @@ impl FleaWorker {
                         }
                     }
                     if self.check_settings_changed() {
-                        return streaming_scope.stop();
+                        return Ok(streaming_scope.stop());
                     }
+                }
+                // fleascope-rs treats only BrokenPipe/UnexpectedEof as connection loss and
+                // `cancel()` tolerates TimedOut, so keep the stop-and-pause path for timeouts.
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    tracing::error!("Timed out reading from continuous stream: {}", e);
+                    self.set_lost_connection().await;
+                    return Ok(streaming_scope.stop());
                 }
                 Err(e) => {
                     tracing::error!("Error reading from continuous stream: {}", e);
                     self.set_lost_connection().await;
-                    return streaming_scope.stop();
+                    // `stop()` writes CTRL-C to the dead port and panics inside
+                    // fleascope-rs (`BusyFleaTerminal::cancel`), so drop the stream instead.
+                    drop(streaming_scope);
+                    return Err(Error::new(e).context("Connection lost during continuous read"));
                 }
             }
             let now = Instant::now();
@@ -635,5 +691,89 @@ mod tests {
             status_rx.borrow().running,
             "Resume must publish running=true to the worker status"
         );
+    }
+
+    /// `test_worker` drops every UI-side handle, exactly like
+    /// `DeviceManager::remove_device` does. The worker must notice and unblock
+    /// instead of panicking (release builds use `panic = "abort"`).
+    #[test]
+    fn dropped_device_handle_unblocks_capture_instead_of_panicking() {
+        let (worker, _status_rx) = test_worker();
+
+        assert!(worker.ui_dropped());
+        assert!(worker.check_settings_changed());
+    }
+
+    #[test]
+    fn live_device_handle_with_unchanged_settings_keeps_capturing() {
+        let (mut worker, _status_rx) = test_worker();
+        let (_config_tx, config_change_rx) = watch::channel(CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::Continuous {},
+        });
+        let (_waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
+        worker.config_change_rx = config_change_rx;
+        worker.waveform_rx = waveform_rx;
+
+        assert!(!worker.ui_dropped());
+        assert!(!worker.check_settings_changed());
+    }
+
+    #[tokio::test]
+    async fn lost_connection_is_published_even_without_notification_receiver() {
+        let (mut worker, status_rx) = test_worker();
+
+        worker.set_lost_connection().await;
+
+        let status = *status_rx.borrow();
+        assert!(!status.connected);
+        assert!(!status.running);
+    }
+
+    /// After a lost connection the device stays in the UI, which `.expect`s on every
+    /// send to the worker (worker_interface.rs). The worker must keep its receivers
+    /// alive until the device is removed, rejecting commands it cannot serve.
+    #[tokio::test]
+    async fn disconnected_worker_keeps_ui_channels_open_until_exit() {
+        let (mut worker, status_rx) = test_worker();
+        let (config_tx, config_change_rx) = watch::channel(CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::Continuous {},
+        });
+        let (waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
+        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(32);
+        worker.config_change_rx = config_change_rx;
+        worker.waveform_rx = waveform_rx;
+        worker.control_rx = control_rx;
+        worker.notification_tx = notification_tx;
+
+        worker.set_lost_connection().await;
+        let task = tokio::spawn(async move { worker.wait_for_removal().await });
+
+        control_tx.try_send(ControlCommand::Resume).unwrap();
+        config_tx
+            .send(CaptureConfig {
+                probe_multiplier: ProbeType::X10,
+                mode: CaptureMode::Continuous {},
+            })
+            .unwrap();
+        waveform_tx.send(WaveformConfig::default()).unwrap();
+
+        // Lost-connection report, then the rejected Resume.
+        for _ in 0..2 {
+            assert!(matches!(
+                notification_rx.recv().await,
+                Some(Notification::Error(_))
+            ));
+        }
+        assert!(!status_rx.borrow().running);
+        assert!(!task.is_finished());
+
+        control_tx.try_send(ControlCommand::Exit).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop on Exit")
+            .unwrap();
     }
 }

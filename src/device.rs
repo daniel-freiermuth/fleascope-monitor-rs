@@ -76,11 +76,7 @@ impl DeviceManager {
             initial_waveform,
             batch_rx,
         );
-        let _handle = tokio::spawn(async move {
-            if let Err(e) = worker.run(scope).await {
-                tracing::error!("Worker error: {}", e);
-            };
-        });
+        let _handle = tokio::spawn(async move { worker.run(scope).await });
 
         self.devices.push(device);
         Ok(())
