@@ -191,13 +191,13 @@ fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize
     // Calculate decimal places needed to show the requested significant digits
     let decimal_places = if abs_scaled >= 100.0 {
         // For 100+ : show as integer (e.g., "123k" not "123.k")
-        (significant_digits.saturating_sub(3)).max(0)
+        significant_digits.saturating_sub(3)
     } else if abs_scaled >= 10.0 {
         // For 10-99: show 1 less decimal place (e.g., "12.3k" for 3 sig digits)
-        (significant_digits.saturating_sub(2)).max(0)
+        significant_digits.saturating_sub(2)
     } else {
         // For 1-9.99: show full decimal places (e.g., "1.23k" for 3 sig digits)
-        (significant_digits.saturating_sub(1)).max(0)
+        significant_digits.saturating_sub(1)
     };
 
     format!(

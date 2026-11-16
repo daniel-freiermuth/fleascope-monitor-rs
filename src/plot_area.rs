@@ -6,7 +6,7 @@ use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 use polars::{
     frame::DataFrame,
-    prelude::{col, lit, Column, DataType, IntoLazy},
+    prelude::{col, lit, Column, DataType, IntoLazy, PolarsResult},
 };
 
 #[derive(Clone)]
@@ -23,7 +23,10 @@ impl ContinuousBuffer {
         let bnc_column = Column::new("bnc".into(), [0.0].as_ref());
         let time_index = Column::new("time".into(), [0.0].as_ref());
 
-        let df = DataFrame::new(vec![time_index, bnc_column]).expect("Failed to create DataFrame");
+        let df = DataFrame::new(vec![time_index, bnc_column]).unwrap_or_else(|e| {
+            tracing::error!("Failed to create DataFrame: {}", e);
+            DataFrame::empty()
+        });
 
         Self {
             data: df,
@@ -51,14 +54,18 @@ impl ContinuousBuffer {
         let time_column = Column::new("time".into(), time_values);
         let bnc_column = Column::new("bnc".into(), bnc_values);
 
-        let batch_df = DataFrame::new(vec![time_column, bnc_column])
-            .expect("Failed to create batch DataFrame");
+        let batch_df = match DataFrame::new(vec![time_column, bnc_column]) {
+            Ok(df) => df,
+            Err(e) => {
+                tracing::error!("Failed to create batch DataFrame: {}", e);
+                return;
+            }
+        };
 
         // Concatenate with existing data
-        self.data = self
-            .data
-            .vstack(&batch_df)
-            .expect("Failed to concatenate DataFrames");
+        if let Err(e) = self.data.vstack_mut(&batch_df) {
+            tracing::error!("Failed to concatenate DataFrames: {}", e);
+        }
     }
 
     fn cleanup_old_batches(&mut self, keep_time: f64) {
@@ -86,6 +93,19 @@ impl ContinuousBuffer {
             return (Vec::new(), Vec::new());
         }
 
+        self.resample_window(window_duration, wrap, plot_width)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to filter and resample DataFrame: {}", e);
+                (Vec::new(), Vec::new())
+            })
+    }
+
+    fn resample_window(
+        &self,
+        window_duration: f64,
+        wrap: bool,
+        plot_width: u32,
+    ) -> PolarsResult<(Vec<f64>, Vec<f64>)> {
         let latest_time = self.last_t;
 
         let window_start = latest_time - window_duration;
@@ -100,12 +120,9 @@ impl ContinuousBuffer {
                 .lazy()
                 .filter(col("time").gt_eq(lit(window_start)))
                 .select([polars::prelude::col("bnc").std(1)])
-                .collect()
-                .expect("Failed to filter and resample DataFrame")
-                .column("bnc")
-                .expect("time column not found")
-                .f64()
-                .expect("time should be f64")
+                .collect()?
+                .column("bnc")?
+                .f64()?
                 .into_no_null_iter()
                 .collect::<Vec<_>>();
             tracing::debug!("RMS Error in window: {:?}", rmse);
@@ -145,8 +162,7 @@ impl ContinuousBuffer {
                 polars::prelude::col("time_min").alias("time"),
                 polars::prelude::col("bnc_mean").alias("bnc"),
             ])
-            .collect()
-            .expect("Failed to filter and resample DataFrame")
+            .collect()?
         };
 
         // Extract vectors efficiently - handle both resampled and non-resampled data
@@ -154,21 +170,17 @@ impl ContinuousBuffer {
         profiling::scope!("extract_resampled_data");
 
         let time = filtered_df
-            .column("time")
-            .expect("time column not found")
-            .f64()
-            .expect("time should be f64")
+            .column("time")?
+            .f64()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
         let bnc = filtered_df
-            .column("bnc")
-            .expect("bnc column not found")
-            .f64()
-            .expect("bnc should be f64")
+            .column("bnc")?
+            .f64()?
             .into_no_null_iter()
             .collect::<Vec<_>>();
 
-        (time, bnc)
+        Ok((time, bnc))
     }
 }
 
