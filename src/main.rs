@@ -1,6 +1,4 @@
 use eframe::egui;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 mod control_panel;
 mod device;
@@ -16,7 +14,7 @@ use plot_area::PlotArea;
 
 #[derive(Default)]
 pub struct FleaScopeApp {
-    device_manager: Arc<Mutex<DeviceManager>>,
+    device_manager: DeviceManager,
     plot_area: PlotArea,
     control_panel: ControlPanel,
     notification_manager: NotificationManager,
@@ -88,16 +86,7 @@ impl eframe::App for FleaScopeApp {
                 ui.label("Status: Ready");
                 ui.separator();
 
-                // Get device count safely
-                let device_count = {
-                    if let Ok(manager) = self.device_manager.try_lock() {
-                        manager.get_devices().len()
-                    } else {
-                        0
-                    }
-                };
-
-                ui.label(format!("Devices: {}", device_count));
+                ui.label(format!("Devices: {}", self.device_manager.get_devices().len()));
                 ui.separator();
                 ui.label(format!("FPS: {:.1}", ctx.input(|i| i.stable_dt).recip()));
 
@@ -125,12 +114,7 @@ impl eframe::App for FleaScopeApp {
                         // Use full available height for plots
                         ui.set_min_height(available_rect.height());
 
-                        // Access device manager safely for plotting
-                        if let Ok(mut manager) = self.device_manager.try_lock() {
-                            self.plot_area.ui(ui, &mut manager);
-                        } else {
-                            ui.label("Loading devices...");
-                        }
+                        self.plot_area.ui(ui, &mut self.device_manager);
                     },
                 );
 
@@ -145,13 +129,11 @@ impl eframe::App for FleaScopeApp {
                         // Use full available height for control panel
                         ui.set_min_height(available_rect.height());
 
-                        // Access device manager safely for control panel
-                        if let Ok(mut manager) = self.device_manager.try_lock() {
-                            self.control_panel
-                                .ui(ui, &mut manager, &mut self.notification_manager);
-                        } else {
-                            ui.label("Loading control panel...");
-                        }
+                        self.control_panel.ui(
+                            ui,
+                            &mut self.device_manager,
+                            &mut self.notification_manager,
+                        );
                     },
                 );
             });
