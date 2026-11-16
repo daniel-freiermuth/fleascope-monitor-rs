@@ -5,7 +5,7 @@ Design inspired by analog oscilloscope.
 
 
 ### Prerequisites
-- Rust 1.70+ (2021 edition)
+- Rust 1.95+ (2021 edition; required by egui/eframe 0.37)
 - Cargo
 
 ### Installation
