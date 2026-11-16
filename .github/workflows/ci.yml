@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # Weekly run against the committed Cargo.lock on the latest stable toolchain,
+  # to catch toolchain/ecosystem rot (e.g. the ethnum 1.5.2 E0512 break) and
+  # newly published advisories even when nobody pushes.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # libudev-sys (serialport via fleascope-rs) links libudev through pkg-config.
+      # winit/glutin load wayland/x11/xkbcommon via dlopen, so no other dev libs are needed to build.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    # A newly published advisory should not block unrelated pushes/PRs;
+    # the weekly scheduled run reports it as a failure instead.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check advisories
