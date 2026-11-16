@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Error, Result};
+use anyhow::{anyhow, bail, Context as _, Error, Result};
 use arc_swap::ArcSwap;
 use fleascope_rs::flea_scope::{
     BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME,
@@ -6,7 +6,7 @@ use fleascope_rs::flea_scope::{
 use fleascope_rs::trigger_config::TriggerConfig as _;
 use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
 use polars::frame::DataFrame;
-use polars::prelude::{IntoLazy, UInt16Chunked};
+use polars::prelude::{IntoLazy, PolarsResult, UInt16Chunked};
 use polars::series::IntoSeries;
 
 use std::sync::Arc;
@@ -345,32 +345,36 @@ impl FleaWorker {
                     tokio::spawn(async move {
                         profiling::scope!("data_processing_pipeline");
 
-                        let _parse_csv_scope = {
+                        let processed = {
                             profiling::scope!("parse_csv");
                             reading
                                 .parse_csv()
-                                .map(|df| {
+                                .and_then(|df| {
                                     profiling::scope!("apply_calibration");
-                                    probe_clone.apply_calibration(df).collect().unwrap()
+                                    probe_clone.apply_calibration(df).collect()
                                 })
-                                .map(|df| {
+                                .map_err(Error::from)
+                                .and_then(|df| {
                                     profiling::scope!("convert_to_data_points");
-                                    FleaWorker::convert_polars_to_data_points(df)
+                                    FleaWorker::convert_polars_to_data_points(&df)
                                 })
                         };
 
-                        _parse_csv_scope
-                            .map(|data_points| {
+                        match processed {
+                            Ok((x_values, data_points)) => {
                                 profiling::scope!("update_shared_data");
 
                                 let new_data = DeviceData {
-                                    x_values: data_points.0,
-                                    data_points: data_points.1,
+                                    x_values,
+                                    data_points,
                                     last_update: Instant::now(),
                                 };
                                 data_copy.store(Arc::new(new_data));
-                            })
-                            .ok();
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to process triggered capture: {:#}", e);
+                            }
+                        }
                     });
                     return Ok(scope);
                 }
@@ -431,41 +435,35 @@ impl FleaWorker {
         let mut start_time = Instant::now();
         // let mut total_samples = 0u32;
         loop {
-            let batch_result = {
+            let read_result = {
                 profiling::scope!("read_batch_data");
 
-                streaming_scope.read(BUFF_SIZE).map(|buffer| {
-                    // Process the buffer data here
-                    let ca = UInt16Chunked::from_vec(RAW_COLUMN_NAME.into(), buffer);
-                    let column = ca.into_series().into();
-                    let df = DataFrame::new(vec![column]).unwrap();
-                    probe
-                        .apply_calibration(df.lazy())
-                        .collect()
-                        .unwrap()
-                        .column(CALIBRATED_COLUMN_NAME)
-                        .unwrap()
-                        .f64()
-                        .unwrap()
-                        .into_no_null_iter()
-                        .collect()
-                })
+                streaming_scope
+                    .read(BUFF_SIZE)
+                    .map(|buffer| Self::calibrate_batch(probe, buffer))
             };
 
-            match batch_result {
-                Ok(batch) => {
+            match read_result {
+                Ok(batch_result) => {
                     self.mark_connected();
-                    {
-                        profiling::scope!("send_batch_channel");
+                    match batch_result {
+                        Ok(batch) => {
+                            profiling::scope!("send_batch_channel");
 
-                        match self.batch_tx.try_send(batch) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                tracing::debug!("Batch channel full - dropping batch (UI not draining fast enough)");
+                            match self.batch_tx.try_send(batch) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::debug!("Batch channel full - dropping batch (UI not draining fast enough)");
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::warn!(
+                                        "Failed to send batch - receiver has been dropped"
+                                    );
+                                }
                             }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                tracing::warn!("Failed to send batch - receiver has been dropped");
-                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to calibrate streamed batch: {}", e);
                         }
                     }
                     if self.check_settings_changed() {
@@ -500,7 +498,18 @@ impl FleaWorker {
         }
     }
 
-    fn convert_polars_to_data_points(df: DataFrame) -> (Vec<f64>, Vec<DataPoint>) {
+    fn calibrate_batch(probe: &FleaProbe, buffer: Vec<u16>) -> PolarsResult<Vec<f64>> {
+        let ca = UInt16Chunked::from_vec(RAW_COLUMN_NAME.into(), buffer);
+        let df = DataFrame::new(vec![ca.into_series().into()])?;
+        let calibrated = probe.apply_calibration(df.lazy()).collect()?;
+        Ok(calibrated
+            .column(CALIBRATED_COLUMN_NAME)?
+            .f64()?
+            .into_no_null_iter()
+            .collect())
+    }
+
+    fn convert_polars_to_data_points(df: &DataFrame) -> Result<(Vec<f64>, Vec<DataPoint>)> {
         profiling::scope!("FleaWorker::convert_polars_to_data_points");
 
         tracing::debug!(
@@ -516,87 +525,50 @@ impl FleaWorker {
         // Extract columns from the DataFrame
         profiling::scope!("extract_dataframe_columns");
 
-        let time_col = match df.column(TIME_COLUMN_NAME) {
-            Ok(col) => col,
-            Err(e) => {
-                tracing::error!("Failed to get time column: {}", e);
-                panic!("Time column not found in DataFrame");
-            }
-        };
+        let time_col = df
+            .column(TIME_COLUMN_NAME)
+            .context("Time column not found in DataFrame")?;
+        let bnc_col = df
+            .column(CALIBRATED_COLUMN_NAME)
+            .context("BNC column not found in DataFrame")?;
+        let bitmap_col = df
+            .column(BITMAP_COLUMN_NAME)
+            .context("Bitmap column not found in DataFrame")?;
 
-        let bnc_col = match df.column(CALIBRATED_COLUMN_NAME) {
-            Ok(col) => col,
-            Err(e) => {
-                tracing::error!("Failed to get bnc column: {}", e);
-                panic!("BNC column not found in DataFrame");
-            }
-        };
+        let time_values: Vec<f64> = time_col
+            .f64()
+            .context("Time column conversion failed")?
+            .into_no_null_iter()
+            .collect();
+        let bnc_values: Vec<f64> = bnc_col
+            .f64()
+            .context("BNC column conversion failed")?
+            .into_no_null_iter()
+            .collect();
 
-        let bitmap_col = match df.column(BITMAP_COLUMN_NAME) {
-            Ok(col) => col,
-            Err(e) => {
-                tracing::error!("Failed to get bitmap column: {}", e);
-                panic!("Bitmap column not found in DataFrame");
-            }
-        };
-
-        let time_values: Vec<f64> = match time_col.f64() {
-            Ok(chunked) => chunked.into_no_null_iter().collect(),
-            Err(e) => {
-                tracing::error!("Failed to convert time column to f64: {}", e);
-                panic!("Time column conversion failed");
-            }
-        };
-
-        let bnc_values: Vec<f64> = match bnc_col.f64() {
-            Ok(chunked) => chunked.into_no_null_iter().collect(),
-            Err(e) => {
-                tracing::error!("Failed to convert bnc column to f64: {}", e);
-                panic!("BNC column conversion failed");
-            }
-        };
-
-        // Convert bitmap column - handle both string and numeric formats
-        let bitmap_values: Vec<u16> = if bitmap_col.dtype() == &polars::datatypes::DataType::String
-        {
+        // Handle string bitmap data (e.g., "0x1ff")
+        // TODO maybe use the fleascope-rs function
+        if bitmap_col.dtype() != &polars::datatypes::DataType::String {
+            bail!(
+                "Bitmap column has type {}, expected string",
+                bitmap_col.dtype()
+            );
+        }
+        let bitmap_values: Vec<u16> = {
             profiling::scope!("parse_bitmap_strings");
 
-            // Handle string bitmap data (e.g., "0x1ff", "0101010101", or "255")
-            // TODO maybe use the fleascope-rs function
-            match bitmap_col.str() {
-                Ok(chunked) => {
-                    let mut values = Vec::new();
-                    for opt_str in chunked.into_iter() {
-                        match opt_str {
-                            Some(s) => {
-                                // Hexadecimal string like "0x1ff"
-                                match u16::from_str_radix(&s[2..], 16) {
-                                    Ok(val) => values.push(val),
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to parse hex string '{}': {}",
-                                            s,
-                                            e
-                                        );
-                                        panic!("Invalid bitmap hex string");
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::error!("Found null bitmap value");
-                                panic!("Null bitmap value encountered");
-                            }
-                        }
-                    }
-                    values
-                }
-                Err(e) => {
-                    tracing::error!("Failed to convert bitmap column to string: {}", e);
-                    panic!("Bitmap column conversion failed");
-                }
-            }
-        } else {
-            panic!("Bitmap column is not a string type, expected string or numeric format");
+            bitmap_col
+                .str()
+                .context("Bitmap column conversion failed")?
+                .into_iter()
+                .map(|opt_str| {
+                    let s = opt_str.ok_or_else(|| anyhow!("Null bitmap value encountered"))?;
+                    // Hexadecimal string like "0x1ff"
+                    s.get(2..)
+                        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                        .ok_or_else(|| anyhow!("Invalid bitmap hex string '{}'", s))
+                })
+                .collect::<Result<_>>()?
         };
 
         tracing::debug!(
@@ -636,12 +608,14 @@ impl FleaWorker {
         }
 
         tracing::debug!("Converted to {} data points", data_points.len());
-        (x_values, data_points)
+        Ok((x_values, data_points))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     fn test_worker() -> (FleaWorker, watch::Receiver<WorkerStatus>) {

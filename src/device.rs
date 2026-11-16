@@ -95,7 +95,11 @@ impl DeviceManager {
             let d = self.devices.remove(index);
             d.stop();
         } else {
-            panic!("Device index out of bounds");
+            tracing::error!(
+                "Cannot remove device {}: only {} devices",
+                index,
+                self.devices.len()
+            );
         }
     }
 }
@@ -168,7 +172,7 @@ fn std_deviation(data: &[f64]) -> Option<f64> {
             let variance = data
                 .iter()
                 .map(|value| {
-                    let diff = data_mean - (*value as f64);
+                    let diff = data_mean - *value;
 
                     diff * diff
                 })

@@ -105,39 +105,40 @@ impl FleaScopeDevice {
             },
             CaptureModeFlat::Continuous => CaptureMode::Continuous {},
         };
-        self.config_change_tx
-            .send(CaptureConfig {
-                probe_multiplier: self.probe_multiplier,
-                mode: cm,
-            })
-            .expect("Failed to send config change signal");
+        let config = CaptureConfig {
+            probe_multiplier: self.probe_multiplier,
+            mode: cm,
+        };
+        if let Err(e) = self.config_change_tx.send(config) {
+            tracing::error!("Failed to send config change signal: {}", e);
+        }
+    }
+
+    fn send_control(&self, command: ControlCommand) {
+        if let Err(e) = self.control_signal_tx.try_send(command) {
+            tracing::error!("Failed to send control command: {}", e);
+        }
     }
 
     pub fn pause(&mut self) {
-        self.control_signal_tx
-            .try_send(ControlCommand::Pause)
-            .expect("Failed to send resume command");
+        self.send_control(ControlCommand::Pause);
     }
 
     pub fn stop(self) {
-        self.control_signal_tx
-            .try_send(ControlCommand::Exit)
-            .expect("Failed to send exit command");
+        self.send_control(ControlCommand::Exit);
     }
 
     pub fn resume(&mut self) {
-        self.control_signal_tx
-            .try_send(ControlCommand::Resume)
-            .expect("Failed to send resume command");
+        self.send_control(ControlCommand::Resume);
     }
 
     pub fn set_waveform(&mut self, waveform_type: Waveform, frequency_hz: i32) {
         self.waveform_config.waveform_type = waveform_type;
         self.waveform_config.frequency_hz = frequency_hz.clamp(10, 4000);
         self.waveform_config.enabled = true;
-        self.waveform_tx
-            .send(self.waveform_config.clone())
-            .expect("Failed to send waveform configuration");
+        if let Err(e) = self.waveform_tx.send(self.waveform_config.clone()) {
+            tracing::error!("Failed to send waveform configuration: {}", e);
+        }
     }
 
     pub fn set_probe_multiplier(&mut self, multiplier: ProbeType) {
