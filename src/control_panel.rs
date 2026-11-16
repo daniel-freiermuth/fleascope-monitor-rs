@@ -13,6 +13,71 @@ pub struct ControlPanel {
     available_devices: Vec<String>,
 }
 
+/// Map a pointer position to the dial's normalized 0.0-1.0 position (270° sweep).
+fn pointer_to_normalized(rect: egui::Rect, pointer_pos: egui::Pos2) -> f32 {
+    let delta = pointer_pos - rect.center();
+    let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
+    (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0)
+}
+
+/// Paint dial background, tick marks, pointer at `normalized`, optional label and value text.
+fn paint_dial(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    normalized: f32,
+    label: Option<&str>,
+    value_text: &str,
+) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.35;
+
+    // Draw dial background circle
+    painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
+
+    // Draw tick marks
+    for i in 0..12 {
+        let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
+        let inner_radius = radius * 0.85;
+        let outer_radius = radius * 0.95;
+        let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
+        let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
+        painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
+    }
+
+    // Calculate angle from dial position (270° range, starting from top-left)
+    let angle = -std::f32::consts::PI * 0.75 + normalized * std::f32::consts::PI * 1.5;
+
+    // Draw pointer
+    let pointer_start = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.3;
+    let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
+    painter.line_segment(
+        [pointer_start, pointer_end],
+        egui::Stroke::new(3.0, Color32::LIGHT_BLUE),
+    );
+
+    // Draw optional label in top-left corner (outside the interactive area)
+    if let Some(label_text) = label {
+        let label_pos = rect.min + egui::vec2(1.0, 1.0);
+        painter.text(
+            label_pos,
+            egui::Align2::LEFT_TOP,
+            label_text,
+            egui::FontId::proportional(8.0),
+            Color32::LIGHT_GRAY,
+        );
+    }
+
+    // Draw current value in bottom-right corner (outside the interactive area)
+    let value_pos = rect.max - egui::vec2(1.0, 1.0);
+    painter.text(
+        value_pos,
+        egui::Align2::RIGHT_BOTTOM,
+        value_text,
+        egui::FontId::proportional(8.0),
+        Color32::WHITE,
+    );
+}
+
 /// Custom dial widget with optional label and value display
 fn dial_widget(
     ui: &mut egui::Ui,
@@ -29,10 +94,7 @@ fn dial_widget(
     // Handle interaction FIRST (before drawing anything)
     if response.clicked() || response.dragged() {
         if let Some(pointer_pos) = response.interact_pointer_pos() {
-            let center = rect.center();
-            let delta = pointer_pos - center;
-            let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
-            let normalized = (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0);
+            let normalized = pointer_to_normalized(rect, pointer_pos);
             let new_value = range.start() + normalized * (range.end() - range.start());
             if (*value - new_value).abs() > 0.001 {
                 // Only update if there's a meaningful change
@@ -43,48 +105,7 @@ fn dial_widget(
     }
 
     if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let center = rect.center();
-        let radius = rect.width().min(rect.height()) * 0.35;
-
-        // Draw dial background circle
-        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
-
-        // Draw tick marks
-        for i in 0..12 {
-            let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
-            let inner_radius = radius * 0.85;
-            let outer_radius = radius * 0.95;
-            let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
-            let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
-            painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
-        }
-
-        // Calculate angle from value (270° range, starting from top-left)
         let normalized = (*value - range.start()) / (range.end() - range.start());
-        let angle = -std::f32::consts::PI * 0.75 + normalized * std::f32::consts::PI * 1.5;
-
-        // Draw pointer
-        let pointer_start = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.3;
-        let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
-        painter.line_segment(
-            [pointer_start, pointer_end],
-            egui::Stroke::new(3.0, Color32::LIGHT_BLUE),
-        );
-
-        // Draw optional label in top-left corner (outside the interactive area)
-        if let Some(label_text) = label {
-            let label_pos = rect.min + egui::vec2(1.0, 1.0);
-            painter.text(
-                label_pos,
-                egui::Align2::LEFT_TOP,
-                label_text,
-                egui::FontId::proportional(8.0),
-                Color32::LIGHT_GRAY,
-            );
-        }
-
-        // Draw current value in bottom-right corner (outside the interactive area)
         let value_text = if let Some(unit_text) = unit {
             if *value >= 1000.0 && unit == Some("Hz") {
                 format!("{:.1}k{}", *value / 1000.0, unit_text)
@@ -94,14 +115,7 @@ fn dial_widget(
         } else {
             format!("{:.1}", value)
         };
-        let value_pos = rect.max - egui::vec2(1.0, 1.0);
-        painter.text(
-            value_pos,
-            egui::Align2::RIGHT_BOTTOM,
-            &value_text,
-            egui::FontId::proportional(8.0),
-            Color32::WHITE,
-        );
+        paint_dial(ui.painter(), rect, normalized, label, &value_text);
     }
 
     response
@@ -129,10 +143,7 @@ fn exponential_dial_widget(
     // Handle interaction FIRST (before drawing anything)
     if response.clicked() || response.dragged() {
         if let Some(pointer_pos) = response.interact_pointer_pos() {
-            let center = rect.center();
-            let delta = pointer_pos - center;
-            let angle = delta.y.atan2(delta.x) + std::f32::consts::PI * 0.75;
-            let normalized = (angle / (std::f32::consts::PI * 1.5)).clamp(0.0, 1.0);
+            let normalized = pointer_to_normalized(rect, pointer_pos);
 
             // Convert back from exponential scale to actual value
             let new_value = min_value * ((max_value / min_value).powf(normalized as f64));
@@ -145,56 +156,8 @@ fn exponential_dial_widget(
     }
 
     if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let center = rect.center();
-        let radius = rect.width().min(rect.height()) * 0.35;
-
-        // Draw dial background circle
-        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, Color32::DARK_GRAY));
-
-        // Draw tick marks
-        for i in 0..12 {
-            let angle = i as f32 * std::f32::consts::PI / 6.0 - std::f32::consts::PI / 2.0;
-            let inner_radius = radius * 0.85;
-            let outer_radius = radius * 0.95;
-            let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
-            let end = center + egui::vec2(angle.cos(), angle.sin()) * outer_radius;
-            painter.line_segment([start, end], egui::Stroke::new(1.0, Color32::GRAY));
-        }
-
-        // Calculate angle from dial position (270° range, starting from top-left)
-        let angle = -std::f32::consts::PI * 0.75 + dial_position * std::f32::consts::PI * 1.5;
-
-        // Draw pointer
-        let pointer_start = center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.3;
-        let pointer_end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
-        painter.line_segment(
-            [pointer_start, pointer_end],
-            egui::Stroke::new(3.0, Color32::LIGHT_BLUE),
-        );
-
-        // Draw optional label in top-left corner
-        if let Some(label_text) = label {
-            let label_pos = rect.min + egui::vec2(1.0, 1.0);
-            painter.text(
-                label_pos,
-                egui::Align2::LEFT_TOP,
-                label_text,
-                egui::FontId::proportional(8.0),
-                Color32::LIGHT_GRAY,
-            );
-        }
-
-        // Draw current value with appropriate formatting
         let value_text = pretty_print_number(*value, unit, 2);
-        let value_pos = rect.max - egui::vec2(1.0, 1.0);
-        painter.text(
-            value_pos,
-            egui::Align2::RIGHT_BOTTOM,
-            &value_text,
-            egui::FontId::proportional(8.0),
-            Color32::WHITE,
-        );
+        paint_dial(ui.painter(), rect, dial_position, label, &value_text);
     }
 
     response
