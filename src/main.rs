@@ -41,7 +41,7 @@ impl eframe::App for FleaScopeApp {
         ui.ctx().request_repaint();
 
         // Top menu bar
-        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+        egui::Panel::top("top_panel").show(ui, |ui| {
             profiling::scope!("top_menu_bar");
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -80,7 +80,7 @@ impl eframe::App for FleaScopeApp {
         });
 
         // Status bar
-        egui::Panel::bottom("status_panel").show_inside(ui, |ui| {
+        egui::Panel::bottom("status_panel").show(ui, |ui| {
             profiling::scope!("status_bar");
             ui.horizontal(|ui| {
                 ui.label("Status: Ready");
@@ -97,7 +97,7 @@ impl eframe::App for FleaScopeApp {
         });
 
         // Main content area
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             profiling::scope!("main_content");
             // Use available space more efficiently
             let available_rect = ui.available_rect_before_wrap();

@@ -128,7 +128,7 @@ impl NotificationManager {
         let mut to_remove = Vec::new();
 
         // Show notifications in top-right corner
-        egui::Area::new("notifications".into())
+        egui::Area::new(egui::Id::unique("notifications"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 20.0))
             .show(ctx, |ui| {
                 ui.set_max_width(350.0);
