@@ -22,7 +22,6 @@ pub struct FleaScopeApp {
 
 impl FleaScopeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
         // Restore app state using cc.storage (requires the "persistence" feature).
         Self::default()
@@ -86,7 +85,10 @@ impl eframe::App for FleaScopeApp {
                 ui.label("Status: Ready");
                 ui.separator();
 
-                ui.label(format!("Devices: {}", self.device_manager.get_devices().len()));
+                ui.label(format!(
+                    "Devices: {}",
+                    self.device_manager.get_devices().len()
+                ));
                 ui.separator();
                 ui.label(format!("FPS: {:.1}", ui.input(|i| i.stable_dt).recip()));
 

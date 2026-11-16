@@ -99,9 +99,7 @@ impl ContinuousBuffer {
                 .clone()
                 .lazy()
                 .filter(col("time").gt_eq(lit(window_start)))
-                .select([
-                    polars::prelude::col("bnc").std(1),
-                ])
+                .select([polars::prelude::col("bnc").std(1)])
                 .collect()
                 .expect("Failed to filter and resample DataFrame")
                 .column("bnc")
