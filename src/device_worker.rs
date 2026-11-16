@@ -32,6 +32,20 @@ pub struct FleaWorker {
 }
 
 impl FleaWorker {
+    async fn notify(&self, notification: Notification) {
+        self.notification_tx
+            .send(notification)
+            .await
+            .expect("Failed to send notification");
+    }
+
+    fn probe_mut(&mut self, probe_type: ProbeType) -> (&mut FleaProbe, &'static str) {
+        match probe_type {
+            ProbeType::X1 => (&mut self.x1, "X1"),
+            ProbeType::X10 => (&mut self.x10, "X10"),
+        }
+    }
+
     async fn handle_control_command(
         &mut self,
         command: ControlCommand,
@@ -40,97 +54,31 @@ impl FleaWorker {
         tracing::info!("Handling control command: {:?}", command);
 
         match command {
-            ControlCommand::Calibrate0V(probe_multiplier) => match probe_multiplier {
-                ProbeType::X1 => match self.x1.calibrate_0(fleascope) {
-                    Ok(_) => {
-                        self.notification_tx
-                            .send(Notification::Success(
-                                "X1 probe calibrated at 0V".to_string(),
-                            ))
-                            .await
-                            .expect("Failed to send calibration result");
-                    }
-                    Err(e) => self
-                        .notification_tx
-                        .send(Notification::Error(format!("X1 calibration failed: {}", e)))
-                        .await
-                        .expect("Failed to send calibration result"),
-                },
-                ProbeType::X10 => match self.x10.calibrate_0(fleascope) {
-                    Ok(_) => {
-                        self.notification_tx
-                            .send(Notification::Success(
-                                "X10 probe calibrated at 0V".to_string(),
-                            ))
-                            .await
-                            .expect("Failed to send calibration result");
-                    }
-                    Err(e) => self
-                        .notification_tx
-                        .send(Notification::Error(format!(
-                            "X10 calibration failed: {}",
-                            e
-                        )))
-                        .await
-                        .expect("Failed to send calibration result"),
-                },
-            },
-            ControlCommand::Calibrate3V(probe_multiplier) => match probe_multiplier {
-                ProbeType::X1 => match self.x1.calibrate_3v3(fleascope) {
-                    Ok(_) => {
-                        self.notification_tx
-                            .send(Notification::Success(
-                                "X1 probe calibrated at 3.3V".to_string(),
-                            ))
-                            .await
-                            .expect("Failed to send calibration result");
-                    }
-                    Err(e) => self
-                        .notification_tx
-                        .send(Notification::Error(format!("X1 calibration failed: {}", e)))
-                        .await
-                        .expect("Failed to send calibration result"),
-                },
-                ProbeType::X10 => match self.x10.calibrate_3v3(fleascope) {
-                    Ok(_) => {
-                        self.notification_tx
-                            .send(Notification::Success(
-                                "X10 probe calibrated at 3.3V".to_string(),
-                            ))
-                            .await
-                            .expect("Failed to send calibration result");
-                    }
-                    Err(e) => self
-                        .notification_tx
-                        .send(Notification::Error(format!(
-                            "X10 calibration failed: {}",
-                            e
-                        )))
-                        .await
-                        .expect("Failed to send calibration result"),
-                },
-            },
+            ControlCommand::Calibrate0V(probe_type) => {
+                let (probe, name) = self.probe_mut(probe_type);
+                let notification = match probe.calibrate_0(fleascope) {
+                    Ok(_) => Notification::Success(format!("{name} probe calibrated at 0V")),
+                    Err(e) => Notification::Error(format!("{name} calibration failed: {e}")),
+                };
+                self.notify(notification).await;
+            }
+            ControlCommand::Calibrate3V(probe_type) => {
+                let (probe, name) = self.probe_mut(probe_type);
+                let notification = match probe.calibrate_3v3(fleascope) {
+                    Ok(_) => Notification::Success(format!("{name} probe calibrated at 3.3V")),
+                    Err(e) => Notification::Error(format!("{name} calibration failed: {e}")),
+                };
+                self.notify(notification).await;
+            }
             ControlCommand::StoreCalibration() => {
-                match Ok(())
+                let notification = match Ok(())
                     .and(self.x1.write_calibration_to_flash(fleascope))
                     .and(self.x10.write_calibration_to_flash(fleascope))
                 {
-                    Ok(_) => self
-                        .notification_tx
-                        .send(Notification::Success(
-                            "Calibration saved successfully".to_string(),
-                        ))
-                        .await
-                        .expect("Failed to send calibration save success"),
-                    Err(e) => self
-                        .notification_tx
-                        .send(Notification::Error(format!(
-                            "Failed to save calibration: {}",
-                            e
-                        )))
-                        .await
-                        .expect("Failed to send calibration save error"),
-                }
+                    Ok(_) => Notification::Success("Calibration saved successfully".to_string()),
+                    Err(e) => Notification::Error(format!("Failed to save calibration: {e}")),
+                };
+                self.notify(notification).await;
             }
             ControlCommand::Exit => {
                 tracing::info!("Exiting FleaWorker");
