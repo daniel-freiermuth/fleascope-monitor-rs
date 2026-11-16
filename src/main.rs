@@ -30,7 +30,7 @@ impl FleaScopeApp {
 }
 
 impl eframe::App for FleaScopeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         profiling::finish_frame!();
 
         // Update notifications (remove expired ones)
@@ -38,15 +38,15 @@ impl eframe::App for FleaScopeApp {
         self.notification_manager.update();
 
         // Request repaint for real-time updates
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
 
         // Top menu bar
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             profiling::scope!("top_menu_bar");
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
 
@@ -80,7 +80,7 @@ impl eframe::App for FleaScopeApp {
         });
 
         // Status bar
-        egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
+        egui::Panel::bottom("status_panel").show_inside(ui, |ui| {
             profiling::scope!("status_bar");
             ui.horizontal(|ui| {
                 ui.label("Status: Ready");
@@ -88,7 +88,7 @@ impl eframe::App for FleaScopeApp {
 
                 ui.label(format!("Devices: {}", self.device_manager.get_devices().len()));
                 ui.separator();
-                ui.label(format!("FPS: {:.1}", ctx.input(|i| i.stable_dt).recip()));
+                ui.label(format!("FPS: {:.1}", ui.input(|i| i.stable_dt).recip()));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("🚀 Rust GUI");
@@ -97,7 +97,7 @@ impl eframe::App for FleaScopeApp {
         });
 
         // Main content area
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             profiling::scope!("main_content");
             // Use available space more efficiently
             let available_rect = ui.available_rect_before_wrap();
@@ -141,7 +141,7 @@ impl eframe::App for FleaScopeApp {
 
         // Render notifications (always last, so they appear on top)
         profiling::scope!("notifications_render");
-        self.notification_manager.ui(ctx);
+        self.notification_manager.ui(ui.ctx());
     }
 }
 
