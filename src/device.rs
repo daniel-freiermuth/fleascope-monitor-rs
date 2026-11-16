@@ -131,7 +131,6 @@ pub enum ControlCommand {
     StoreCalibration(),
     Pause,
     Resume,
-    Step,
     Exit,
 }
 

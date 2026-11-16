@@ -142,11 +142,6 @@ impl FleaWorker {
             ControlCommand::Resume => {
                 self.set_as_running();
             }
-            ControlCommand::Step => {
-                tracing::info!("Stepping FleaWorker");
-                // Implement step logic if needed, e.g., trigger a single read
-                // This could be a no-op if stepping is not supported
-            }
         };
         Ok(())
     }
