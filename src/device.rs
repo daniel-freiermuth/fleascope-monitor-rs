@@ -1,12 +1,15 @@
 use arc_swap::ArcSwap;
 use fleascope_rs::{
-    AnalogTrigger, AnalogTriggerBuilder, BitState, DigitalTrigger, FleaConnectorError,
-    IdleFleaScope, ProbeType, Waveform,
+    AnalogTrigger, AnalogTriggerBuilder, BitState, DigitalTrigger, FleaConnector,
+    FleaConnectorError, IdleFleaScope, ProbeType, Waveform,
 };
 use std::{sync::Arc, time::Instant};
 use tokio::sync::watch;
 
-use crate::{device_worker::FleaWorker, worker_interface::FleaScopeDevice};
+use crate::{
+    device_worker::{port_attached, FleaWorker},
+    worker_interface::FleaScopeDevice,
+};
 
 // Time frame constants for consistent validation
 pub const MIN_TIME_FRAME: f64 = 0.000122; // 122μs
@@ -20,6 +23,14 @@ pub struct DeviceManager {
 impl DeviceManager {
     pub fn add_device(&mut self, hostname: String) -> Result<(), FleaConnectorError> {
         let (scope, x1, x10) = IdleFleaScope::connect(Some(&hostname), None, true)?;
+        // `connect` opened the first port enumerated under this name. The worker watches
+        // that port; a quick unplug and replug gets a new port while the dead one is open.
+        let port = FleaConnector::get_available_devices(Some(&hostname))?
+            .next()
+            .ok_or_else(|| FleaConnectorError::DeviceNotFound {
+                name: hostname.clone(),
+            })?
+            .port;
         let initial_config = CaptureConfig {
             probe_multiplier: ProbeType::X1,
             mode: CaptureMode::Triggered {
@@ -62,6 +73,7 @@ impl DeviceManager {
             x10,
             waveform_rx, // Channel for waveform configuration
             batch_tx,
+            device_present: Box::new(move || port_attached(&port)),
         };
 
         let device = FleaScopeDevice::new(

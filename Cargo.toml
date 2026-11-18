@@ -29,6 +29,10 @@ profiling = "1.0"
 version = "0.37.0"
 features = ["default", "all_loaders"]
 
+[dev-dependencies]
+# Pseudo-terminal pairs that stand in for a FleaScope in the worker tests.
+serialport = "4.10.1"
+
 [lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"

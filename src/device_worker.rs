@@ -18,6 +18,32 @@ use crate::device::{
     TriggerSource, WaveformConfig, WorkerStatus,
 };
 
+/// How often a paused worker checks that its device is still attached.
+const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether the serial port the scope was opened on is still attached. Polled while
+/// paused, so it must be cheap: listing ports scans every tty through libudev and even
+/// opens the `serial8250` ones (tens of ms of CPU per call).
+#[cfg(unix)]
+pub fn port_attached(port: &str) -> bool {
+    // Unplugging removes the device node even while it is open (USB serial and ptys
+    // alike), and the kernel does not hand the name to a new device until it is closed.
+    std::path::Path::new(port).exists()
+}
+
+/// Whether the serial port the scope was opened on is still attached.
+#[cfg(not(unix))]
+pub fn port_attached(port: &str) -> bool {
+    // COM port names are not paths, so fall back to listing the ports.
+    match fleascope_rs::FleaConnector::get_available_devices(None) {
+        Ok(mut devices) => devices.any(|device| device.port == port),
+        Err(e) => {
+            tracing::warn!("Cannot list serial ports, assuming {port} is attached: {e}");
+            true
+        }
+    }
+}
+
 pub struct FleaWorker {
     pub data: Arc<ArcSwap<DeviceData>>,
     /// Single source of truth for the worker's state; only the worker loop sends.
@@ -29,6 +55,9 @@ pub struct FleaWorker {
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub batch_tx: tokio::sync::mpsc::Sender<Vec<f64>>,
+    /// Whether the device is still attached. Nothing touches the port while paused, and
+    /// every fleascope-rs call on an unplugged port panics, so the pause polls this.
+    pub device_present: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl FleaWorker {
@@ -186,18 +215,30 @@ impl FleaWorker {
                 tracing::debug!("Device is paused, skipping data generation");
 
                 // During pause, still check for config changes and calibration commands
-                tokio::select! {
+                let command = tokio::select! {
                     signal = self.waveform_rx.changed() => {
                         if signal.is_ok() {
                             tracing::info!("Configuration changed while paused, will restart");
                         }
+                        None
                     }
-                    Some(command) = self.control_rx.recv() => {
-                        tracing::info!("Received calibration command while paused: {:?}", command);
-                        if let Err(e) = self.handle_control_command(command, &mut fleascope).await {
-                            tracing::info!("FleaWorker stopping: {e:#}");
-                            break;
-                        }
+                    Some(command) = self.control_rx.recv() => Some(command),
+                    () = tokio::time::sleep(PRESENCE_POLL_INTERVAL) => None,
+                };
+                // Nothing touched the port while paused, so this is the only way to notice an
+                // unplug before the next fleascope-rs call (RUN, calibration, teardown on
+                // Remove) panics on the dead port. A consumed `Exit` is fine: `stop()` also
+                // drops the device handle, which ends `wait_for_removal`.
+                if !(self.device_present)() {
+                    tracing::error!("Device unplugged while paused");
+                    self.set_lost_connection().await;
+                    return None;
+                }
+                if let Some(command) = command {
+                    tracing::info!("Received calibration command while paused: {:?}", command);
+                    if let Err(e) = self.handle_control_command(command, &mut fleascope).await {
+                        tracing::info!("FleaWorker stopping: {e:#}");
+                        break;
                     }
                 }
                 continue;
@@ -617,6 +658,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    #[cfg(unix)]
+    use fleascope_rs::{IdleFleaTerminal, StatelessFleaTerminal};
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_worker() -> (FleaWorker, watch::Receiver<WorkerStatus>) {
         let (_config_tx, config_change_rx) = watch::channel(CaptureConfig {
@@ -646,6 +691,7 @@ mod tests {
             x1: FleaProbe::new(ProbeType::X1),
             x10: FleaProbe::new(ProbeType::X10),
             batch_tx,
+            device_present: Box::new(|| true),
         };
         (worker, status_rx)
     }
@@ -749,5 +795,154 @@ mod tests {
             .await
             .expect("worker must stop on Exit")
             .unwrap();
+    }
+
+    /// The UI side of a worker, as `FleaScopeDevice` holds it. Dropping it after
+    /// sending `Exit` is what `DeviceManager::remove_device` does.
+    #[cfg(unix)]
+    struct UiHandles {
+        _config_tx: watch::Sender<CaptureConfig>,
+        _waveform_tx: watch::Sender<WaveformConfig>,
+        control_tx: tokio::sync::mpsc::Sender<ControlCommand>,
+        _notification_rx: tokio::sync::mpsc::Receiver<Notification>,
+    }
+
+    #[cfg(unix)]
+    fn attach_ui(worker: &mut FleaWorker) -> UiHandles {
+        let (config_tx, config_change_rx) = watch::channel(CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::Continuous {},
+        });
+        let (waveform_tx, waveform_rx) = watch::channel(WaveformConfig::default());
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
+        let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(32);
+        worker.config_change_rx = config_change_rx;
+        worker.waveform_rx = waveform_rx;
+        worker.control_rx = control_rx;
+        worker.notification_tx = notification_tx;
+        UiHandles {
+            _config_tx: config_tx,
+            _waveform_tx: waveform_tx,
+            control_tx,
+            _notification_rx: notification_rx,
+        }
+    }
+
+    /// A fake device on a pseudo terminal that answers every command with the prompt.
+    #[cfg(unix)]
+    struct FakeFleaScope {
+        port: String,
+        plugged: Arc<AtomicBool>,
+        device: std::thread::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl FakeFleaScope {
+        fn plug_in() -> (Self, IdleFleaScope) {
+            use serialport::SerialPort as _;
+            use std::io::{ErrorKind, Read as _, Write as _};
+
+            let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+            let plugged = Arc::new(AtomicBool::new(true));
+            let device = std::thread::spawn({
+                let plugged = plugged.clone();
+                move || {
+                    let mut buf = [0u8; 256];
+                    while plugged.load(Ordering::SeqCst) {
+                        match master.read(&mut buf) {
+                            Ok(n) => {
+                                for _ in buf[..n].iter().filter(|&&byte| byte == b'\n') {
+                                    master.write_all(b"> ").unwrap();
+                                }
+                            }
+                            Err(e) => assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}"),
+                        }
+                    }
+                }
+            });
+            let port = slave.name().unwrap();
+            let terminal = StatelessFleaTerminal::new(&port).unwrap();
+            let scope = IdleFleaScope::new(IdleFleaTerminal::try_from(terminal).unwrap());
+            drop(slave);
+            (
+                Self {
+                    port,
+                    plugged,
+                    device,
+                },
+                scope,
+            )
+        }
+
+        /// What `DeviceManager` gives the worker as `device_present`.
+        fn presence(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
+            let port = self.port.clone();
+            Box::new(move || port_attached(&port))
+        }
+
+        /// Closes the master side. Like the kernel does to an open tty whose USB
+        /// device is unplugged, this hangs up the port: every further write fails.
+        fn unplug(self) {
+            self.plugged.store(false, Ordering::SeqCst);
+            self.device.join().unwrap();
+        }
+    }
+
+    /// Nothing touches the port while paused, yet every fleascope-rs call on an
+    /// unplugged port panics (and release builds abort). The worker must notice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paused_worker_notices_unplug_on_its_own() {
+        let (mut worker, mut status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        worker.device_present = device.presence();
+        worker.set_as_paused();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL * 3).await;
+        assert!(
+            status_rx.borrow().connected,
+            "present device lost while paused"
+        );
+        assert!(!task.is_finished());
+
+        device.unplug();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            status_rx.wait_for(|status| !status.connected),
+        )
+        .await
+        .expect("paused worker must notice the unplug")
+        .unwrap();
+
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// Removing the device right after the unplug must not reach
+    /// `IdleFleaScope::teardown`, which writes to the dead port.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_device_unplugged_while_paused_does_not_panic() {
+        let (mut worker, _status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        worker.device_present = device.presence();
+        worker.set_as_paused();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+        tokio::task::yield_now().await; // let the worker settle into its pause
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
     }
 }
