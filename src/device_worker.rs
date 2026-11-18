@@ -21,6 +21,77 @@ use crate::device::{
 /// How often a paused worker checks that its device is still attached.
 const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long fleascope-rs `cancel()`/`stop()` may wait for the prompt after CTRL-C.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long one `ReadingFleaScope::try_get_result` may take: a single serial read,
+/// which fleascope-rs bounds with a 70 ms port timeout.
+const POLL_TIMEOUT: Duration = Duration::from_secs(1);
+
+const IO_THREAD_NAME: &str = "fleascope-io";
+
+/// Runs a fleascope-rs call that may panic or never return on its own thread and gives up
+/// after `deadline`, abandoning that thread; `None` means the call did not deliver.
+/// fleascope-rs panics on serial errors (`BusyFleaTerminal::cancel`, `read_chunk`), and
+/// `cancel` waits for the prompt with no deadline. An abandoned thread either finishes late
+/// and drops its result, or panics: with `panic = "unwind"` that ends only the thread, and
+/// under `panic = "abort"` (release builds) `contain_io_panics` keeps it from aborting.
+async fn run_contained<T: Send + 'static>(
+    deadline: Duration,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    contain_io_panics();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(IO_THREAD_NAME.to_string())
+        .spawn(move || {
+            // The receiver is gone once we gave up; the late result is dropped then.
+            let _ = result_tx.send(call());
+        });
+    if let Err(e) = spawned {
+        tracing::error!("Cannot spawn a thread for device I/O: {e}");
+        return None;
+    }
+    if let Ok(Ok(result)) = tokio::time::timeout(deadline, result_rx).await {
+        return Some(result);
+    }
+    tracing::error!("Device I/O did not complete within {deadline:?}");
+    None
+}
+
+/// `cancel()`/`stop()` under `run_contained`; `None` means the device did not answer CTRL-C.
+async fn cancel_with_deadline(
+    cancel: impl FnOnce() -> IdleFleaScope + Send + 'static,
+) -> Option<IdleFleaScope> {
+    run_contained(CANCEL_TIMEOUT, cancel).await
+}
+
+/// Unwinding ends only the panicking thread, so there is nothing to contain.
+#[cfg(not(panic = "abort"))]
+fn contain_io_panics() {}
+
+/// A panic hook runs before the abort, so parking the panicking thread in it keeps a panic
+/// in a `run_contained` thread from aborting the process. std calls the hook while holding
+/// its hook lock for reading, so a parked thread keeps that lock: after the first contained
+/// panic, `std::panic::set_hook`/`take_hook` block forever. Nothing in the app calls them
+/// after start-up; the hook must stay the last one installed.
+#[cfg(panic = "abort")]
+fn contain_io_panics() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().name() == Some(IO_THREAD_NAME) {
+                tracing::error!("fleascope-rs panicked during device I/O, parking: {info}");
+                loop {
+                    std::thread::park();
+                }
+            }
+            previous(info);
+        }));
+    });
+}
+
 /// Whether the serial port the scope was opened on is still attached. Polled while
 /// paused, so it must be cheap: listing ports scans every tty through libudev and even
 /// opens the `serial8250` ones (tens of ms of CPU per call).
@@ -382,8 +453,11 @@ impl FleaWorker {
         tracing::debug!("Successfully started read operation on FleaScope");
 
         loop {
-            match fleascope_for_read.try_get_result() {
-                Ok(Ok((scope, reading))) => {
+            // `read_chunk` panics on serial errors other than TimedOut, BrokenPipe and
+            // UnexpectedEof (e.g. EIO), so poll on a contained thread.
+            let poll = move || fleascope_for_read.try_get_result();
+            match run_contained(POLL_TIMEOUT, poll).await {
+                Some(Ok(Ok((scope, reading)))) => {
                     self.mark_connected();
                     let data_copy = self.data.clone();
                     tokio::spawn(async move {
@@ -422,20 +496,32 @@ impl FleaWorker {
                     });
                     return Ok(scope);
                 }
-                Ok(Err(scope)) => {
+                Some(Ok(Err(scope))) => {
                     fleascope_for_read = scope;
                 }
-                Err(_) => {
+                Some(Err(_)) | None => {
                     tracing::error!("Error during hardware read: Connection lost");
                     self.set_lost_connection().await;
                     return Err(Error::msg("Connection lost during hardware read"));
                 }
             }
-            profiling::scope!("hardware_wait_polling_loop");
+            let settings_changed = {
+                // A tracy span is !Send; keep it off the awaits below so `run` stays Send.
+                profiling::scope!("hardware_wait_polling_loop");
+                self.check_settings_changed()
+            };
 
-            if self.check_settings_changed() {
+            if settings_changed {
                 tracing::info!("Settings changed during hardware wait, calling unblock()");
-                return Ok(fleascope_for_read.cancel());
+                // A silent device is indistinguishable from one waiting for its trigger.
+                if let Some(scope) = cancel_with_deadline(move || fleascope_for_read.cancel()).await
+                {
+                    return Ok(scope);
+                }
+                self.set_lost_connection().await;
+                return Err(Error::msg(
+                    "Device did not answer CTRL-C during hardware read",
+                ));
             }
         }
     }
@@ -511,15 +597,25 @@ impl FleaWorker {
                         }
                     }
                     if self.check_settings_changed() {
-                        return Ok(streaming_scope.stop());
+                        if let Some(scope) =
+                            cancel_with_deadline(move || streaming_scope.stop()).await
+                        {
+                            return Ok(scope);
+                        }
+                        self.set_lost_connection().await;
+                        return Err(Error::msg("Device did not answer CTRL-C during streaming"));
                     }
                 }
-                // fleascope-rs treats only BrokenPipe/UnexpectedEof as connection loss and
-                // `cancel()` tolerates TimedOut, so keep the stop-and-pause path for timeouts.
+                // The port reads with a 70 ms timeout, so this may be a stall of a live device:
+                // stop and pause, keeping the scope so RUN resumes, unless CTRL-C goes unanswered.
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     tracing::error!("Timed out reading from continuous stream: {}", e);
                     self.set_lost_connection().await;
-                    return Ok(streaming_scope.stop());
+                    return cancel_with_deadline(move || streaming_scope.stop())
+                        .await
+                        .ok_or_else(|| {
+                            Error::new(e).context("Device did not answer CTRL-C after a stall")
+                        });
                 }
                 Err(e) => {
                     tracing::error!("Error reading from continuous stream: {}", e);
@@ -804,10 +900,10 @@ mod tests {
     /// sending `Exit` is what `DeviceManager::remove_device` does.
     #[cfg(unix)]
     struct UiHandles {
-        _config_tx: watch::Sender<CaptureConfig>,
+        config_tx: watch::Sender<CaptureConfig>,
         waveform_tx: watch::Sender<WaveformConfig>,
         control_tx: tokio::sync::mpsc::Sender<ControlCommand>,
-        _notification_rx: tokio::sync::mpsc::Receiver<Notification>,
+        notification_rx: tokio::sync::mpsc::Receiver<Notification>,
     }
 
     #[cfg(unix)]
@@ -824,20 +920,21 @@ mod tests {
         worker.control_rx = control_rx;
         worker.notification_tx = notification_tx;
         UiHandles {
-            _config_tx: config_tx,
+            config_tx,
             waveform_tx,
             control_tx,
-            _notification_rx: notification_rx,
+            notification_rx,
         }
     }
 
-    /// A fake device on a pseudo terminal that answers every command with the prompt.
+    /// A fake device on a pseudo terminal that answers every command and CTRL-C with the prompt.
     #[cfg(unix)]
     struct FakeFleaScope {
         port: String,
         plugged: Arc<AtomicBool>,
         /// Every byte the worker wrote to the device.
         received: Arc<std::sync::Mutex<Vec<u8>>>,
+        answering: Arc<AtomicBool>,
         device: std::thread::JoinHandle<()>,
     }
 
@@ -850,19 +947,27 @@ mod tests {
             let (mut master, slave) = serialport::TTYPort::pair().unwrap();
             let plugged = Arc::new(AtomicBool::new(true));
             let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let answering = Arc::new(AtomicBool::new(true));
             let device = std::thread::spawn({
                 let plugged = plugged.clone();
                 let received = received.clone();
+                let answering = answering.clone();
                 move || {
                     let mut buf = [0u8; 256];
                     while plugged.load(Ordering::SeqCst) {
                         match master.read(&mut buf) {
+                            Ok(_) if !answering.load(Ordering::SeqCst) => {}
                             Ok(n) => {
                                 received.lock().unwrap().extend_from_slice(&buf[..n]);
-                                for _ in buf[..n].iter().filter(|&&byte| byte == b'\n') {
+                                for _ in buf[..n]
+                                    .iter()
+                                    .filter(|&&byte| byte == b'\n' || byte == 0x03)
+                                {
                                     master.write_all(b"> ").unwrap();
                                 }
                             }
+                            // The host closed its end of the port (the worker dropped the scope).
+                            Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
                             Err(e) => assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}"),
                         }
                     }
@@ -877,6 +982,7 @@ mod tests {
                     port,
                     plugged,
                     received,
+                    answering,
                     device,
                 },
                 scope,
@@ -887,6 +993,11 @@ mod tests {
         fn presence(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
             let port = self.port.clone();
             Box::new(move || port_attached(&port))
+        }
+
+        /// Keeps the port attached but stops answering, like a wedged device.
+        fn go_silent(&self) {
+            self.answering.store(false, Ordering::SeqCst);
         }
 
         /// Closes the master side. Like the kernel does to an open tty whose USB
@@ -996,5 +1107,147 @@ mod tests {
             reached.is_ok(),
             "waveform change made while paused never reached the device"
         );
+    }
+
+    /// A fleascope-rs panic in a contained I/O thread must not wedge std's panic-hook
+    /// lock: libtest swaps the hook after the last test, so `cargo test` would never exit.
+    #[tokio::test]
+    async fn panic_in_contained_io_leaves_panic_hook_usable() {
+        let result = run_contained(CANCEL_TIMEOUT, || {
+            std::hint::black_box(None::<()>).expect("Serial read error");
+        })
+        .await;
+        assert!(result.is_none());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::panic::set_hook(std::panic::take_hook());
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the panic hook lock must stay free");
+    }
+
+    /// Runs the worker on its own thread and runtime, so a worker hung for good (a
+    /// fleascope-rs `cancel()` waiting for a prompt) fails the test instead of hanging it.
+    /// The test drives it from its own thread; the worker loops may never yield.
+    #[cfg(unix)]
+    fn run_on_own_thread(
+        mut worker: FleaWorker,
+        scope: IdleFleaScope,
+    ) -> std::sync::mpsc::Receiver<()> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(worker.run(scope));
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+    }
+
+    #[cfg(unix)]
+    fn wait_until(
+        status_rx: &watch::Receiver<WorkerStatus>,
+        what: &str,
+        done: impl Fn(&WorkerStatus) -> bool,
+    ) {
+        let deadline = Instant::now() + CANCEL_TIMEOUT + Duration::from_secs(2);
+        while !done(&status_rx.borrow()) {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn next_notification(ui: &mut UiHandles) -> String {
+        let deadline = Instant::now() + CANCEL_TIMEOUT + Duration::from_secs(2);
+        loop {
+            if let Ok(Notification::Success(message) | Notification::Error(message)) =
+                ui.notification_rx.try_recv()
+            {
+                return message;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a notification"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// What `DeviceManager::remove_device` does; the worker must then finish.
+    #[cfg(unix)]
+    fn remove(ui: UiHandles, done: &std::sync::mpsc::Receiver<()>) {
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        done.recv_timeout(CANCEL_TIMEOUT + Duration::from_secs(2))
+            .expect("worker must stop once the device is removed");
+    }
+
+    /// A stream that times out may mean the device stopped answering. `stop()` would
+    /// then wait forever for a prompt (`BusyFleaTerminal::cancel` has no deadline).
+    #[cfg(unix)]
+    #[test]
+    fn continuous_read_timeout_on_silent_device_gives_up_instead_of_hanging() {
+        let (mut worker, status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        device.go_silent();
+        let done = run_on_own_thread(worker, scope);
+        wait_until(&status_rx, "the connection is lost", |status| {
+            !status.connected
+        });
+        remove(ui, &done);
+        device.unplug();
+    }
+
+    /// In triggered mode a silent device looks like one waiting for its trigger, so
+    /// STOP (or any settings change, or removal) reaches `cancel()` on it.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_triggered_capture_on_silent_device_gives_up_instead_of_hanging() {
+        let (mut worker, status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        ui.config_tx.send_replace(CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::Triggered {
+                trigger_config: TriggerConfig::default(),
+                time_frame: 0.1,
+            },
+        });
+        let (device, scope) = FakeFleaScope::plug_in();
+        device.go_silent();
+        let done = run_on_own_thread(worker, scope);
+        std::thread::sleep(Duration::from_millis(200)); // let it wait for the trigger
+        ui.control_tx.try_send(ControlCommand::Pause).unwrap();
+        wait_until(&status_rx, "the connection is lost", |status| {
+            !status.connected
+        });
+        remove(ui, &done);
+        device.unplug();
+    }
+
+    /// A device that merely paused its stream for one read timeout still answers
+    /// CTRL-C; the worker must keep its scope so RUN restarts the stream.
+    #[cfg(unix)]
+    #[test]
+    fn continuous_read_timeout_on_live_device_stays_resumable() {
+        let (mut worker, _status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        let done = run_on_own_thread(worker, scope);
+        // The fake never streams samples, so every stream read times out.
+        assert!(next_notification(&mut ui).contains("Lost connection"));
+        ui.control_tx.try_send(ControlCommand::Resume).unwrap();
+        let after_run = next_notification(&mut ui);
+        assert!(
+            after_run.contains("Lost connection"),
+            "RUN must restart the stream, got {after_run:?}"
+        );
+        remove(ui, &done);
+        device.unplug();
     }
 }
