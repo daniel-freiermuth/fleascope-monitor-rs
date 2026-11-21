@@ -1,5 +1,5 @@
 # FleaScope Live Oscilloscope Makefile
-.PHONY: build run clean release help dev-check watch
+.PHONY: build run clean release help dev-check watch fmt-check ci
 
 # Default target
 all: build
@@ -53,6 +53,16 @@ fmt:
 lint:
 	cargo clippy
 
+# Check formatting without rewriting files (fails on unformatted code)
+fmt-check:
+	cargo fmt --all -- --check
+
+# Run the same checks as .github/workflows/ci.yml; fails on any violation.
+# clippy fails on the deny-level lints in Cargo.toml's [lints] tables.
+ci: fmt-check
+	cargo clippy --locked --all-targets
+	cargo test --locked
+
 # Install dependencies
 deps:
 	cargo fetch
@@ -71,6 +81,8 @@ help:
 	@echo "  check        - Check code without building"
 	@echo "  test         - Run tests"
 	@echo "  fmt          - Format code"
+	@echo "  fmt-check    - Check formatting without modifying files"
 	@echo "  lint         - Run clippy linter"
+	@echo "  ci           - Run the CI checks (fmt-check, clippy, test) locally"
 	@echo "  deps         - Install dependencies"
 	@echo "  help         - Show this help message"
