@@ -218,7 +218,10 @@ impl FleaWorker {
                 let command = tokio::select! {
                     signal = self.waveform_rx.changed() => {
                         if signal.is_ok() {
-                            tracing::info!("Configuration changed while paused, will restart");
+                            tracing::info!("Waveform configuration changed while paused");
+                            // `changed()` marked it as seen; flag it again so the
+                            // `has_changed()` check above applies it to the device.
+                            self.waveform_rx.mark_changed();
                         }
                         None
                     }
@@ -802,7 +805,7 @@ mod tests {
     #[cfg(unix)]
     struct UiHandles {
         _config_tx: watch::Sender<CaptureConfig>,
-        _waveform_tx: watch::Sender<WaveformConfig>,
+        waveform_tx: watch::Sender<WaveformConfig>,
         control_tx: tokio::sync::mpsc::Sender<ControlCommand>,
         _notification_rx: tokio::sync::mpsc::Receiver<Notification>,
     }
@@ -822,7 +825,7 @@ mod tests {
         worker.notification_tx = notification_tx;
         UiHandles {
             _config_tx: config_tx,
-            _waveform_tx: waveform_tx,
+            waveform_tx,
             control_tx,
             _notification_rx: notification_rx,
         }
@@ -833,6 +836,8 @@ mod tests {
     struct FakeFleaScope {
         port: String,
         plugged: Arc<AtomicBool>,
+        /// Every byte the worker wrote to the device.
+        received: Arc<std::sync::Mutex<Vec<u8>>>,
         device: std::thread::JoinHandle<()>,
     }
 
@@ -844,13 +849,16 @@ mod tests {
 
             let (mut master, slave) = serialport::TTYPort::pair().unwrap();
             let plugged = Arc::new(AtomicBool::new(true));
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
             let device = std::thread::spawn({
                 let plugged = plugged.clone();
+                let received = received.clone();
                 move || {
                     let mut buf = [0u8; 256];
                     while plugged.load(Ordering::SeqCst) {
                         match master.read(&mut buf) {
                             Ok(n) => {
+                                received.lock().unwrap().extend_from_slice(&buf[..n]);
                                 for _ in buf[..n].iter().filter(|&&byte| byte == b'\n') {
                                     master.write_all(b"> ").unwrap();
                                 }
@@ -868,6 +876,7 @@ mod tests {
                 Self {
                     port,
                     plugged,
+                    received,
                     device,
                 },
                 scope,
@@ -944,5 +953,48 @@ mod tests {
             .await
             .expect("worker must stop once the device is removed")
             .expect("worker must not panic");
+    }
+
+    /// The waveform generator controls work while paused (control_panel.rs). A change
+    /// made then must still reach the device, not be swallowed by the pause wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waveform_change_while_paused_reaches_device() {
+        let (mut worker, _status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        worker.device_present = device.presence();
+        worker.set_as_paused();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+        tokio::task::yield_now().await; // let the worker settle into its pause
+
+        ui.waveform_tx
+            .send(WaveformConfig {
+                enabled: true,
+                waveform_type: fleascope_rs::Waveform::Square,
+                frequency_hz: 440,
+            })
+            .unwrap();
+
+        let reached = tokio::time::timeout(Duration::from_secs(2), async {
+            while !String::from_utf8_lossy(&device.received.lock().unwrap())
+                .contains("wave square 440")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+        assert!(
+            reached.is_ok(),
+            "waveform change made while paused never reached the device"
+        );
     }
 }
