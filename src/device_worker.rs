@@ -106,7 +106,7 @@ impl FleaWorker {
                     .and(self.x1.write_calibration_to_flash(fleascope))
                     .and(self.x10.write_calibration_to_flash(fleascope))
                 {
-                    Ok(_) => Notification::Success("Calibration saved successfully".to_string()),
+                    Ok(()) => Notification::Success("Calibration saved successfully".to_string()),
                     Err(e) => Notification::Error(format!("Failed to save calibration: {e}")),
                 };
                 self.notify(notification).await?;
@@ -121,7 +121,7 @@ impl FleaWorker {
             ControlCommand::Resume => {
                 self.set_as_running();
             }
-        };
+        }
         Ok(())
     }
 
@@ -356,7 +356,7 @@ impl FleaWorker {
                     trigger_config
                         .analog
                         .into_trigger(probe)
-                        .map(|trigger| trigger.into_trigger_fields())
+                        .map(fleascope_rs::AnalogTrigger::into_trigger_fields)
                 }
                 TriggerSource::Digital => {
                     tracing::debug!("Converting digital trigger to string");
@@ -371,8 +371,7 @@ impl FleaWorker {
                 tracing::error!("Failed to convert trigger to string: {}", e);
                 if let Err(e) = self
                     .notify(Notification::Error(format!(
-                        "Invalid trigger configuration: {}",
-                        e
+                        "Invalid trigger configuration: {e}"
                     )))
                     .await
                 {
@@ -725,7 +724,7 @@ mod tests {
     }
 
     /// The UI derives the RUN/STOP button from the worker status channel
-    /// (control_panel.rs). Resume after Pause must publish `running = true`,
+    /// (`control_panel.rs`). Resume after Pause must publish `running = true`,
     /// otherwise the device stays "paused" in the UI forever.
     #[test]
     fn resume_after_pause_publishes_running_to_status() {
@@ -779,7 +778,7 @@ mod tests {
     }
 
     /// After a lost connection the device stays in the UI, which `.expect`s on every
-    /// send to the worker (worker_interface.rs). The worker must keep its receivers
+    /// send to the worker (`worker_interface.rs`). The worker must keep its receivers
     /// alive until the device is removed, rejecting commands it cannot serve.
     #[tokio::test]
     async fn disconnected_worker_keeps_ui_channels_open_until_exit() {
@@ -1017,7 +1016,7 @@ mod tests {
             .expect("worker must not panic");
     }
 
-    /// The waveform generator controls work while paused (control_panel.rs). A change
+    /// The waveform generator controls work while paused (`control_panel.rs`). A change
     /// made then must still reach the device, not be swallowed by the pause wait.
     #[cfg(unix)]
     #[tokio::test]

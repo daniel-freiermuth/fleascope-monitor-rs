@@ -127,7 +127,7 @@ pub struct DigitalStreamBuffer {
     last_t: f64,
     /// Estimated samples / second (from windowed counter); 0 until measured.
     pub sample_rate_hz: f64,
-    /// Exact rate from the FW config; `None` for free-run (us_per_sample == 0).
+    /// Exact rate from the FW config; `None` for free-run (`us_per_sample` == 0).
     configured_rate_hz: Option<f64>,
     /// Display window in seconds; kept in sync from the plot arm each frame.
     window_s: f64,
@@ -140,7 +140,7 @@ pub struct DigitalStreamBuffer {
 
 impl DigitalStreamBuffer {
     const RATE_WINDOW_SECS: f64 = 0.5;
-    /// Target display density: MAX_POINTS bins per `window_s`.
+    /// Target display density: `MAX_POINTS` bins per `window_s`.
     const MAX_POINTS: usize = 2048;
     /// Memory safety cap: 65 536 bins × 32 bytes ≈ 2 MB.
     const MEMORY_CAP: usize = 65_536;
@@ -241,8 +241,8 @@ impl DigitalStreamBuffer {
         self.bins.drain(..excess);
     }
 
-    /// Return (x_times, y_values) for `channel` (0-8) over the last `window_s` seconds.
-    /// At most 2 × MAX_POINTS entries: a bin where the channel toggled yields both levels.
+    /// Return (`x_times`, `y_values`) for `channel` (0-8) over the last `window_s` seconds.
+    /// At most 2 × `MAX_POINTS` entries: a bin where the channel toggled yields both levels.
     pub fn get_channel_data(&self, channel: usize, window_s: f64) -> (Vec<f64>, Vec<f64>) {
         let cutoff = self.last_t - window_s;
         let level = |mask: u16| f64::from((mask >> channel) & 1);
@@ -452,7 +452,7 @@ impl PlotArea {
             return;
         }
 
-        let plot = Plot::new(format!("analog_plot_{}", device_idx))
+        let plot = Plot::new(format!("analog_plot_{device_idx}"))
             .height(self.plot_height)
             .show_grid(self.show_grid)
             .auto_bounds([true, true])
@@ -497,7 +497,7 @@ impl PlotArea {
                     return;
                 }
 
-                let plot = Plot::new(format!("digital_plot_{}", device_idx))
+                let plot = Plot::new(format!("digital_plot_{device_idx}"))
                     .height(self.plot_height * 1.5)
                     .show_grid(self.show_grid)
                     .auto_bounds([true, true])
@@ -520,7 +520,7 @@ impl PlotArea {
                         if !filtered_data.is_empty() {
                             let filtered_points = PlotPoints::from(filtered_data);
                             let color_idx = (ch + 1) % self.colors.len();
-                            let line = Line::new(format!("D{}", ch), filtered_points)
+                            let line = Line::new(format!("D{ch}"), filtered_points)
                                 .color(self.colors[color_idx])
                                 .width(1.5);
                             plot_ui.line(line);
@@ -558,7 +558,7 @@ impl PlotArea {
                     return;
                 }
 
-                let plot = Plot::new(format!("digital_stream_plot_{}", device_idx))
+                let plot = Plot::new(format!("digital_stream_plot_{device_idx}"))
                     .height(self.plot_height * 1.5)
                     .show_grid(self.show_grid)
                     .auto_bounds([true, true])
@@ -589,7 +589,7 @@ impl PlotArea {
                             if !filtered_data.is_empty() {
                                 let filtered_points = PlotPoints::from(filtered_data);
                                 let color_idx = (ch + 1) % colors.len();
-                                let line = Line::new(format!("D{}", ch), filtered_points)
+                                let line = Line::new(format!("D{ch}"), filtered_points)
                                     .color(colors[color_idx])
                                     .width(1.5);
                                 plot_ui.line(line);
@@ -664,6 +664,6 @@ mod tests {
         buf.add_batch(&[0b1; 56]);
 
         assert!(buf.sample_rate_hz == 0.0, "no rate is known yet");
-        assert!(buf.get_channel_data(0, 1.0).0.is_empty());
+        assert_eq!(buf.get_channel_data(0, 1.0).0, [] as [f64; 0]);
     }
 }

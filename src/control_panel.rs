@@ -111,10 +111,10 @@ fn dial_widget(
             if *value >= 1000.0 && unit == Some("Hz") {
                 format!("{:.1}k{}", *value / 1000.0, unit_text)
             } else {
-                format!("{:.1}{}", value, unit_text)
+                format!("{value:.1}{unit_text}")
             }
         } else {
-            format!("{:.1}", value)
+            format!("{value:.1}")
         };
         paint_dial(ui.painter(), rect, normalized, label, &value_text);
     }
@@ -230,7 +230,7 @@ impl ControlPanel {
                 match FleaConnector::get_available_devices(None) {
                     Ok(it) => self.available_devices = it.map(|d| d.name).collect(),
                     Err(e) => {
-                        notifications.add_error(format!("Failed to load devices: {}", e));
+                        notifications.add_error(format!("Failed to load devices: {e}"));
                         tracing::error!("Failed to load devices: {}", e);
                     }
                 }
@@ -245,14 +245,14 @@ impl ControlPanel {
                         continue;
                     }
                     if ui.small_button(hostname).clicked() {
-                        match device_manager.add_device(hostname.to_string()) {
-                            Ok(_) => {
+                        match device_manager.add_device(hostname.clone()) {
+                            Ok(()) => {
                                 notifications
-                                    .add_success(format!("Connected to device: {}", hostname));
+                                    .add_success(format!("Connected to device: {hostname}"));
                             }
                             Err(e) => {
                                 notifications
-                                    .add_error(format!("Failed to connect to {}: {}", hostname, e));
+                                    .add_error(format!("Failed to connect to {hostname}: {e}"));
                                 tracing::error!("Failed to add device: {}", e);
                             }
                         }
@@ -303,9 +303,8 @@ impl ControlPanel {
                             let device_name = device_manager
                                 .get_devices()
                                 .get(idx)
-                                .map(|d| d.name.clone())
-                                .unwrap_or_else(|| "Unknown".to_string());
-                            notifications.add_info(format!("Removed device: {}", device_name));
+                                .map_or_else(|| "Unknown".to_string(), |d| d.name.clone());
+                            notifications.add_info(format!("Removed device: {device_name}"));
                             tracing::info!("Removing device: {}", device_name);
                             device_manager.remove_device(idx);
                         }
@@ -394,7 +393,7 @@ impl ControlPanel {
                     .color(Color32::YELLOW),
             );
 
-            egui::Grid::new(format!("channels_grid_{}", idx))
+            egui::Grid::new(format!("channels_grid_{idx}"))
                 .num_columns(5)
                 .spacing([3.0, 3.0])
                 .show(ui, |ui| {
@@ -470,15 +469,13 @@ impl ControlPanel {
                         if ui
                             .add_sized(
                                 [15.0, 15.0],
-                                egui::Button::new(
-                                    RichText::new(format!("{}", ch))
-                                        .size(7.0)
-                                        .color(if enabled {
-                                            Color32::GREEN
-                                        } else {
-                                            Color32::DARK_GRAY
-                                        }),
-                                ),
+                                egui::Button::new(RichText::new(format!("{ch}")).size(7.0).color(
+                                    if enabled {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::DARK_GRAY
+                                    },
+                                )),
                             )
                             .clicked()
                         {
@@ -522,15 +519,13 @@ impl ControlPanel {
                         if ui
                             .add_sized(
                                 [15.0, 15.0],
-                                egui::Button::new(
-                                    RichText::new(format!("{}", ch))
-                                        .size(7.0)
-                                        .color(if enabled {
-                                            Color32::GREEN
-                                        } else {
-                                            Color32::DARK_GRAY
-                                        }),
-                                ),
+                                egui::Button::new(RichText::new(format!("{ch}")).size(7.0).color(
+                                    if enabled {
+                                        Color32::GREEN
+                                    } else {
+                                        Color32::DARK_GRAY
+                                    },
+                                )),
                             )
                             .clicked()
                         {
@@ -575,7 +570,7 @@ impl ControlPanel {
                     .color(Color32::YELLOW),
             );
 
-            egui::Grid::new(format!("timebase_grid_{}", idx))
+            egui::Grid::new(format!("timebase_grid_{idx}"))
                 .num_columns(4)
                 .spacing([4.0, 4.0])
                 .show(ui, |ui| {
@@ -650,7 +645,7 @@ impl ControlPanel {
                     .color(Color32::YELLOW),
             );
 
-            egui::Grid::new(format!("cal_grid_{}", idx))
+            egui::Grid::new(format!("cal_grid_{idx}"))
                 .num_columns(4)
                 .spacing([3.0, 3.0])
                 .show(ui, |ui| {
@@ -672,7 +667,7 @@ impl ControlPanel {
                     {
                         match device.start_calibrate_0v() {
                             Ok(()) => {
-                                notifications.add_info(format!("0V cal started - {}", device.name))
+                                notifications.add_info(format!("0V cal started - {}", device.name));
                             }
                             Err(e) => notifications
                                 .add_error(format!("0V cal failed - {}: {}", device.name, e)),
@@ -690,7 +685,7 @@ impl ControlPanel {
                     {
                         match device.start_calibrate_3v() {
                             Ok(()) => {
-                                notifications.add_info(format!("3V cal started - {}", device.name))
+                                notifications.add_info(format!("3V cal started - {}", device.name));
                             }
                             Err(e) => notifications
                                 .add_error(format!("3V cal failed - {}: {}", device.name, e)),
@@ -708,7 +703,7 @@ impl ControlPanel {
                     {
                         match device.start_store_calibration() {
                             Ok(()) => {
-                                notifications.add_info(format!("Cal stored - {}", device.name))
+                                notifications.add_info(format!("Cal stored - {}", device.name));
                             }
                             Err(e) => notifications
                                 .add_error(format!("Store failed - {}: {}", device.name, e)),
@@ -726,7 +721,7 @@ impl ControlPanel {
                 .strong()
                 .color(Color32::YELLOW),
         )
-        .id_salt(format!("capture_mode_device_{}", idx))
+        .id_salt(format!("capture_mode_device_{idx}"))
         .default_open(true)
         .show(ui, |ui| {
             self.render_retro_capture_mode_config(ui, device, idx, notifications);
@@ -741,7 +736,7 @@ impl ControlPanel {
                     .strong()
                     .color(Color32::YELLOW),
             )
-            .id_salt(format!("trigger_device_{}", idx))
+            .id_salt(format!("trigger_device_{idx}"))
             .default_open(true)
             .show(ui, |ui| {
                 self.render_retro_trigger_config(ui, device, idx, notifications);
@@ -756,7 +751,7 @@ impl ControlPanel {
                 .strong()
                 .color(Color32::YELLOW),
         )
-        .id_salt(format!("waveform_device_{}", idx))
+        .id_salt(format!("waveform_device_{idx}"))
         .default_open(true)
         .show(ui, |ui| {
             self.render_retro_waveform_config(ui, device, idx, notifications);
@@ -776,7 +771,7 @@ impl ControlPanel {
             let data = device.data.load();
             let update_age = data.last_update.elapsed().as_millis();
 
-            egui::Grid::new(format!("status_grid_{}", idx))
+            egui::Grid::new(format!("status_grid_{idx}"))
                 .num_columns(6)
                 .spacing([2.0, 2.0])
                 .show(ui, |ui| {
@@ -789,7 +784,7 @@ impl ControlPanel {
                     );
                     ui.label(RichText::new("RATE").size(6.0).color(Color32::LIGHT_GRAY));
                     ui.label(
-                        RichText::new(format!("{}ms", update_age))
+                        RichText::new(format!("{update_age}ms"))
                             .size(6.0)
                             .color(Color32::WHITE),
                     );
@@ -855,7 +850,7 @@ impl ControlPanel {
         _notifications: &mut NotificationManager,
     ) {
         ui.group(|ui| {
-            egui::Grid::new(format!("retro_trigger_{}", idx))
+            egui::Grid::new(format!("retro_trigger_{idx}"))
                 .num_columns(5)
                 .spacing([4.0, 4.0])
                 .show(ui, |ui| {
@@ -1085,34 +1080,11 @@ impl ControlPanel {
         _notifications: &mut NotificationManager,
     ) {
         ui.group(|ui| {
-            egui::Grid::new(format!("retro_waveform_{}", idx))
+            egui::Grid::new(format!("retro_waveform_{idx}"))
                 .num_columns(5)
                 .spacing([4.0, 4.0])
                 .show(ui, |ui| {
-                    if !device.get_waveform_config().enabled {
-                        // Row 1: Enable/Power switch
-                        ui.label(RichText::new("POWER").size(8.0).color(Color32::LIGHT_GRAY));
-
-                        if ui
-                            .add_sized(
-                                [30.0, 22.0],
-                                egui::Button::new(
-                                    RichText::new("ON").size(8.0).color(Color32::RED),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            device.set_waveform(
-                                device.get_waveform_config().waveform_type,
-                                device.get_waveform_config().frequency_hz,
-                            );
-                        }
-
-                        ui.label(""); // Empty labels instead of add_space
-                        ui.label("");
-                        ui.label("");
-                        ui.end_row();
-                    } else {
+                    if device.get_waveform_config().enabled {
                         // Row 2: Waveform type selection with retro styling
                         ui.label(RichText::new("WAVE").size(8.0).color(Color32::LIGHT_GRAY));
 
@@ -1171,7 +1143,7 @@ impl ControlPanel {
                             let label = if freq_val >= 1000.0 {
                                 format!("{}k", freq_val / 1000.0)
                             } else {
-                                format!("{}", freq_val)
+                                format!("{freq_val}")
                             };
 
                             if ui
@@ -1195,6 +1167,29 @@ impl ControlPanel {
                                 // notifications.add_info(format!("Frequency: {} - {}", freq_str, device.name));
                             }
                         }
+                        ui.end_row();
+                    } else {
+                        // Row 1: Enable/Power switch
+                        ui.label(RichText::new("POWER").size(8.0).color(Color32::LIGHT_GRAY));
+
+                        if ui
+                            .add_sized(
+                                [30.0, 22.0],
+                                egui::Button::new(
+                                    RichText::new("ON").size(8.0).color(Color32::RED),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            device.set_waveform(
+                                device.get_waveform_config().waveform_type,
+                                device.get_waveform_config().frequency_hz,
+                            );
+                        }
+
+                        ui.label(""); // Empty labels instead of add_space
+                        ui.label("");
+                        ui.label("");
                         ui.end_row();
                     }
                 });
@@ -1292,7 +1287,7 @@ impl ControlPanel {
                         .suffix(" s")
                         .custom_formatter(|n, _| {
                             if n >= 1.0 {
-                                format!("{:.2}s", n)
+                                format!("{n:.2}s")
                             } else if n >= 0.001 {
                                 format!("{:.0}ms", n * 1000.0)
                             } else {
@@ -1336,7 +1331,7 @@ impl ControlPanel {
                             .logarithmic(true)
                             .custom_formatter(|n, _| {
                                 if n >= 1.0 {
-                                    format!("{:.2}s", n)
+                                    format!("{n:.2}s")
                                 } else {
                                     format!("{:.0}ms", n * 1000.0)
                                 }
@@ -1362,7 +1357,7 @@ impl ControlPanel {
                         let mut on = (mask & bit) != 0;
                         let resp = ui.add_sized(
                             [30.0, 18.0],
-                            egui::Button::new(RichText::new(format!("b{}", ch)).size(7.0).color(
+                            egui::Button::new(RichText::new(format!("b{ch}")).size(7.0).color(
                                 if on {
                                     Color32::GREEN
                                 } else {
@@ -1434,10 +1429,10 @@ impl ControlPanel {
                 } else if hz >= 1_000.0 {
                     format!("{:.1} ksps", hz / 1_000.0)
                 } else {
-                    format!("{:.0} sps", hz)
+                    format!("{hz:.0} sps")
                 };
                 ui.label(
-                    RichText::new(format!("measured: {}", rate_str))
+                    RichText::new(format!("measured: {rate_str}"))
                         .size(7.0)
                         .color(Color32::LIGHT_GREEN)
                         .family(egui::FontFamily::Monospace),
@@ -1459,7 +1454,7 @@ impl ControlPanel {
                     .logarithmic(true)
                     .custom_formatter(|n, _| {
                         if n >= 1.0 {
-                            format!("{:.2} s", n)
+                            format!("{n:.2} s")
                         } else {
                             format!("{:.0} ms", n * 1000.0)
                         }
