@@ -1,13 +1,7 @@
-use anyhow::{anyhow, bail, Context as _, Error, Result};
+use anyhow::{anyhow, Error, Result};
 use arc_swap::ArcSwap;
-use fleascope_rs::flea_scope::{
-    BITMAP_COLUMN_NAME, CALIBRATED_COLUMN_NAME, RAW_COLUMN_NAME, TIME_COLUMN_NAME,
-};
-use fleascope_rs::trigger_config::TriggerConfig as _;
-use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType};
-use polars::frame::DataFrame;
-use polars::prelude::{IntoLazy, PolarsResult, UInt16Chunked};
-use polars::series::IntoSeries;
+use fleascope_rs::flea_scope::CaptureConfigError;
+use fleascope_rs::{FleaProbe, IdleFleaScope, ProbeType, ReadStatus, ScopeReading};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -187,6 +181,22 @@ impl FleaWorker {
         tracing::info!("FleaWorker stopped");
     }
 
+    async fn apply_waveform(&mut self, fleascope: &mut IdleFleaScope) {
+        tracing::info!("Waveform configuration changed, updating waveform");
+        let waveform_config = self.waveform_rx.borrow_and_update().clone();
+        if let Err(e) =
+            fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz)
+        {
+            tracing::error!("Failed to set waveform: {}", e);
+            if let Err(e) = self
+                .notify(Notification::Error(format!("Failed to set waveform: {e}")))
+                .await
+            {
+                tracing::warn!("Could not report waveform failure: {e:#}");
+            }
+        }
+    }
+
     /// Returns the scope on a clean stop, `None` once the connection is lost.
     async fn capture_loop(&mut self, mut fleascope: IdleFleaScope) -> Option<IdleFleaScope> {
         let mut last_rate_update = Instant::now();
@@ -206,9 +216,7 @@ impl FleaWorker {
                 break;
             }
             if self.waveform_rx.has_changed().unwrap_or(false) {
-                tracing::info!("Waveform configuration changed, updating waveform");
-                let waveform_config = self.waveform_rx.borrow_and_update().clone();
-                fleascope.set_waveform(waveform_config.waveform_type, waveform_config.frequency_hz);
+                self.apply_waveform(&mut fleascope).await;
             }
 
             if !self.is_running() {
@@ -374,35 +382,27 @@ impl FleaWorker {
         };
         let mut fleascope_for_read = match star_res {
             Ok(fleascope_for_read) => fleascope_for_read,
-            Err((s, e)) => {
-                tracing::error!("Failed to start read operation: {}", e);
-                return Ok(s);
+            Err((scope, CaptureConfigError::SerialTerminal(e))) => {
+                return self.start_failed("capture", scope, e.into(), true).await;
+            }
+            Err((scope, e)) => {
+                return self.start_failed("capture", scope, e.into(), false).await;
             }
         };
         tracing::debug!("Successfully started read operation on FleaScope");
 
         loop {
             match fleascope_for_read.try_get_result() {
-                Ok(Ok((scope, reading))) => {
+                Ok(ReadStatus::Done(scope, reading)) => {
                     self.mark_connected();
                     let data_copy = self.data.clone();
                     tokio::spawn(async move {
                         profiling::scope!("data_processing_pipeline");
 
-                        let processed = {
-                            profiling::scope!("parse_csv");
-                            reading
-                                .parse_csv()
-                                .and_then(|df| {
-                                    profiling::scope!("apply_calibration");
-                                    probe_clone.apply_calibration(df).collect()
-                                })
-                                .map_err(Error::from)
-                                .and_then(|df| {
-                                    profiling::scope!("convert_to_data_points");
-                                    FleaWorker::convert_polars_to_data_points(&df)
-                                })
-                        };
+                        let processed = reading.map_err(Error::from).and_then(|reading| {
+                            profiling::scope!("convert_to_data_points");
+                            FleaWorker::reading_to_data_points(&reading, &probe_clone)
+                        });
 
                         match processed {
                             Ok((x_values, data_points)) => {
@@ -422,7 +422,7 @@ impl FleaWorker {
                     });
                     return Ok(scope);
                 }
-                Ok(Err(scope)) => {
+                Ok(ReadStatus::Pending(scope)) => {
                     fleascope_for_read = scope;
                 }
                 Err(_) => {
@@ -435,9 +435,52 @@ impl FleaWorker {
 
             if self.check_settings_changed() {
                 tracing::info!("Settings changed during hardware wait, calling unblock()");
-                return Ok(fleascope_for_read.cancel());
+                return self.stopped(fleascope_for_read.cancel()).await;
             }
         }
+    }
+
+    /// Hands back the scope after cancelling a capture or stream; failing to
+    /// cancel means the device is gone.
+    async fn stopped<E>(&mut self, stop_result: Result<IdleFleaScope, E>) -> Result<IdleFleaScope>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        match stop_result {
+            Ok(scope) => Ok(scope),
+            Err(e) => {
+                tracing::error!("Failed to stop device operation: {}", e);
+                self.set_lost_connection().await;
+                Err(Error::new(e).context("Connection lost while stopping device operation"))
+            }
+        }
+    }
+
+    /// Starting a capture or stream failed. A terminal error means the device is gone;
+    /// anything else is a configuration problem that would fail again on every retry,
+    /// so report it and pause.
+    async fn start_failed(
+        &mut self,
+        what: &str,
+        scope: IdleFleaScope,
+        error: Error,
+        connection_lost: bool,
+    ) -> Result<IdleFleaScope> {
+        tracing::error!("Failed to start {what}: {error:#}");
+        if connection_lost {
+            self.set_lost_connection().await;
+            return Err(error.context(format!("Connection lost while starting {what}")));
+        }
+        if let Err(e) = self
+            .notify(Notification::Error(format!(
+                "Failed to start {what}: {error:#}"
+            )))
+            .await
+        {
+            tracing::warn!("Could not report {what} failure: {e:#}");
+        }
+        self.set_as_paused();
+        Ok(scope)
     }
 
     /// A closed channel counts as a change so the capture unblocks and `run` can shut down.
@@ -475,7 +518,14 @@ impl FleaWorker {
             ProbeType::X10 => &self.x10,
         };
 
-        let mut streaming_scope = fleascope.stream();
+        let mut streaming_scope = match fleascope.stream() {
+            Ok(streaming_scope) => streaming_scope,
+            Err((scope, e)) => {
+                return self
+                    .start_failed("continuous stream", scope, e.into(), true)
+                    .await;
+            }
+        };
         let mut start_time = Instant::now();
         // let mut total_samples = 0u32;
         loop {
@@ -484,7 +534,7 @@ impl FleaWorker {
 
                 streaming_scope
                     .read(BUFF_SIZE)
-                    .map(|buffer| Self::calibrate_batch(probe, buffer))
+                    .map(|buffer| probe.voltages(&buffer).map(Iterator::collect::<Vec<f64>>))
             };
 
             match read_result {
@@ -511,22 +561,18 @@ impl FleaWorker {
                         }
                     }
                     if self.check_settings_changed() {
-                        return Ok(streaming_scope.stop());
+                        return self.stopped(streaming_scope.stop()).await;
                     }
-                }
-                // fleascope-rs treats only BrokenPipe/UnexpectedEof as connection loss and
-                // `cancel()` tolerates TimedOut, so keep the stop-and-pause path for timeouts.
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    tracing::error!("Timed out reading from continuous stream: {}", e);
-                    self.set_lost_connection().await;
-                    return Ok(streaming_scope.stop());
                 }
                 Err(e) => {
                     tracing::error!("Error reading from continuous stream: {}", e);
                     self.set_lost_connection().await;
-                    // `stop()` writes CTRL-C to the dead port and panics inside
-                    // fleascope-rs (`BusyFleaTerminal::cancel`), so drop the stream instead.
-                    drop(streaming_scope);
+                    // A timeout leaves the port usable, so hand the stopped scope back.
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        if let Ok(scope) = streaming_scope.stop() {
+                            return Ok(scope);
+                        }
+                    }
                     return Err(Error::new(e).context("Connection lost during continuous read"));
                 }
             }
@@ -542,117 +588,20 @@ impl FleaWorker {
         }
     }
 
-    fn calibrate_batch(probe: &FleaProbe, buffer: Vec<u16>) -> PolarsResult<Vec<f64>> {
-        let ca = UInt16Chunked::from_vec(RAW_COLUMN_NAME.into(), buffer);
-        let df = DataFrame::new(vec![ca.into_series().into()])?;
-        let calibrated = probe.apply_calibration(df.lazy()).collect()?;
-        Ok(calibrated
-            .column(CALIBRATED_COLUMN_NAME)?
-            .f64()?
-            .into_no_null_iter()
-            .collect())
-    }
-
-    fn convert_polars_to_data_points(df: &DataFrame) -> Result<(Vec<f64>, Vec<DataPoint>)> {
-        profiling::scope!("FleaWorker::convert_polars_to_data_points");
-
-        tracing::debug!(
-            "Converting DataFrame with columns: {:?}",
-            df.get_column_names()
-        );
-        tracing::debug!(
-            "DataFrame shape: {} rows, {} columns",
-            df.height(),
-            df.width()
-        );
-
-        // Extract columns from the DataFrame
-        profiling::scope!("extract_dataframe_columns");
-
-        let time_col = df
-            .column(TIME_COLUMN_NAME)
-            .context("Time column not found in DataFrame")?;
-        let bnc_col = df
-            .column(CALIBRATED_COLUMN_NAME)
-            .context("BNC column not found in DataFrame")?;
-        let bitmap_col = df
-            .column(BITMAP_COLUMN_NAME)
-            .context("Bitmap column not found in DataFrame")?;
-
-        let time_values: Vec<f64> = time_col
-            .f64()
-            .context("Time column conversion failed")?
-            .into_no_null_iter()
-            .collect();
-        let bnc_values: Vec<f64> = bnc_col
-            .f64()
-            .context("BNC column conversion failed")?
-            .into_no_null_iter()
+    fn reading_to_data_points(
+        reading: &ScopeReading,
+        probe: &FleaProbe,
+    ) -> Result<(Vec<f64>, Vec<DataPoint>)> {
+        let data_points = probe
+            .voltages(reading.raw_bnc())?
+            .zip(reading.bitmap())
+            .map(|(analog_channel, &bitmap)| DataPoint {
+                analog_channel,
+                digital_channels: std::array::from_fn(|i| bitmap & (1 << i) != 0),
+            })
             .collect();
 
-        // Handle string bitmap data (e.g., "0x1ff")
-        // TODO maybe use the fleascope-rs function
-        if bitmap_col.dtype() != &polars::datatypes::DataType::String {
-            bail!(
-                "Bitmap column has type {}, expected string",
-                bitmap_col.dtype()
-            );
-        }
-        let bitmap_values: Vec<u16> = {
-            profiling::scope!("parse_bitmap_strings");
-
-            bitmap_col
-                .str()
-                .context("Bitmap column conversion failed")?
-                .into_iter()
-                .map(|opt_str| {
-                    let s = opt_str.ok_or_else(|| anyhow!("Null bitmap value encountered"))?;
-                    // Hexadecimal string like "0x1ff"
-                    s.get(2..)
-                        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
-                        .ok_or_else(|| anyhow!("Invalid bitmap hex string '{}'", s))
-                })
-                .collect::<Result<_>>()?
-        };
-
-        tracing::debug!(
-            "Extracted {} time values, {} BNC values, {} bitmap values",
-            time_values.len(),
-            bnc_values.len(),
-            bitmap_values.len()
-        );
-
-        tracing::debug!(
-            "Successfully converted DataFrame to vectors, processing {} data points",
-            time_values.len()
-        );
-
-        profiling::scope!("create_data_points_from_vectors");
-
-        let mut x_values = Vec::new();
-        let mut data_points = Vec::new();
-
-        for ((time, bnc), bitmap) in time_values
-            .iter()
-            .zip(bnc_values.iter())
-            .zip(bitmap_values.iter())
-        {
-            x_values.push(*time);
-
-            // Extract digital channels from bitmap
-            let mut digital_channels = [false; 9];
-            for (i, ch) in digital_channels.iter_mut().enumerate() {
-                *ch = (bitmap & (1 << i)) != 0;
-            }
-
-            data_points.push(DataPoint {
-                analog_channel: *bnc,
-                digital_channels,
-            });
-        }
-
-        tracing::debug!("Converted to {} data points", data_points.len());
-        Ok((x_values, data_points))
+        Ok((reading.times().collect(), data_points))
     }
 }
 
@@ -855,12 +804,22 @@ mod tests {
                 let received = received.clone();
                 move || {
                     let mut buf = [0u8; 256];
+                    let mut line = Vec::new();
                     while plugged.load(Ordering::SeqCst) {
                         match master.read(&mut buf) {
                             Ok(n) => {
                                 received.lock().unwrap().extend_from_slice(&buf[..n]);
-                                for _ in buf[..n].iter().filter(|&&byte| byte == b'\n') {
+                                for &byte in &buf[..n] {
+                                    if byte != b'\n' {
+                                        line.push(byte);
+                                        continue;
+                                    }
+                                    // The driver refuses firmware outside 3.x on connect.
+                                    if line.trim_ascii() == b"ver" {
+                                        master.write_all(b"3.1.0\n").unwrap();
+                                    }
                                     master.write_all(b"> ").unwrap();
+                                    line.clear();
                                 }
                             }
                             Err(e) => assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}"),
@@ -870,7 +829,7 @@ mod tests {
             });
             let port = slave.name().unwrap();
             let terminal = StatelessFleaTerminal::new(&port).unwrap();
-            let scope = IdleFleaScope::new(IdleFleaTerminal::try_from(terminal).unwrap());
+            let scope = IdleFleaScope::new(IdleFleaTerminal::try_from(terminal).unwrap()).unwrap();
             drop(slave);
             (
                 Self {
@@ -948,6 +907,33 @@ mod tests {
 
         device.unplug();
         ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// Starting a stream on an unplugged port fails at once. The worker must report
+    /// the lost connection instead of retrying in a hot loop. Multi-threaded so the
+    /// timeout still fires if the worker spins.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_worker_reports_unplug_when_stream_cannot_start() {
+        let (mut worker, mut status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        device.unplug();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            status_rx.wait_for(|status| !status.connected),
+        )
+        .await
+        .expect("worker must report the lost connection")
+        .unwrap();
+
         drop(ui);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
