@@ -12,7 +12,7 @@ use crate::{
 };
 
 // Time frame constants for consistent validation
-pub const MIN_TIME_FRAME: f64 = 0.000122; // 122μs
+pub const MIN_TIME_FRAME: f64 = 0.000_122; // 122μs
 pub const MAX_TIME_FRAME: f64 = 3.49; // 3.49s
 /// Longest digital-stream sample interval the firmware honours: its timer clamps
 /// anything slower to ~114 Hz (see `IdleFleaScope::compute_n_samples_per_packet`).

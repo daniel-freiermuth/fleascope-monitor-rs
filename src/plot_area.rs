@@ -250,8 +250,8 @@ impl DigitalStreamBuffer {
         let mut y = Vec::new();
         for bin in self.bins.iter().filter(|bin| bin.t >= cutoff) {
             let t = bin.t - cutoff;
-            let (low, high) = (level(bin.all_high), level(bin.any_high));
-            if low == high {
+            let low = level(bin.all_high);
+            if ((bin.all_high ^ bin.any_high) >> channel) & 1 == 0 {
                 x.push(t);
                 y.push(low);
             } else {

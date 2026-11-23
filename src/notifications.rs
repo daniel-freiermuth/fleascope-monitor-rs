@@ -14,19 +14,19 @@ pub enum NotificationType {
 pub struct Notification {
     pub id: usize,
     pub message: String,
-    pub notification_type: NotificationType,
+    pub kind: NotificationType,
     pub created_at: Instant,
     pub duration_secs: f32,
 }
 
 impl Notification {
-    pub fn new(message: String, notification_type: NotificationType) -> Self {
+    pub fn new(message: String, kind: NotificationType) -> Self {
         Self {
             id: 0, // Will be set by the manager
             message,
-            notification_type,
+            kind,
             created_at: Instant::now(),
-            duration_secs: match notification_type {
+            duration_secs: match kind {
                 NotificationType::Error => 8.0,
                 // NotificationType::Warning => 6.0,
                 NotificationType::Success => 4.0,
@@ -46,7 +46,7 @@ impl Notification {
     }
 
     pub fn get_color(&self) -> Color32 {
-        match self.notification_type {
+        match self.kind {
             NotificationType::Info => Color32::LIGHT_BLUE,
             NotificationType::Success => Color32::LIGHT_GREEN,
             // NotificationType::Warning => Color32::from_rgb(255, 165, 0), // Orange
@@ -55,7 +55,7 @@ impl Notification {
     }
 
     pub fn get_icon(&self) -> &'static str {
-        match self.notification_type {
+        match self.kind {
             NotificationType::Info => "ℹ️",
             NotificationType::Success => "✅",
             // NotificationType::Warning => "⚠️",
@@ -133,7 +133,7 @@ impl NotificationManager {
                 ui.set_max_width(350.0);
 
                 for notification in &self.notifications {
-                    let response = self.render_notification(ui, notification);
+                    let response = Self::render_notification(ui, notification);
                     if response.clicked() {
                         to_remove.push(notification.id);
                     }
@@ -146,11 +146,7 @@ impl NotificationManager {
         }
     }
 
-    fn render_notification(
-        &self,
-        ui: &mut egui::Ui,
-        notification: &Notification,
-    ) -> egui::Response {
+    fn render_notification(ui: &mut egui::Ui, notification: &Notification) -> egui::Response {
         let color = notification.get_color();
         let icon = notification.get_icon();
 
