@@ -295,6 +295,11 @@ impl FleaWorker {
                 let update_rate = read_count as f64 / last_rate_update.elapsed().as_secs_f64();
                 // A pause during the capture above already reset the rate; don't overwrite it.
                 self.status_tx.send_if_modified(|status| {
+                    // Exact compare: any change in the computed rate must be published.
+                    #[allow(
+                        clippy::float_cmp,
+                        reason = "change detection, not equality of measurements"
+                    )]
                     let changed = status.running && status.update_rate != update_rate;
                     if changed {
                         status.update_rate = update_rate;

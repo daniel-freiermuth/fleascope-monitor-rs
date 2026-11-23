@@ -165,11 +165,6 @@ fn exponential_dial_widget(
 }
 
 fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize) -> String {
-    if value == 0.0 {
-        return format!("0{}", unit.unwrap_or(""));
-    }
-
-    let abs_value = value.abs();
     const MAGNITUDES: &[(f64, &str)] = &[
         (1e9, "G"),
         (1e6, "M"),
@@ -179,6 +174,12 @@ fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize
         (1e-6, "μ"),
         (1e-9, "n"),
     ];
+
+    if value == 0.0 {
+        return format!("0{}", unit.unwrap_or(""));
+    }
+
+    let abs_value = value.abs();
 
     let (factor, prefix) = MAGNITUDES
         .iter()
@@ -288,7 +289,7 @@ impl ControlPanel {
                         for (idx, device) in device_manager.get_devices_mut().iter_mut().enumerate()
                         {
                             ui.group(|ui| {
-                                self.render_device_rack(
+                                Self::render_device_rack(
                                     ui,
                                     device,
                                     idx,
@@ -313,8 +314,11 @@ impl ControlPanel {
         });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "immediate-mode egui layout; splitting would only scatter one panel"
+    )]
     fn render_device_rack(
-        &self,
         ui: &mut egui::Ui,
         device: &mut FleaScopeDevice,
         idx: usize,
@@ -724,7 +728,7 @@ impl ControlPanel {
         .id_salt(format!("capture_mode_device_{idx}"))
         .default_open(true)
         .show(ui, |ui| {
-            self.render_retro_capture_mode_config(ui, device, idx, notifications);
+            Self::render_retro_capture_mode_config(ui, device, idx, notifications);
         });
 
         // Retro Trigger Control Panel - Only show in triggered mode
@@ -739,7 +743,7 @@ impl ControlPanel {
             .id_salt(format!("trigger_device_{idx}"))
             .default_open(true)
             .show(ui, |ui| {
-                self.render_retro_trigger_config(ui, device, idx, notifications);
+                Self::render_retro_trigger_config(ui, device, idx, notifications);
             });
         }
 
@@ -754,7 +758,7 @@ impl ControlPanel {
         .id_salt(format!("waveform_device_{idx}"))
         .default_open(true)
         .show(ui, |ui| {
-            self.render_retro_waveform_config(ui, device, idx, notifications);
+            Self::render_retro_waveform_config(ui, device, idx, notifications);
         });
 
         // Retro System Status Panel - Even more compact
@@ -842,8 +846,11 @@ impl ControlPanel {
         });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "immediate-mode egui layout; splitting would only scatter one panel"
+    )]
     fn render_retro_trigger_config(
-        &self,
         ui: &mut egui::Ui,
         device: &mut FleaScopeDevice,
         idx: usize,
@@ -1073,7 +1080,6 @@ impl ControlPanel {
     }
 
     fn render_retro_waveform_config(
-        &self,
         ui: &mut egui::Ui,
         device: &mut FleaScopeDevice,
         idx: usize,
@@ -1196,8 +1202,11 @@ impl ControlPanel {
         });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "immediate-mode egui layout; splitting would only scatter one panel"
+    )]
     fn render_retro_capture_mode_config(
-        &self,
         ui: &mut egui::Ui,
         device: &mut FleaScopeDevice,
         _idx: usize,
