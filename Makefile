@@ -58,9 +58,9 @@ fmt-check:
 	cargo fmt --all -- --check
 
 # Run the same checks as .github/workflows/ci.yml; fails on any violation.
-# clippy fails on the deny-level lints in Cargo.toml's [lints] tables.
+# clippy fails on any warning, including the pedantic group in Cargo.toml's [lints] tables.
 ci: fmt-check
-	cargo clippy --locked --all-targets
+	cargo clippy --locked --all-targets -- -D warnings
 	cargo test --locked
 
 # Install dependencies
