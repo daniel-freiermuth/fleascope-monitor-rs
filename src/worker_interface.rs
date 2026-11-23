@@ -247,20 +247,20 @@ impl FleaScopeDevice {
     pub fn start_calibrate_0v(&self) -> Result<(), anyhow::Error> {
         self.control_signal_tx
             .try_send(ControlCommand::Calibrate0V(self.probe_multiplier))
-            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {e}"))
     }
 
     /// Send 3V calibration command (non-blocking)  
     pub fn start_calibrate_3v(&self) -> Result<(), anyhow::Error> {
         self.control_signal_tx
             .try_send(ControlCommand::Calibrate3V(self.probe_multiplier))
-            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to send calibration command: {e}"))
     }
 
     /// Send store calibration command (non-blocking)
     pub fn start_store_calibration(&self) -> Result<(), anyhow::Error> {
         self.control_signal_tx
             .try_send(ControlCommand::StoreCalibration())
-            .map_err(|e| anyhow::anyhow!("Failed to send storage command: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to send storage command: {e}"))
     }
 }
