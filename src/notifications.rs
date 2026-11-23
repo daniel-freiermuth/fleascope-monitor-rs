@@ -1,6 +1,6 @@
-use chrono::{DateTime, Utc};
 use egui::{Color32, RichText};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub enum NotificationType {
@@ -15,7 +15,7 @@ pub struct Notification {
     pub id: usize,
     pub message: String,
     pub notification_type: NotificationType,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Instant,
     pub duration_secs: f32,
 }
 
@@ -25,7 +25,7 @@ impl Notification {
             id: 0, // Will be set by the manager
             message,
             notification_type,
-            created_at: Utc::now(),
+            created_at: Instant::now(),
             duration_secs: match notification_type {
                 NotificationType::Error => 8.0,
                 // NotificationType::Warning => 6.0,
@@ -42,8 +42,7 @@ impl Notification {
     } */
 
     pub fn is_expired(&self) -> bool {
-        let elapsed = Utc::now().signed_duration_since(self.created_at);
-        elapsed.num_milliseconds() as f32 / 1000.0 > self.duration_secs
+        self.created_at.elapsed().as_secs_f32() > self.duration_secs
     }
 
     pub fn get_color(&self) -> Color32 {
@@ -175,10 +174,7 @@ impl NotificationManager {
                         ui.label(RichText::new(&notification.message).color(color).strong());
 
                         // Show time remaining as a progress bar
-                        let elapsed = Utc::now()
-                            .signed_duration_since(notification.created_at)
-                            .num_milliseconds() as f32
-                            / 1000.0;
+                        let elapsed = notification.created_at.elapsed().as_secs_f32();
                         let progress = 1.0 - (elapsed / notification.duration_secs).clamp(0.0, 1.0);
 
                         let progress_bar = egui::ProgressBar::new(progress)
