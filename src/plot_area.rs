@@ -4,83 +4,56 @@ use crate::{
 };
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
-use polars::{
-    frame::DataFrame,
-    prelude::{col, lit, Column, DataType, IntoLazy, PolarsResult},
-};
+use std::collections::VecDeque;
 
 #[derive(Clone)]
 pub struct ContinuousBuffer {
-    data: DataFrame,
+    samples: VecDeque<f64>,
     sample_rate_hz: u32,
-    last_t: f64,
+    /// Samples received since creation; the global index of the next sample.
+    total_samples: u64,
+}
+
+/// Running mean of the samples falling into one plot bin.
+struct Bin {
+    id: i64,
+    t_min: f64,
+    sum: f64,
+    count: u32,
+}
+
+impl Bin {
+    fn mean(&self) -> f64 {
+        self.sum / f64::from(self.count)
+    }
 }
 
 impl ContinuousBuffer {
     pub fn new(sample_rate_hz: u32) -> Self {
-        profiling::scope!("ContinuousBuffer::new");
-
-        let bnc_column = Column::new("bnc".into(), [0.0].as_ref());
-        let time_index = Column::new("time".into(), [0.0].as_ref());
-
-        let df = DataFrame::new(vec![time_index, bnc_column]).unwrap_or_else(|e| {
-            tracing::error!("Failed to create DataFrame: {}", e);
-            DataFrame::empty()
-        });
-
         Self {
-            data: df,
+            samples: VecDeque::new(),
             sample_rate_hz,
-            last_t: 0.0,
+            total_samples: 0,
         }
     }
 
     pub fn add_batch(&mut self, batch: Vec<f64>) {
         profiling::scope!("ContinuousBuffer::add_batch");
 
-        let time_step = 1.0 / self.sample_rate_hz as f64;
-
-        // Create time and BNC value vectors
-        let mut time_values = Vec::with_capacity(batch.len());
-        let mut bnc_values = Vec::with_capacity(batch.len());
-
-        for &bnc_value in batch.iter() {
-            time_values.push(self.last_t);
-            bnc_values.push(bnc_value);
-            self.last_t += time_step;
-        }
-
-        // Create new DataFrame from the batch with time as index
-        let time_column = Column::new("time".into(), time_values);
-        let bnc_column = Column::new("bnc".into(), bnc_values);
-
-        let batch_df = match DataFrame::new(vec![time_column, bnc_column]) {
-            Ok(df) => df,
-            Err(e) => {
-                tracing::error!("Failed to create batch DataFrame: {}", e);
-                return;
-            }
-        };
-
-        // Concatenate with existing data
-        if let Err(e) = self.data.vstack_mut(&batch_df) {
-            tracing::error!("Failed to concatenate DataFrames: {}", e);
-        }
+        self.total_samples += batch.len() as u64;
+        self.samples.extend(batch);
     }
 
     fn cleanup_old_batches(&mut self, keep_time: f64) {
         profiling::scope!("ContinuousBuffer::cleanup_old_batches");
 
         let keep_samples = (keep_time * self.sample_rate_hz as f64) as usize;
-        let current_height = self.data.height();
-
-        if current_height > keep_samples {
-            let rows_to_remove = current_height - keep_samples;
-            // Keep only the last keep_samples rows
-            self.data = self.data.slice(rows_to_remove as i64, keep_samples);
-        }
+        let excess = self.samples.len().saturating_sub(keep_samples);
+        self.samples.drain(..excess);
     }
 
+    /// Mean-decimates the last `window_duration` seconds to about one point per pixel.
+    /// Bins are aligned to absolute time so they stay put while the signal scrolls.
     pub fn get_data_in_window(
         &self,
         window_duration: f64,
@@ -89,98 +62,44 @@ impl ContinuousBuffer {
     ) -> (Vec<f64>, Vec<f64>) {
         profiling::scope!("ContinuousBuffer::get_data_in_window");
 
-        if self.data.height() == 0 {
-            return (Vec::new(), Vec::new());
+        let rate = f64::from(self.sample_rate_hz);
+        let window_len = ((window_duration * rate).round() as usize).min(self.samples.len());
+        let skip = self.samples.len() - window_len;
+        let first_index = self.total_samples - self.samples.len() as u64 + skip as u64;
+        // Bin ids come from integer sample indices so float error never moves a
+        // sample across a bin edge.
+        let samples_per_bin = window_duration * rate / f64::from(plot_width);
+
+        let mut bins: Vec<Bin> = Vec::with_capacity(plot_width as usize + 2);
+        for (i, &v) in self.samples.range(skip..).enumerate() {
+            let index = first_index + i as u64;
+            let id = (index as f64 / samples_per_bin).floor() as i64;
+            match bins.last_mut() {
+                Some(bin) if bin.id == id => {
+                    bin.sum += v;
+                    bin.count += 1;
+                }
+                _ => bins.push(Bin {
+                    id,
+                    t_min: index as f64 / rate,
+                    sum: v,
+                    count: 1,
+                }),
+            }
         }
 
-        self.resample_window(window_duration, wrap, plot_width)
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to filter and resample DataFrame: {}", e);
-                (Vec::new(), Vec::new())
-            })
-    }
-
-    fn resample_window(
-        &self,
-        window_duration: f64,
-        wrap: bool,
-        plot_width: u32,
-    ) -> PolarsResult<(Vec<f64>, Vec<f64>)> {
-        let latest_time = self.last_t;
-
-        let window_start = latest_time - window_duration;
-        let time_bin_size = window_duration / plot_width as f64;
-
-        // Use Polars lazy evaluation for efficient filtering and resampling
-        let filtered_df = {
-            profiling::scope!("polars_filter_and_resample");
-            let rmse = self
-                .data
-                .clone()
-                .lazy()
-                .filter(col("time").gt_eq(lit(window_start)))
-                .select([polars::prelude::col("bnc").std(1)])
-                .collect()?
-                .column("bnc")?
-                .f64()?
-                .into_no_null_iter()
-                .collect::<Vec<_>>();
-            tracing::debug!("RMS Error in window: {:?}", rmse);
-            let mut df = self
-                .data
-                .clone()
-                .lazy()
-                .filter(col("time").gt_eq(lit(window_start)))
-                .with_column(
-                    ((col("time") - lit(window_start)) / lit(time_bin_size))
-                        .cast(DataType::Int32)
-                        .alias("time_bin"),
-                )
-                .group_by([col("time_bin")])
-                .agg([
-                    col("time").min().alias("time_min"),
-                    col("time").max().alias("time_max"),
-                    col("bnc").min().alias("bnc_min"),
-                    col("bnc").median().alias("bnc_median"),
-                    col("bnc").mean().alias("bnc_mean"),
-                    col("bnc").max().alias("bnc_max"),
-                ])
-                .sort(
-                    ["time_min"],
-                    polars::prelude::SortMultipleOptions::default(),
-                )
-                .with_row_index("idx", None)
-                .filter(col("idx").gt(lit(0)).and(col("idx").lt(col("idx").max())));
-            if wrap {
-                df = df.with_column(col("time_min") % lit(window_duration))
+        // The first and last bins are only partially filled.
+        let full_bins = bins
+            .get(1..bins.len().saturating_sub(1))
+            .unwrap_or_default();
+        let mut points: Vec<(f64, f64)> = full_bins.iter().map(|b| (b.t_min, b.mean())).collect();
+        if wrap {
+            for (t, _) in &mut points {
+                *t %= window_duration;
             }
-            df.sort(
-                ["time_min"],
-                polars::prelude::SortMultipleOptions::default(),
-            )
-            .select([
-                polars::prelude::col("time_min").alias("time"),
-                polars::prelude::col("bnc_mean").alias("bnc"),
-            ])
-            .collect()?
-        };
-
-        // Extract vectors efficiently - handle both resampled and non-resampled data
-        // Resampled data - interleave min/max points
-        profiling::scope!("extract_resampled_data");
-
-        let time = filtered_df
-            .column("time")?
-            .f64()?
-            .into_no_null_iter()
-            .collect::<Vec<_>>();
-        let bnc = filtered_df
-            .column("bnc")?
-            .f64()?
-            .into_no_null_iter()
-            .collect::<Vec<_>>();
-
-        Ok((time, bnc))
+            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        points.into_iter().unzip()
     }
 }
 
@@ -442,53 +361,33 @@ impl PlotArea {
 mod tests {
     use super::*;
 
-    /// Proves that absolute-time bin calculation overflows Int32 after ~24 min
-    /// with buffer_time=0.001s and plot_width=1500.
-    ///
-    /// time_bin_size = 0.001 / 1500 ≈ 6.67e-7
-    /// At last_t = 2000.0: time / time_bin_size = 2000 / 6.67e-7 = 3e9 > i32::MAX
+    /// After ~33 min of streaming at 1 MHz, absolute bin ids exceed `i32::MAX`
+    /// for the smallest window; binning must still produce the window.
     #[test]
-    fn int32_overflow_in_time_bin_after_24_min() {
-        // Use a high sample rate so that window_duration=0.001s contains
-        // enough samples to survive the first/last-bin filter at line 138.
-        let sample_rate: u32 = 1_000_000; // 1 MHz
-        let mut buf = ContinuousBuffer::new(sample_rate);
+    fn bins_window_after_long_capture() {
+        let mut buf = ContinuousBuffer::new(1_000_000);
+        buf.total_samples = 2_000_000_000;
+        buf.add_batch(vec![1.0; 1000]);
 
-        // Fast-forward time to ~2000s by directly setting last_t.
-        // This is equivalent to having captured data for 2000 seconds.
-        buf.last_t = 2000.0;
+        let (times, values) = buf.get_data_in_window(0.001, false, 1500);
 
-        // Add a batch of 1000 samples starting at t=2000.0.
-        // At 1 MHz, this covers 0.001s — exactly the window_duration.
-        let batch = vec![1.0_f64; 1000];
-        buf.add_batch(batch);
-        // Trim initial dummy row from ContinuousBuffer::new
-        buf.cleanup_old_batches(0.002);
+        // Bins are narrower than a sample: one point per sample minus both edge bins.
+        assert_eq!(times.len(), 998);
+        assert_eq!(values.len(), 998);
+        assert!(times.iter().all(|&t| t >= 2000.0));
+        assert!(values.iter().all(|&v| (v - 1.0).abs() < f64::EPSILON));
+    }
 
-        let buffer_time = 0.001; // minimum slider value from control_panel.rs:1363
-        let plot_width = 1500u32;
+    #[test]
+    fn decimates_to_bin_means_without_partial_edge_bins() {
+        // 1 kHz, 1 s window, 100 px: 10 samples per bin alternating 0/2.
+        let mut buf = ContinuousBuffer::new(1000);
+        buf.add_batch((0..1000).map(|i| f64::from(i % 2) * 2.0).collect());
 
-        // Arithmetic proof of overflow:
-        //   time_bin_size = 0.001 / 1500 ≈ 6.667e-7
-        //   time / time_bin_size = 2000.0 / 6.667e-7 ≈ 3.0e9
-        //   i32::MAX = 2_147_483_647 ≈ 2.15e9
-        //   3.0e9 > i32::MAX → overflow → null bins → empty output
-        let time_bin_size = buffer_time / plot_width as f64;
-        let max_bin = buf.last_t / time_bin_size;
-        assert!(
-            max_bin > i32::MAX as f64,
-            "time bin value {max_bin} should exceed i32::MAX to trigger overflow",
-        );
+        let (times, values) = buf.get_data_in_window(1.0, false, 100);
 
-        let (times, values) = buf.get_data_in_window(buffer_time, false, plot_width);
-
-        // With the bug, the Int32 cast produces nulls and the group_by returns
-        // empty/garbled data. A correct implementation must return non-empty
-        // results because the window contains 1000 samples.
-        assert!(
-            !times.is_empty(),
-            "get_data_in_window returned empty times — Int32 overflow corrupted binning",
-        );
-        assert_eq!(times.len(), values.len());
+        assert_eq!(times.len(), 98);
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+        assert!(values.iter().all(|&v| (v - 1.0).abs() < 1e-9));
     }
 }
