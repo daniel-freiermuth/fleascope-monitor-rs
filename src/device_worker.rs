@@ -836,7 +836,7 @@ mod tests {
         _config_tx: watch::Sender<CaptureConfig>,
         waveform_tx: watch::Sender<WaveformConfig>,
         control_tx: tokio::sync::mpsc::Sender<ControlCommand>,
-        _notification_rx: tokio::sync::mpsc::Receiver<Notification>,
+        notification_rx: tokio::sync::mpsc::Receiver<Notification>,
     }
 
     #[cfg(unix)]
@@ -856,7 +856,7 @@ mod tests {
             _config_tx: config_tx,
             waveform_tx,
             control_tx,
-            _notification_rx: notification_rx,
+            notification_rx,
         }
     }
 
@@ -867,7 +867,7 @@ mod tests {
         plugged: Arc<AtomicBool>,
         /// Every byte the worker wrote to the device.
         received: Arc<std::sync::Mutex<Vec<u8>>>,
-        device: std::thread::JoinHandle<()>,
+        device: std::thread::JoinHandle<std::io::Result<()>>,
     }
 
     #[cfg(unix)]
@@ -896,15 +896,17 @@ mod tests {
                                     }
                                     // The driver refuses firmware outside 3.x on connect.
                                     if line.trim_ascii() == b"ver" {
-                                        master.write_all(b"3.1.0\n").unwrap();
+                                        master.write_all(b"3.1.0\n")?;
                                     }
-                                    master.write_all(b"> ").unwrap();
+                                    master.write_all(b"> ")?;
                                     line.clear();
                                 }
                             }
-                            Err(e) => assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}"),
+                            Err(e) if e.kind() == ErrorKind::TimedOut => {}
+                            Err(e) => return Err(e),
                         }
                     }
+                    Ok(())
                 }
             });
             let port = slave.name().unwrap();
@@ -932,7 +934,15 @@ mod tests {
         /// device is unplugged, this hangs up the port: every further write fails.
         fn unplug(self) {
             self.plugged.store(false, Ordering::SeqCst);
-            self.device.join().unwrap();
+            self.device.join().unwrap().unwrap();
+        }
+
+        /// Stops the fake after the worker closed its end of the port. The hangup
+        /// that closing causes on the fake's side is expected then.
+        fn remove_after_worker_closed_port(self) {
+            self.plugged.store(false, Ordering::SeqCst);
+            // Ignore only the hangup error; a panic in the fake still fails the test.
+            let _hangup = self.device.join().unwrap();
         }
     }
 
@@ -984,6 +994,156 @@ mod tests {
         worker.set_as_paused();
         let task = tokio::spawn(async move { worker.run(scope).await });
         tokio::task::yield_now().await; // let the worker settle into its pause
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// A command that wakes the pause after an unplug must be stopped by the presence
+    /// check: RUN would start a stream and calibration would talk to the dead port, both
+    /// of which panic in fleascope-rs on real hardware. The fake stays attached while the
+    /// presence check reports it gone, so any byte the worker writes after the "unplug"
+    /// proves the command reached the port. The command is dropped with the lost
+    /// connection, and later ones are answered by `wait_for_removal`.
+    #[cfg(unix)]
+    async fn command_after_unplug_while_paused_never_reaches_port(
+        command: impl Fn() -> ControlCommand,
+    ) {
+        fn describe(notification: Option<Notification>) -> String {
+            match notification {
+                Some(Notification::Success(msg)) => format!("Success({msg})"),
+                Some(Notification::Error(msg)) => format!("Error({msg})"),
+                None => "channel closed".to_string(),
+            }
+        }
+
+        let name = format!("{:?}", command());
+        let (mut worker, mut status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        let present = Arc::new(AtomicBool::new(true));
+        worker.device_present = Box::new({
+            let present = present.clone();
+            move || present.load(Ordering::SeqCst)
+        });
+        // Without a calibration, Calibrate3V and StoreCalibration fail before any I/O.
+        worker.x1.set_calibration(2048.0, 1.0);
+        worker.x10.set_calibration(2048.0, 1.0);
+        worker.set_as_paused();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle into the pause
+        let written_before = device.received.lock().unwrap().len();
+
+        present.store(false, Ordering::SeqCst);
+        ui.control_tx.try_send(command()).unwrap();
+        let lost = tokio::time::timeout(
+            Duration::from_secs(2),
+            status_rx.wait_for(|status| !status.connected),
+        )
+        .await
+        .is_ok_and(|status| status.is_ok());
+        // Give the fake time to read anything the worker wrote.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let written = String::from_utf8_lossy(&device.received.lock().unwrap()[written_before..])
+            .into_owned();
+        assert!(
+            written.is_empty(),
+            "{name} after unplug reached the port: {written:?}"
+        );
+        assert!(lost, "{name} after unplug must report the lost connection");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), ui.notification_rx.recv())
+            .await
+            .unwrap();
+        let first = describe(first);
+        assert!(
+            first.starts_with("Error(Lost connection"),
+            "{name}: expected the lost-connection error first, got {first}"
+        );
+
+        ui.control_tx.try_send(command()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), ui.notification_rx.recv())
+            .await
+            .unwrap();
+        let second = describe(second);
+        assert!(
+            second.starts_with("Error(Device disconnected"),
+            "{name}: a later command must be rejected, got {second}"
+        );
+
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        let joined = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed");
+        assert!(
+            joined.is_ok(),
+            "{name} after unplug panicked the worker: {joined:?}"
+        );
+        device.remove_after_worker_closed_port();
+    }
+
+    // Multi-threaded so the timeouts still fire if a command starts a busy capture.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_after_unplug_while_paused_does_not_start_capture() {
+        command_after_unplug_while_paused_never_reaches_port(|| ControlCommand::Resume).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_calibration_after_unplug_while_paused_does_not_reach_port() {
+        command_after_unplug_while_paused_never_reaches_port(|| {
+            ControlCommand::Calibrate0V(ProbeType::X1)
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_volt_calibration_after_unplug_while_paused_does_not_reach_port() {
+        command_after_unplug_while_paused_never_reaches_port(|| {
+            ControlCommand::Calibrate3V(ProbeType::X10)
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storing_calibration_after_unplug_while_paused_does_not_reach_port() {
+        command_after_unplug_while_paused_never_reaches_port(ControlCommand::StoreCalibration)
+            .await;
+    }
+
+    /// The presence check must not swallow commands while the device is still there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn calibration_while_paused_reaches_present_device() {
+        let (mut worker, status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        let (device, scope) = FakeFleaScope::plug_in();
+        worker.device_present = device.presence();
+        worker.set_as_paused();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+        tokio::task::yield_now().await; // let the worker settle into its pause
+
+        ui.control_tx
+            .try_send(ControlCommand::Calibrate0V(ProbeType::X1))
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(2), ui.notification_rx.recv())
+            .await
+            .expect("calibration while paused must be answered")
+            .unwrap();
+        let msg = match answer {
+            Notification::Success(msg) | Notification::Error(msg) => msg,
+        };
+        assert!(msg.starts_with("X1 "), "not a calibration answer: {msg}");
+        assert!(status_rx.borrow().connected);
 
         device.unplug();
         ui.control_tx.try_send(ControlCommand::Exit).unwrap();
