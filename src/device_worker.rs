@@ -833,7 +833,7 @@ mod tests {
     /// sending `Exit` is what `DeviceManager::remove_device` does.
     #[cfg(unix)]
     struct UiHandles {
-        _config_tx: watch::Sender<CaptureConfig>,
+        config_tx: watch::Sender<CaptureConfig>,
         waveform_tx: watch::Sender<WaveformConfig>,
         control_tx: tokio::sync::mpsc::Sender<ControlCommand>,
         notification_rx: tokio::sync::mpsc::Receiver<Notification>,
@@ -853,10 +853,31 @@ mod tests {
         worker.control_rx = control_rx;
         worker.notification_tx = notification_tx;
         UiHandles {
-            _config_tx: config_tx,
+            config_tx,
             waveform_tx,
             control_tx,
             notification_rx,
+        }
+    }
+
+    /// How a [`FakeFleaScope`] answers.
+    #[cfg(unix)]
+    struct FakeFirmware {
+        /// Reply to `ver`.
+        version: &'static str,
+        /// Packets sent in turn, one per poll, while a `digital_stream` runs; the
+        /// stream ends on CTRL-C with the prompt, like the firmware. `None` answers
+        /// `digital_stream` with the prompt like any other command.
+        digital_packets: Option<Vec<Vec<u8>>>,
+    }
+
+    #[cfg(unix)]
+    impl Default for FakeFirmware {
+        fn default() -> Self {
+            Self {
+                version: "3.1.0",
+                digital_packets: None,
+            }
         }
     }
 
@@ -873,10 +894,18 @@ mod tests {
     #[cfg(unix)]
     impl FakeFleaScope {
         fn plug_in() -> (Self, IdleFleaScope) {
+            Self::plug_in_with(FakeFirmware::default())
+        }
+
+        fn plug_in_with(firmware: FakeFirmware) -> (Self, IdleFleaScope) {
             use serialport::SerialPort as _;
             use std::io::{ErrorKind, Read as _, Write as _};
 
             let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+            if firmware.digital_packets.is_some() {
+                // Poll often enough to stream packets at a steady pace.
+                master.set_timeout(Duration::from_millis(5)).unwrap();
+            }
             let plugged = Arc::new(AtomicBool::new(true));
             let received = Arc::new(std::sync::Mutex::new(Vec::new()));
             let device = std::thread::spawn({
@@ -885,25 +914,54 @@ mod tests {
                 move || {
                     let mut buf = [0u8; 256];
                     let mut line = Vec::new();
+                    let mut streaming = false;
+                    let mut next_packet = 0;
                     while plugged.load(Ordering::SeqCst) {
                         match master.read(&mut buf) {
                             Ok(n) => {
                                 received.lock().unwrap().extend_from_slice(&buf[..n]);
                                 for &byte in &buf[..n] {
-                                    if byte != b'\n' {
-                                        line.push(byte);
-                                        continue;
+                                    match byte {
+                                        // CTRL-C ends a running command, which prints the prompt.
+                                        0x03 => {
+                                            if streaming {
+                                                streaming = false;
+                                                master.write_all(b"> ")?;
+                                            }
+                                            line.clear();
+                                        }
+                                        b'\n' => {
+                                            let command = line.trim_ascii();
+                                            // The driver refuses firmware outside 3.x on connect.
+                                            if command == b"ver" {
+                                                master.write_all(firmware.version.as_bytes())?;
+                                                master.write_all(b"\n")?;
+                                            }
+                                            if firmware.digital_packets.is_some()
+                                                && command.starts_with(b"digital_stream ")
+                                            {
+                                                streaming = true;
+                                                next_packet = 0;
+                                            } else {
+                                                master.write_all(b"> ")?;
+                                            }
+                                            line.clear();
+                                        }
+                                        _ => line.push(byte),
                                     }
-                                    // The driver refuses firmware outside 3.x on connect.
-                                    if line.trim_ascii() == b"ver" {
-                                        master.write_all(b"3.1.0\n")?;
-                                    }
-                                    master.write_all(b"> ")?;
-                                    line.clear();
                                 }
                             }
                             Err(e) if e.kind() == ErrorKind::TimedOut => {}
                             Err(e) => return Err(e),
+                        }
+                        let packets = firmware.digital_packets.as_deref().unwrap_or_default();
+                        if streaming && !packets.is_empty() {
+                            match master.write_all(&packets[next_packet % packets.len()]) {
+                                // The worker is not reading right now; skip this packet.
+                                Err(e) if e.kind() == ErrorKind::TimedOut => {}
+                                result => result?,
+                            }
+                            next_packet += 1;
                         }
                     }
                     Ok(())
@@ -922,6 +980,22 @@ mod tests {
                 },
                 scope,
             )
+        }
+
+        /// Everything the worker wrote to the device so far.
+        fn written(&self) -> String {
+            String::from_utf8_lossy(&self.received.lock().unwrap()).into_owned()
+        }
+
+        /// Waits up to 2s for the worker's writes to satisfy `done`.
+        async fn wait_until_written(&self, done: impl Fn(&str) -> bool) -> bool {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !done(&self.written()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
         }
 
         /// What `DeviceManager` gives the worker as `device_present`.
@@ -1222,5 +1296,429 @@ mod tests {
             reached.is_ok(),
             "waveform change made while paused never reached the device"
         );
+    }
+
+    /// Channels 0 and 2 at 500 Hz: 25 samples per packet, packed into 7 bytes.
+    #[cfg(unix)]
+    const DIGITAL_MASK: u16 = 0b101;
+    #[cfg(unix)]
+    const DIGITAL_US_PER_SAMPLE: u32 = 2000;
+    #[cfg(unix)]
+    const DIGITAL_START: &str = "digital_stream 0x5 2000 25\n";
+
+    #[cfg(unix)]
+    fn digital_stream_config(channel_mask: u16, us_per_sample: u32) -> CaptureConfig {
+        CaptureConfig {
+            probe_multiplier: ProbeType::X1,
+            mode: CaptureMode::DigitalStream {
+                channel_mask,
+                us_per_sample,
+            },
+        }
+    }
+
+    /// A fake streaming, in turn: no channel high, channel 0 high, channel 2 high.
+    #[cfg(unix)]
+    fn streaming_firmware() -> FakeFirmware {
+        FakeFirmware {
+            digital_packets: Some(vec![vec![0x00; 7], vec![0x55; 7], vec![0xAA; 7]]),
+            ..FakeFirmware::default()
+        }
+    }
+
+    /// The bitmasks the worker must forward for the packets of `streaming_firmware`.
+    #[cfg(unix)]
+    fn streamed_batches() -> [Vec<u16>; 3] {
+        [vec![0b000; 25], vec![0b001; 25], vec![0b100; 25]]
+    }
+
+    #[cfg(unix)]
+    async fn next_notification(ui: &mut UiHandles) -> String {
+        let notification = tokio::time::timeout(Duration::from_secs(2), ui.notification_rx.recv())
+            .await
+            .expect("expected a notification");
+        match notification {
+            Some(Notification::Success(msg)) => format!("Success({msg})"),
+            Some(Notification::Error(msg)) => format!("Error({msg})"),
+            None => "channel closed".to_string(),
+        }
+    }
+
+    /// Proves the worker still holds a working scope: a paused worker that kept it
+    /// answers a calibration from the device, `wait_for_removal` would reject it.
+    #[cfg(unix)]
+    async fn assert_scope_kept(ui: &mut UiHandles) {
+        ui.control_tx
+            .try_send(ControlCommand::Calibrate0V(ProbeType::X1))
+            .unwrap();
+        let answer = next_notification(ui).await;
+        assert!(
+            answer.starts_with("Success(X1 ") || answer.starts_with("Error(X1 "),
+            "not a calibration answer: {answer}"
+        );
+    }
+
+    /// Same, for a worker that dropped the scope and waits for removal.
+    #[cfg(unix)]
+    async fn assert_scope_dropped(ui: &mut UiHandles) {
+        ui.control_tx.try_send(ControlCommand::Resume).unwrap();
+        let answer = next_notification(ui).await;
+        assert!(
+            answer.starts_with("Error(Device disconnected"),
+            "a disconnected worker must reject commands, got {answer}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_status(
+        status_rx: &mut watch::Receiver<WorkerStatus>,
+        what: &str,
+        done: impl FnMut(&WorkerStatus) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), status_rx.wait_for(done))
+            .await
+            .expect(what)
+            .unwrap();
+    }
+
+    /// Firmware before 3.1.0 has no `digital_stream`. That is a configuration problem,
+    /// not a lost device: report it, pause, keep the scope, and do not retry.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_on_old_firmware_reports_error_and_pauses() {
+        let (mut worker, mut status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(FakeFirmware {
+            version: "3.0.0",
+            ..FakeFirmware::default()
+        });
+        worker.device_present = device.presence();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        let first = next_notification(&mut ui).await;
+        assert!(
+            first.starts_with("Error(Failed to start digital stream"),
+            "expected the unsupported-firmware error, got {first}"
+        );
+        wait_for_status(&mut status_rx, "worker must pause", |status| {
+            !status.running
+        })
+        .await;
+        assert!(
+            status_rx.borrow().connected,
+            "old firmware is not a lost connection"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            ui.notification_rx.try_recv().is_err(),
+            "the worker must not retry an unsupported stream"
+        );
+        assert!(!device.written().contains("digital_stream"));
+        assert_scope_kept(&mut ui).await;
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// Starting the stream on an unplugged port is a lost connection, not a
+    /// configuration error to show and pause on.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_start_on_unplugged_port_reports_lost_connection() {
+        let (mut worker, mut status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(streaming_firmware());
+        device.unplug();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        wait_for_status(
+            &mut status_rx,
+            "worker must report the lost connection",
+            |status| !status.connected,
+        )
+        .await;
+        let first = next_notification(&mut ui).await;
+        assert!(
+            first.starts_with("Error(Lost connection"),
+            "expected the lost-connection error, got {first}"
+        );
+        assert_scope_dropped(&mut ui).await;
+
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// Decoded packets reach the UI in order, and a config or waveform change stops
+    /// the stream (CTRL-C) and restarts it with the new settings.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_forwards_packets_and_restarts_on_change() {
+        let (mut worker, status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (digital_tx, mut digital_rx) = tokio::sync::mpsc::channel(64);
+        worker.digital_batch_tx = digital_tx;
+        worker
+            .status_tx
+            .send_modify(|status| status.connected = false);
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(streaming_firmware());
+        worker.device_present = device.presence();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        let mut batches = Vec::new();
+        for _ in 0..6 {
+            let batch = tokio::time::timeout(Duration::from_secs(2), digital_rx.recv())
+                .await
+                .expect("expected a streamed batch")
+                .unwrap();
+            batches.push(batch);
+        }
+        let [none, ch0, ch2] = streamed_batches();
+        assert_eq!(
+            batches,
+            [none.clone(), ch0.clone(), ch2.clone(), none, ch0, ch2]
+        );
+        assert!(
+            status_rx.borrow().connected,
+            "a streamed packet proves the device is connected"
+        );
+        assert!(device.written().contains(DIGITAL_START));
+
+        ui.config_tx
+            .send(digital_stream_config(0b1, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let restart = format!("{DIGITAL_START}\u{3}digital_stream 0x1 2000 25\n");
+        assert!(
+            device.wait_until_written(|w| w.ends_with(&restart)).await,
+            "a config change must stop the stream and restart it: {:?}",
+            device.written()
+        );
+
+        ui.waveform_tx
+            .send(WaveformConfig {
+                enabled: true,
+                waveform_type: fleascope_rs::Waveform::Square,
+                frequency_hz: 440,
+            })
+            .unwrap();
+        let restarted_after_waveform = |w: &str| {
+            w.split_once(&restart).is_some_and(|(_, after)| {
+                after
+                    .strip_prefix('\u{3}')
+                    .and_then(|after| after.split_once("wave square 440"))
+                    .is_some_and(|(_, after)| after.ends_with("digital_stream 0x1 2000 25\n"))
+            })
+        };
+        assert!(
+            device.wait_until_written(restarted_after_waveform).await,
+            "a waveform change must stop the stream, apply it and restart: {:?}",
+            device.written()
+        );
+
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("worker must stop on Exit")
+            .expect("worker must not panic");
+        drop(ui);
+        device.remove_after_worker_closed_port();
+    }
+
+    /// A UI that does not drain its batches must not stall or end the read loop: the
+    /// worker keeps reading packets, a queued Pause still stops the stream, and the
+    /// paused worker does not restart it.
+    #[cfg(unix)]
+    async fn digital_stream_survives_undrained_ui(keep_receiver: bool) {
+        let (mut worker, mut status_rx) = test_worker();
+        let ui = attach_ui(&mut worker);
+        let (digital_tx, digital_rx) = tokio::sync::mpsc::channel(1);
+        worker.digital_batch_tx = digital_tx;
+        let mut digital_rx = keep_receiver.then_some(digital_rx);
+        worker
+            .status_tx
+            .send_modify(|status| status.connected = false);
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(streaming_firmware());
+        worker.device_present = device.presence();
+        // Lets the test clear `connected`, which only a newly read packet sets again.
+        let status_tx = worker.status_tx.clone();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        wait_for_status(&mut status_rx, "the stream must start", |status| {
+            status.connected
+        })
+        .await;
+        // Many more packets than the channel holds.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = *status_rx.borrow();
+        assert!(
+            status.running && status.connected,
+            "a full or closed batch channel must not stop the worker: {status:?}"
+        );
+        assert!(
+            device.written().ends_with(DIGITAL_START),
+            "a full or closed batch channel must not stop the stream: {:?}",
+            device.written()
+        );
+        for _ in 0..3 {
+            status_tx.send_modify(|status| status.connected = false);
+            wait_for_status(
+                &mut status_rx,
+                "the worker must keep reading packets",
+                |status| status.connected,
+            )
+            .await;
+        }
+        if let Some(digital_rx) = &mut digital_rx {
+            let [none, ..] = streamed_batches();
+            assert_eq!(digital_rx.try_recv().unwrap(), none, "first batch is kept");
+            tokio::time::timeout(Duration::from_secs(2), digital_rx.recv())
+                .await
+                .expect("a drained channel must receive batches again")
+                .unwrap();
+        }
+        assert!(status_rx.borrow().running);
+        assert!(device.written().ends_with(DIGITAL_START));
+
+        ui.control_tx.try_send(ControlCommand::Pause).unwrap();
+        wait_for_status(
+            &mut status_rx,
+            "Pause must reach the streaming worker",
+            |status| !status.running,
+        )
+        .await;
+        assert!(
+            device.written().ends_with(&format!("{DIGITAL_START}\u{3}")),
+            "Pause must stop the stream: {:?}",
+            device.written()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            device.written().matches("digital_stream").count(),
+            1,
+            "a paused worker must not restart the stream"
+        );
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_drops_batches_when_ui_lags() {
+        digital_stream_survives_undrained_ui(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_keeps_running_without_batch_receiver() {
+        digital_stream_survives_undrained_ui(false).await;
+    }
+
+    /// A read timeout leaves the port usable: report the lost connection, but stop
+    /// the stream and keep the scope.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_read_timeout_keeps_scope() {
+        let (mut worker, mut status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(FakeFirmware {
+            digital_packets: Some(Vec::new()),
+            ..FakeFirmware::default()
+        });
+        worker.device_present = device.presence();
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        wait_for_status(&mut status_rx, "a silent stream must time out", |status| {
+            !status.connected
+        })
+        .await;
+        let first = next_notification(&mut ui).await;
+        assert!(
+            first.starts_with("Error(Lost connection"),
+            "expected the lost-connection error, got {first}"
+        );
+        assert!(
+            device
+                .wait_until_written(|w| w.ends_with(&format!("{DIGITAL_START}\u{3}")))
+                .await,
+            "the timed-out stream must be stopped: {:?}",
+            device.written()
+        );
+        assert!(!status_rx.borrow().running);
+        assert_scope_kept(&mut ui).await;
+
+        device.unplug();
+        ui.control_tx.try_send(ControlCommand::Exit).unwrap();
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
+    }
+
+    /// Unplugging mid-stream is a read error other than a timeout: the scope is
+    /// dropped and the worker waits for the device to be removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn digital_stream_unplug_drops_scope() {
+        let (mut worker, mut status_rx) = test_worker();
+        let mut ui = attach_ui(&mut worker);
+        let (digital_tx, mut digital_rx) = tokio::sync::mpsc::channel(64);
+        worker.digital_batch_tx = digital_tx;
+        ui.config_tx
+            .send(digital_stream_config(DIGITAL_MASK, DIGITAL_US_PER_SAMPLE))
+            .unwrap();
+        let (device, scope) = FakeFleaScope::plug_in_with(streaming_firmware());
+        let task = tokio::spawn(async move { worker.run(scope).await });
+
+        tokio::time::timeout(Duration::from_secs(2), digital_rx.recv())
+            .await
+            .expect("the stream must start")
+            .unwrap();
+        device.unplug();
+        wait_for_status(&mut status_rx, "worker must report the unplug", |status| {
+            !status.connected
+        })
+        .await;
+        let first = next_notification(&mut ui).await;
+        assert!(
+            first.starts_with("Error(Lost connection"),
+            "expected the lost-connection error, got {first}"
+        );
+        assert_scope_dropped(&mut ui).await;
+
+        drop(ui);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker must stop once the device is removed")
+            .expect("worker must not panic");
     }
 }
