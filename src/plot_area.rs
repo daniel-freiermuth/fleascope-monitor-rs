@@ -112,6 +112,8 @@ struct DigitalBin {
     all_high: u16,
     /// Channels high in at least one sample; differs from `all_high` where a channel toggled.
     any_high: u16,
+    /// Channels in the stream's mask for every sample of the bin; others were not measured.
+    sampled: u16,
     count: usize,
 }
 
@@ -190,7 +192,8 @@ impl DigitalStreamBuffer {
         self.last_batch = None;
     }
 
-    pub fn add_batch(&mut self, batch: &[u16]) {
+    /// Append samples decoded with `channel_mask`; bits outside it are 0, not measured lows.
+    pub fn add_batch(&mut self, channel_mask: u16, batch: &[u16]) {
         if batch.is_empty() {
             return;
         }
@@ -219,10 +222,12 @@ impl DigitalStreamBuffer {
                 t: self.last_t,
                 all_high: u16::MAX,
                 any_high: 0,
+                sampled: u16::MAX,
                 count: 0,
             });
             bin.all_high &= sample;
             bin.any_high |= sample;
+            bin.sampled &= channel_mask;
             bin.count += 1;
             if bin.count >= step {
                 self.bins.push_back(*bin);
@@ -241,14 +246,23 @@ impl DigitalStreamBuffer {
         self.bins.drain(..excess);
     }
 
-    /// Return (`x_times`, `y_values`) for `channel` (0-8) over the last `window_s` seconds.
+    /// Return (`x_times`, `y_values`) segments for `channel` (0-8) over the last `window_s`
+    /// seconds, one per run of bins that sampled the channel, so nothing is drawn where it
+    /// was not in the stream's mask.
     /// At most 2 × `MAX_POINTS` entries: a bin where the channel toggled yields both levels.
-    pub fn get_channel_data(&self, channel: usize, window_s: f64) -> (Vec<f64>, Vec<f64>) {
+    pub fn get_channel_segments(&self, channel: usize, window_s: f64) -> Vec<(Vec<f64>, Vec<f64>)> {
         let cutoff = self.last_t - window_s;
         let level = |mask: u16| f64::from((mask >> channel) & 1);
+        let mut segments = Vec::new();
         let mut x = Vec::new();
         let mut y = Vec::new();
         for bin in self.bins.iter().filter(|bin| bin.t >= cutoff) {
+            if (bin.sampled >> channel) & 1 == 0 {
+                if !x.is_empty() {
+                    segments.push((std::mem::take(&mut x), std::mem::take(&mut y)));
+                }
+                continue;
+            }
             let t = bin.t - cutoff;
             let low = level(bin.all_high);
             if ((bin.all_high ^ bin.any_high) >> channel) & 1 == 0 {
@@ -261,7 +275,10 @@ impl DigitalStreamBuffer {
                 y.extend([from, 1.0 - from]);
             }
         }
-        (x, y)
+        if !x.is_empty() {
+            segments.push((x, y));
+        }
+        segments
     }
 }
 
@@ -540,8 +557,8 @@ impl PlotArea {
                 buffer.set_configured_us_per_sample(device.get_digital_stream_sample_interval_us());
                 buffer.set_window_s(window_s);
 
-                while let Ok(batch) = device.digital_batch_rx.try_recv() {
-                    buffer.add_batch(&batch);
+                while let Ok((channel_mask, batch)) = device.digital_batch_rx.try_recv() {
+                    buffer.add_batch(channel_mask, &batch);
                 }
                 buffer.cleanup(window_s * 2.0);
                 buffer.expire_idle_rate();
@@ -568,19 +585,21 @@ impl PlotArea {
                     .y_axis_min_width(40.0);
 
                 // Snapshot data outside the closure to avoid borrow conflict
-                let channel_data: Vec<Option<(Vec<f64>, Vec<f64>)>> = (0..9)
+                let channel_data: Vec<Vec<(Vec<f64>, Vec<f64>)>> = (0..9)
                     .map(|ch| {
                         if (mask >> ch) & 1 == 0 || !device.enabled_channels[ch + 1] {
-                            return None;
+                            return Vec::new();
                         }
-                        Some(buffer.get_channel_data(ch, window_s))
+                        buffer.get_channel_segments(ch, window_s)
                     })
                     .collect();
 
                 let colors = self.colors.clone();
                 plot.show(ui, |plot_ui| {
-                    for (ch, data_opt) in channel_data.into_iter().enumerate() {
-                        if let Some((x_data, y_data)) = data_opt {
+                    for (ch, segments) in channel_data.into_iter().enumerate() {
+                        // One line per sampled run, so gaps where the channel was not
+                        // in the mask stay empty.
+                        for (x_data, y_data) in segments {
                             let filtered_data: Vec<[f64; 2]> = x_data
                                 .iter()
                                 .zip(y_data.iter())
@@ -636,6 +655,13 @@ mod tests {
         assert!(values.iter().all(|&v| (v - 1.0).abs() < 1e-9));
     }
 
+    /// The only segment of `channel` over a 1 s window.
+    fn single_segment(buf: &DigitalStreamBuffer, channel: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut segments = buf.get_channel_segments(channel, 1.0);
+        assert_eq!(segments.len(), 1, "D{channel} split into segments");
+        segments.remove(0)
+    }
+
     #[test]
     fn digital_decimation_keeps_single_sample_pulse() {
         // 100 kHz over 1 s: 48 samples per bin, fed in 56-sample packets.
@@ -644,11 +670,11 @@ mod tests {
         let mut samples = vec![0u16; 560];
         samples[200] = 0b1; // one-sample pulse on D0, inside the 5th bin
         for packet in samples.chunks(56) {
-            buf.add_batch(packet);
+            buf.add_batch(0x1ff, packet);
         }
 
-        let (times, d0) = buf.get_channel_data(0, 1.0);
-        let (_, d1) = buf.get_channel_data(1, 1.0);
+        let (times, d0) = single_segment(&buf, 0);
+        let (_, d1) = single_segment(&buf, 1);
 
         // Bins span packets evenly: 560 / 48 = 11 full bins, the pulse bin drawn as an edge.
         assert_eq!(times.len(), 12);
@@ -658,12 +684,93 @@ mod tests {
     }
 
     #[test]
+    fn channel_added_to_mask_has_no_history_before_it_was_sampled() {
+        // 100 kHz; D1 is high throughout. 0.5 s streamed with mask 0x001, then 0.5 s with 0x003.
+        let mut buf = DigitalStreamBuffer::new();
+        buf.set_configured_us_per_sample(10);
+        for _ in 0..50_000 / 56 {
+            buf.add_batch(0x001, &[0x001; 56]);
+        }
+        let restart = buf.last_t;
+        for _ in 0..50_000 / 56 {
+            buf.add_batch(0x003, &[0x003; 56]);
+        }
+
+        let (times, d1) = single_segment(&buf, 1);
+        let (d0_times, _) = single_segment(&buf, 0);
+        let cutoff = buf.last_t - 1.0;
+
+        assert_ne!(times, [] as [f64; 0]);
+        assert!(
+            times.iter().all(|&t| t + cutoff >= restart),
+            "D1 drawn before it was sampled"
+        );
+        assert!(d1.iter().all(|&v| v > 0.5), "D1 drawn low");
+        // D0 was sampled by both streams, so its history before the restart stays.
+        assert!(d0_times.first().is_some_and(|&t| t + cutoff < restart));
+    }
+
+    fn feed(buf: &mut DigitalStreamBuffer, channel_mask: u16, samples: &[u16]) {
+        for packet in samples.chunks(56) {
+            buf.add_batch(channel_mask, packet);
+        }
+    }
+
+    /// 100 kHz; D0 always sampled. D1 sampled for 0.3 s, removed for 0.4 s, then
+    /// re-added with `after_readd`. Returns the buffer and the removal and re-add times.
+    fn d1_removed_and_readded(after_readd: &[u16]) -> (DigitalStreamBuffer, f64, f64) {
+        let mut buf = DigitalStreamBuffer::new();
+        buf.set_configured_us_per_sample(10);
+        feed(&mut buf, 0x003, &vec![0x003; 30_000]);
+        let removed = buf.last_t;
+        feed(&mut buf, 0x001, &vec![0x001; 40_000]);
+        let readded = buf.last_t;
+        feed(&mut buf, 0x003, after_readd);
+        (buf, removed, readded)
+    }
+
+    #[test]
+    fn readded_channel_is_not_drawn_across_the_time_it_was_not_sampled() {
+        let (buf, removed, readded) = d1_removed_and_readded(&vec![0x003; 30_000]);
+        let cutoff = buf.last_t - 1.0;
+
+        let segments = buf.get_channel_segments(1, 1.0);
+
+        assert_eq!(
+            segments.len(),
+            2,
+            "D1 bridged across the 0.4 s it was not sampled"
+        );
+        assert!(segments[0].0.last().is_some_and(|&t| t + cutoff < removed));
+        assert!(segments[1]
+            .0
+            .first()
+            .is_some_and(|&t| t + cutoff >= readded));
+    }
+
+    #[test]
+    fn edge_after_readd_does_not_start_from_the_level_before_removal() {
+        // D1 was high before removal; after the re-add it is low for 60 samples, then rises.
+        let mut after_readd = vec![0x003; 30_000];
+        after_readd[..60].fill(0x001);
+        let (buf, _, readded) = d1_removed_and_readded(&after_readd);
+        let cutoff = buf.last_t - 1.0;
+
+        let segments = buf.get_channel_segments(1, 1.0);
+        let (times, d1) = &segments[1];
+
+        assert!(times[0] + cutoff >= readded);
+        assert!((times[0] - times[1]).abs() < 1e-12, "edge in the first bin");
+        assert!(d1[0] < 0.5 && d1[1] > 0.5, "rising edge drawn as falling");
+    }
+
+    #[test]
     fn free_run_digital_samples_wait_for_a_measured_rate() {
         let mut buf = DigitalStreamBuffer::new();
         buf.set_configured_us_per_sample(0);
-        buf.add_batch(&[0b1; 56]);
+        buf.add_batch(0x1ff, &[0b1; 56]);
 
         assert!(buf.sample_rate_hz == 0.0, "no rate is known yet");
-        assert_eq!(buf.get_channel_data(0, 1.0).0, [] as [f64; 0]);
+        assert_eq!(buf.get_channel_segments(0, 1.0), []);
     }
 }

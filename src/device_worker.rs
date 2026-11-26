@@ -49,7 +49,8 @@ pub struct FleaWorker {
     pub x1: FleaProbe,
     pub x10: FleaProbe,
     pub batch_tx: tokio::sync::mpsc::Sender<Vec<f64>>,
-    pub digital_batch_tx: tokio::sync::mpsc::Sender<Vec<u16>>,
+    /// Digital-stream samples with the channel mask they were decoded with.
+    pub digital_batch_tx: tokio::sync::mpsc::Sender<(u16, Vec<u16>)>,
     /// Whether the device is still attached. Nothing touches the port while paused, and
     /// every fleascope-rs call on an unplugged port panics, so the pause polls this.
     pub device_present: Box<dyn Fn() -> bool + Send + Sync>,
@@ -637,7 +638,7 @@ impl FleaWorker {
                     self.mark_connected();
                     {
                         profiling::scope!("send_digital_batch_channel");
-                        match self.digital_batch_tx.try_send(bitmasks) {
+                        match self.digital_batch_tx.try_send((channel_mask, bitmasks)) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                 tracing::debug!("Digital batch channel full - dropping batch (UI not draining fast enough)");

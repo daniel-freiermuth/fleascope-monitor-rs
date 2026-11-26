@@ -54,7 +54,9 @@ impl DeviceManager {
         // when UI rendering falls behind the capture rate)
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<f64>>(128);
         // Digital packets hold only a few dozen samples, so allow many more in flight.
-        let (digital_batch_tx, digital_batch_rx) = tokio::sync::mpsc::channel::<Vec<u16>>(1024);
+        // Each carries the channel mask it was decoded with.
+        let (digital_batch_tx, digital_batch_rx) =
+            tokio::sync::mpsc::channel::<(u16, Vec<u16>)>(1024);
 
         let (status_tx, status_rx) = watch::channel(WorkerStatus {
             running: true,
