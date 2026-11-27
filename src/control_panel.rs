@@ -179,11 +179,17 @@ fn pretty_print_number(value: f64, unit: Option<&str>, significant_digits: usize
         return format!("0{}", unit.unwrap_or(""));
     }
 
-    let abs_value = value.abs();
+    // Round to the requested significant digits first, so that prefix and
+    // decimal count are chosen from the value that is actually displayed
+    // (e.g. 0.9997 -> 1.0, not "1000m").
+    let raw_abs = value.abs();
+    let step = 10f64.powi(raw_abs.log10().floor() as i32 + 1 - significant_digits.max(1) as i32);
+    let abs_value = (raw_abs / step).round() * step;
+    let value = abs_value.copysign(value);
 
     let (factor, prefix) = MAGNITUDES
         .iter()
-        .find(|&&(f, _)| abs_value >= f)
+        .find(|&&(f, _)| abs_value >= f * (1.0 - 1e-9))
         .copied()
         .unwrap_or((1.0, ""));
 
@@ -1472,5 +1478,19 @@ impl ControlPanel {
                 let _ = window_response; // slider edits the handle directly
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pretty_print_number_tests {
+    use super::pretty_print_number;
+
+    #[test]
+    fn rounding_up_to_next_decade_switches_prefix() {
+        assert_eq!(pretty_print_number(0.000_999_6, Some("s"), 2), "1.0ms");
+        assert_eq!(pretty_print_number(0.9997, Some("s"), 2), "1.0s");
+        assert_eq!(pretty_print_number(0.00997, Some("s"), 2), "10ms");
+        assert_eq!(pretty_print_number(0.0012, Some("s"), 2), "1.2ms");
+        assert_eq!(pretty_print_number(0.000_122, Some("s"), 2), "120μs");
     }
 }
