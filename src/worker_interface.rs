@@ -38,7 +38,7 @@ pub struct FleaScopeDevice {
     pub notification_rx: tokio::sync::mpsc::Receiver<Notification>, // Channel for calibration results
     waveform_tx: Sender<WaveformConfig>, // Channel for waveform configuration
     pub batch_rx: tokio::sync::mpsc::Receiver<Vec<f64>>, // Channel for continuous batches
-    pub digital_batch_rx: tokio::sync::mpsc::Receiver<Vec<u16>>, // Channel for digital-stream batches
+    pub digital_batch_rx: tokio::sync::mpsc::Receiver<(u16, Vec<u16>)>, // Channel for digital-stream batches and their channel mask
     triggered_config: TriggeredCaptureConfig,
     continuous_config: ContinuousCaptureConfig,
     capture_mode: CaptureModeFlat,
@@ -62,7 +62,7 @@ impl FleaScopeDevice {
         waveform_tx: Sender<WaveformConfig>,
         initial_waveform: WaveformConfig,
         batch_rx: tokio::sync::mpsc::Receiver<Vec<f64>>,
-        digital_batch_rx: tokio::sync::mpsc::Receiver<Vec<u16>>,
+        digital_batch_rx: tokio::sync::mpsc::Receiver<(u16, Vec<u16>)>,
     ) -> Self {
         let mut triggered_config = TriggeredCaptureConfig {
             time_frame: 0.1,
